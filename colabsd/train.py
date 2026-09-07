@@ -260,6 +260,7 @@ def finetune(
                     seed=model_seed,
                     output_dir=run_dir,
                     source_trial=None,
+                    on_epoch=_epoch_reporter(progress, len(rows), total, name, t0),
                 )
                 minutes = (time.time() - t0) / 60.0
                 _lock_test_artifacts(
@@ -907,6 +908,37 @@ def _check_adapter_matches_pooling(adapter: Any, config: dict[str, Any], pooling
         )
     return sorted(resolved)
 
+
+def _elapsed(seconds: float) -> str:
+    """`6m12s`, so a reader can tell a slow run from a stopped one."""
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+def _epoch_reporter(
+    progress: ProgressFn | None,
+    done: int,
+    total: int,
+    name: str,
+    started: float,
+) -> Callable[[int, int, float], None] | None:
+    """Forward each finished epoch to `progress` as a line the panel can display.
+
+    `done` stays the number of *completed runs*, so the run counter does not advance until
+    the run really finishes; the epoch and the validation score go in the label.
+    """
+    if progress is None:
+        return None
+
+    def report(epoch: int, max_epochs: int, score: float) -> None:
+        _notify(
+            progress,
+            done,
+            total,
+            f"{name} · epoch {epoch + 1}/{max_epochs} · val {score:.4f} · {_elapsed(time.time() - started)}",
+        )
+
+    return report
 
 def _notify(progress: ProgressFn | None, done: int, total: int, label: str) -> None:
     if progress is not None:

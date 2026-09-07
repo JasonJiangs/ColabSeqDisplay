@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -332,6 +333,7 @@ def train_eval_config(
     seed: int,
     output_dir: Path,
     source_trial: SourceTrial | None,
+    on_epoch: Callable[[int, int, float], None] | None = None,
 ) -> dict[str, Any]:
     """Train one LoRA configuration on one split and score validation *and* test.
 
@@ -421,6 +423,11 @@ def train_eval_config(
             **validation_log_row(metric_summary),
         }
         log_rows.append(row)
+        if on_epoch is not None:
+            # A fine-tune runs for tens of minutes. Without this the caller has nothing to
+            # show between "starting" and the final result, and a working run is
+            # indistinguishable from a hung one.
+            on_epoch(epoch, max_epochs, float(score))
         if score > best_score:
             best_score = score
             best_epoch = epoch
