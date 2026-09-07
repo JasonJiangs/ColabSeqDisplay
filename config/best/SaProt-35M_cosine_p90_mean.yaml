@@ -1,0 +1,41 @@
+# ColabSeqDisplay best-config registry entry.
+# Read by colabsd.bestconfig.load_best_config(), and validated by
+# colabsd.engine.train_config.load_lora_best_config().
+
+_meta:
+  status: tuned
+  source: seqdisplay-opt LoRA hyperparameter study on the SlugCas9 5NNK library
+  optuna_trial: 18
+  test_spearman_mean: 0.5576
+  test_spearman_sd: 0.0162
+  n_reevaluation_runs: 9
+
+model: SaProt-35M
+
+parameters:
+  adapter_lr: 0.0001613054254
+  head_lr: 3.257280625e-05
+  adapter_weight_decay: 0.001
+  lora_rank: 32
+  lora_alpha: 128
+  lora_dropout: 0.2
+  effective_batch_size: 16
+
+training:
+  tuning_method: lora
+  head: mlp
+  pooling: cosine_p90_mean
+  micro_batch_size: 8
+  max_epochs: 20
+  early_stopping_patience: 3
+  max_grad_norm: 1.0
+  head_weight_decay: 0.01
+  loss: mse
+  gradient_accumulation: derive_from_effective_batch_size
+  label_preprocessing: train_split_zscore
+  evaluate_test_during_optimization: false
+
+evaluation:
+  selection_objective: mean_validation_spearman
+  split_seeds: [1, 2, 3]
+  model_seeds: [11, 22, 33]

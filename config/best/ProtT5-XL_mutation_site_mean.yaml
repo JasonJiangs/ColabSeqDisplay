@@ -1,0 +1,39 @@
+# ColabSeqDisplay best-config registry entry.
+# Read by colabsd.bestconfig.load_best_config(), and validated by
+# colabsd.engine.train_config.load_lora_best_config().
+
+_meta:
+  status: provisional
+  source: median of the 10 tuned cosine_p90_mean configs
+  replace_with: output of seqdisplay-lora-optuna for this model/pooling
+  test_spearman_mean: unknown
+
+model: ProtT5-XL
+
+parameters:
+  adapter_lr: 0.00017
+  head_lr: 5.5e-05
+  adapter_weight_decay: 0.001
+  lora_rank: 32
+  lora_alpha: 128
+  lora_dropout: 0.1
+  effective_batch_size: 16
+
+training:
+  tuning_method: lora
+  head: mlp
+  pooling: mutation_site_mean
+  micro_batch_size: 8
+  max_epochs: 20
+  early_stopping_patience: 3
+  max_grad_norm: 1.0
+  head_weight_decay: 0.01
+  loss: mse
+  gradient_accumulation: derive_from_effective_batch_size
+  label_preprocessing: train_split_zscore
+  evaluate_test_during_optimization: false
+
+evaluation:
+  selection_objective: mean_validation_spearman
+  split_seeds: [1, 2, 3]
+  model_seeds: [11, 22, 33]

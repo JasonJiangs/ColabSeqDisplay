@@ -1,0 +1,70 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+*.whl
+.venv/
+venv/
+.env
+.python-version
+
+# ---------------------------------------------------------------------------
+# Jupyter / Colab
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+*-checkpoint.ipynb
+
+# ---------------------------------------------------------------------------
+# What the notebooks write when they run
+#
+# Every step writes under the working directory named in the Setup cell, which
+# defaults to `colabsd_work/` beside the notebook: run directories, split
+# indices, the locked test partition, the report, and any structure predicted
+# for the wild type. Running a notebook inside a clone of this repository must
+# not turn those into a commit.
+# ---------------------------------------------------------------------------
+colabsd_work/
+
+# Exported model bundles and scored variants, wherever they are saved
+*_bundle.zip
+model_bundle.zip
+scored_variants.csv
+ranked_variants.csv
+
+# Trained weights (LoRA adapters, prediction heads) and downloaded checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Predicted structures
+*_esmfold.pdb
+
+# Downloaded tool binaries and model caches. The Foldseek binary is fetched
+# into ~/.cache/colabsd unless COLABSD_CACHE_DIR points somewhere else.
+.cache/
+foldseek/
+foldseek*.tar.gz
+
+# ---------------------------------------------------------------------------
+# Tooling caches
+# ---------------------------------------------------------------------------
+.ruff_cache/
+.mypy_cache/
+
+# ---------------------------------------------------------------------------
+# Editors and operating systems
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

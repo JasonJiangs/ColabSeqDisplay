@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colabseqdisplay"
+version = "0.1.0"
+description = "No-code Colab front end for protein sequence-display library optimisation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26,<3",
+    "pandas>=2.1,<4",
+    "scipy>=1.11,<2",
+    "scikit-learn>=1.3,<2",
+    "matplotlib>=3.7,<4",
+    "tqdm>=4.66,<5",
+    "torch>=2.2,<3",
+    "transformers>=4.40",
+    "huggingface_hub>=0.23",
+    "pyyaml>=6,<7",
+    # The notebooks are the product, and the whole panel is built from these two.
+    # Colab ships both; a plain install elsewhere does not, and launch() would raise.
+    "ipywidgets>=8,<9",
+    "ipython>=8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+esmc = ["esm>=3.1"]
+prott5 = ["sentencepiece>=0.1.99,<1"]
+optuna = ["optuna>=3,<5"]
+
+# `config/best/` and `examples/` sit beside the package in the source tree, and a wheel
+# cannot carry files from outside a package directory. They are mapped in as
+# `colabsd.config` / `colabsd.examples` so an installed copy carries the 28-entry config
+# registry and the bundled SlugCas9 example rather than silently shipping an empty
+# registry; `colabsd.DATA_ROOT` finds them in either layout. The list is explicit because
+# `package-dir` and `packages.find` cannot be combined, so a new subpackage or a new data
+# file extension has to be added here as well or it will be missing from the built
+# distribution.
+[tool.setuptools]
+packages = [
+    "colabsd",
+    "colabsd.backbones",
+    "colabsd.engine",
+    "colabsd.ui",
+    "colabsd.config",
+    "colabsd.config.best",
+    "colabsd.examples",
+    "colabsd.examples.slugcas9_5nnk",
+]
+
+[tool.setuptools.package-dir]
+"colabsd.config" = "config"
+"colabsd.examples" = "examples"
+
+[tool.setuptools.package-data]
+"colabsd.engine" = ["README.md"]
+"colabsd.config" = ["*.md"]
+"colabsd.config.best" = ["*.yaml", "*.md"]
+"colabsd.examples" = ["*.md"]
+"colabsd.examples.slugcas9_5nnk" = ["*.csv", "*.fasta", "*.txt", "*.json", "*.md"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F", "I", "UP", "B"]

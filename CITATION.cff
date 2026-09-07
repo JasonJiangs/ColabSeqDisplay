@@ -1,0 +1,104 @@
+# Citation metadata for ColabSeqDisplay, in Citation File Format 1.2.0.
+# GitHub renders this file as the repository's "Cite this repository" entry.
+#
+# Five PLACEHOLDER values must be replaced before this repository is cited in a
+# publication. Grep this file for PLACEHOLDER to find every one of them:
+#   1. the author entry            — real authors and affiliations, in citation order
+#   2. `doi:`                      — the concept DOI minted when the release is archived
+#   3. `identifiers:` doi value    — the same concept DOI, again
+#   4. `date-released:`            — the deposit date; uncomment it at the same time
+#   5. the `references:` entry     — the real citation for the seqdisplay-opt study,
+#                                    whose method this software runs
+#
+# In that order: list the authors, publish a tagged release and archive it in a
+# DOI-issuing repository (archiving a GitHub release on Zenodo mints a DOI of the
+# shape below), then paste the concept DOI into both fields and set the date.
+#
+# `version:` must stay equal to the version in pyproject.toml and colabsd/__init__.py.
+# `license:` must stay equal to the licence in LICENSE and pyproject.toml.
+
+cff-version: 1.2.0
+message: "If you use ColabSeqDisplay in your research, please cite it using the metadata in this file."
+title: "ColabSeqDisplay: no-code protein language model fine-tuning for sequence-display variant libraries"
+abstract: >-
+  ColabSeqDisplay is a set of three Google Colab notebooks that fine-tune a protein
+  language model on a sequence-display variant library and predict activity for new
+  variants. Hyperparameters are looked up per (backbone, pooling) pair from a committed
+  registry rather than tuned in the notebook, the test partition is locked until it is
+  deliberately unlocked, and the workflow reports a one-hot baseline beside the
+  fine-tuned result.
+type: software
+version: 0.1.0
+
+# ---------------------------------------------------------------------------
+# PLACEHOLDER — replace before publication.
+# One entry per author, in the order they should appear in the citation.
+# Delete the placeholder entry once the real authors are listed.
+# ---------------------------------------------------------------------------
+authors:
+  - family-names: "PLACEHOLDER-FAMILY-NAME"
+    given-names: "PLACEHOLDER-GIVEN-NAMES"
+    affiliation: "PLACEHOLDER-AFFILIATION"
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # uncomment and fill in
+
+# ---------------------------------------------------------------------------
+# PLACEHOLDER — replace with the DOI minted when this repository is archived.
+# Custom code central to a study's conclusions is expected to be deposited in a
+# DOI-issuing repository; archiving this GitHub repository on Zenodo mints a DOI
+# of this shape. Zenodo mints two: use the *concept* DOI, which always resolves
+# to the newest version, rather than the DOI of one specific release.
+# Update this field, the matching identifier below, and `date-released`, at the
+# moment the archive is created.
+# The value below is a syntactically valid DOI, so validators pass on this file
+# as it stands; it does not resolve, and is not a citable identifier.
+# ---------------------------------------------------------------------------
+doi: "10.5281/zenodo.0000000"
+
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.0000000"
+    description: "PLACEHOLDER — concept DOI for all versions of the archived software."
+  - type: url
+    value: "https://github.com/JasonJiangs/ColabSeqDisplay"
+    description: "Source repository."
+
+repository-code: "https://github.com/JasonJiangs/ColabSeqDisplay"
+url: "https://github.com/JasonJiangs/ColabSeqDisplay"
+license: MIT
+
+# PLACEHOLDER — set to the archive date (YYYY-MM-DD) when the DOI is minted.
+# date-released: 2026-01-01
+
+# ---------------------------------------------------------------------------
+# The study this software is a front end for. `colabsd/engine/` is copied from
+# its code and every tuned hyperparameter in `config/best/` was selected by it,
+# so anyone citing ColabSeqDisplay should cite it too; listing it here is what
+# makes a citation manager surface both. See ATTRIBUTION.md.
+#
+# PLACEHOLDER — replace `authors`, and add `doi:`/`year:`/`journal:` (changing
+# `type:` to `article`), with the real citation when that study is published.
+# ---------------------------------------------------------------------------
+references:
+  - type: software
+    title: "SequenceDisplay-Workflow-Optimization: LoRA fine-tuning and representation comparison for sequence-display activity prediction (Python package seqdisplay_opt)"
+    abbreviation: "seqdisplay-opt"
+    authors:
+      - name: "PLACEHOLDER — the authors of SequenceDisplay-Workflow-Optimization"
+    repository-code: "https://github.com/JasonJiangs/SequenceDisplay-Workflow-Optimization"
+    url: "https://github.com/JasonJiangs/SequenceDisplay-Workflow-Optimization"
+    notes: >-
+      The method ColabSeqDisplay runs: the LoRA implementation, the training loop, the
+      pooling strategies, the metrics, the head registry, the split protocol, and the
+      tuned hyperparameters in config/best/. Every performance figure reported by
+      ColabSeqDisplay is a measurement from this study.
+
+keywords:
+  - protein language model
+  - sequence display
+  - variant effect prediction
+  - deep mutational scanning
+  - LoRA
+  - low-rank adaptation
+  - fine-tuning
+  - Google Colab
+  - protein engineering
