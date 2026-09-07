@@ -1,6 +1,6 @@
 # The bundled example — SlugCas9 5NNK
 
-Every default in the three notebook forms describes the files in this directory, so the
+Every default in the main notebook's form describes the files in this directory, so the
 workflow runs end to end without uploading anything. It is also the reference shape for
 your own data: if your library can be written the way `library.csv` is written, the
 notebooks will read it.
@@ -99,9 +99,10 @@ as the amino-acid sequence and describe the same chain.
 
 Of the backbones the notebook offers, only the three SaProt models — `SaProt-35M`,
 `SaProt-650M`, `SaProt-1.3B` — read it; the rest are sequence-only and need nothing from
-this file. To make one for your own
-protein, use `colab/ColabSeqDisplay_Prepare.ipynb`, which will predict a structure with ESMFold
-if you do not have one and convert it with Foldseek.
+this file. To make one for your own protein you do not have to go anywhere else: pick a
+SaProt backbone in step 2 of `colab/ColabSeqDisplay.ipynb` and step 3a appears, which converts
+a structure you upload with Foldseek — or, for a protein short enough, predicts one with
+ESMFold first. It is written into the working directory of the same session that trains.
 
 ## The two region files
 
@@ -173,10 +174,10 @@ choose. You need:
    count column is optional. Any activity scale works.
 2. **The full-length wild-type sequence**, as a FASTA file, a URL, or pasted into the form.
    Your positions are 1-based against *this* sequence.
-3. **A 3Di string** — only if you intend to use a SaProt backbone.
-   `colab/ColabSeqDisplay_Prepare.ipynb` writes one.
-4. **A region file** — only if you intend to use `cosine_p90_mean` pooling.
-   `colab/ColabSeqDisplay_Prepare.ipynb` writes one, in the JSON shape above, from your own
-   library. Skip it and use `mutation_site_mean` instead, which needs no file; read
+3. **A 3Di string** — only if you intend to use a SaProt backbone, and you do not have to
+   bring one: step 3a of `colab/ColabSeqDisplay.ipynb` writes it in the same session.
+4. **A region file** — only if you intend to use `cosine_p90_mean` pooling, and again you do
+   not have to bring one: step 3b of `colab/ColabSeqDisplay.ipynb` discovers it, in the JSON
+   shape above, from your own library. Skip it and use `mutation_site_mean` instead, which needs no file; read
    [`../../config/best/README.md`](../../config/best/README.md) first, because no
    `mutation_site_mean` pair has been tuned.

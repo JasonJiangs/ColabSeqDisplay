@@ -66,7 +66,7 @@ regression heads — dropping those also drops a hard `xgboost` dependency.
 Fidelity is the rule for `colabsd/engine/`: the tuned configurations in `config/best/`
 were selected against upstream's exact code, so a silent behavioural drift would
 invalidate them. Every departure below is deliberate, recorded in the module header, and
-checked against the original.
+covered by a test.
 
 1. **`micro_batch_size: auto` no longer raises in the config loader.** Upstream's
    `load_lora_best_config` defaults `training.micro_batch_size` to the string `"auto"` and
@@ -112,38 +112,36 @@ holds it.
 
 ## How we know the copy still computes the original
 
-Equality was asserted by execution, not assumed by reading. For every module that carries
-a number — `lora.py`, `pooling.py`, `heads.py`, `train_config.py` — the vendored copy and
-the original were driven side by side on real input (the bundled 16,424-variant SlugCas9
-library, all 28 shipped configs, a full LoRA fine-tune) and their outputs compared, rather
-than their source.
+Equality is asserted, not assumed. `tests/test_engine_lora.py`,
+`tests/test_engine_pooling.py`, `tests/test_engine_heads.py` and
+`tests/test_engine_train_config.py` import both the vendored module and the original and
+run them side by side on real input — the bundled 16,424-variant SlugCas9 library, all 28
+shipped configs, a full LoRA fine-tune — asserting equal outputs rather than equal source.
 
-Three further checks close the gaps that argument leaves:
+Those comparisons need the research checkout. They locate it by importing `seqdisplay_opt`
+and then by the `SEQDISPLAY_OPT_ROOT` environment variable, and **skip cleanly when neither
+is available**, so the suite is green for a user who has only this repository. On a bare
+clone every test passes and the skips are exactly these comparisons plus four that want
+HuggingFace weights; with a checkout reachable, roughly eighty more tests run and only the
+four weight-dependent ones skip. To run them:
 
-- `create_split` is pinned to the study's *recorded* index lists — the artefacts
-  `config/best/` was selected on — so the check holds even if the original's source later
-  changes.
-- `inject_lora` is run against real HuggingFace attention naming (`EsmModel`,
-  `T5EncoderModel`, built from a small config with no weights and no network) rather than
-  a toy module tree.
-- Every shared definition is compared at AST level, with docstrings, annotations,
-  formatting and the deliberate renames normalised away, so an undocumented edit to a body
-  here is caught even where no behavioural check reaches it. The departures listed above
-  are its allow-list: one that is not recorded fails, and so does one left listed after it
-  has been reverted.
+```bash
+SEQDISPLAY_OPT_ROOT=/path/to/SequenceDisplay-Workflow-Optimization python -m pytest tests/ -q
+```
 
-Those comparisons need a copy of the original alongside this repository. Nothing a user
-does requires one: `colabsd`, the notebooks, the 28 shipped configs and the bundled
-example are standalone, and this repository installs and runs with no second checkout
-anywhere on the machine.
+### The one thing that still needs the checkout
 
-### What is not here
+`scripts/search_best_config.py` — the offline Optuna search that *produces* a new
+`config/best/` entry — was left composing with the research package rather than vendoring
+it: the search space (`load_lora_optuna_config`, `suggest_lora_params`,
+`DEFAULT_LORA_CONFIG`) and the per-trial training entry point (`train_one_trial`) stayed
+upstream. It reaches them through one guarded helper, `_import_research`, which names the
+checkout and the environment variable when it is missing rather than raising a bare
+`ModuleNotFoundError`. `scripts/investigate_region.py --stage compare` is the same shape:
+it compares against a published region only that repository holds.
 
-The machinery that *produces* a new `config/best/` entry stayed with the study. Filling
-one of the 18 placeholder pairs means running that Optuna search offline, against the
-research code, and copying the winning trial's values in — `config/best/README.md`
-describes the shape of the file that results. This repository consumes tuned
-configurations; it does not search for them.
+Neither is part of the product. The notebooks, `colabsd`, the 28 shipped configs and the
+test suite are all standalone; these two developer scripts are the documented exception.
 
 ## Data and hyperparameters
 
@@ -151,13 +149,11 @@ configurations; it does not search for them.
 shape `colabsd` expects. `library.csv`, `wt.fasta` and `wt_3di.txt` are byte-identical to
 upstream's `data/processed/5nnk_avg_mut_num.csv`, `data/protein/slugcas9_wt.fasta` and
 `data/protein/slugcas9_wt_3di.txt`. The two `region_*.json` files are the exception: they
-are recomputed here and differ from upstream's published region. The two agree on 69 of
-106 positions at p90 and 48 of 53 at p95; what that costs, and what it does not, is set
-out in [`README.md`](README.md#limitations) and
-[`examples/slugcas9_5nnk/README.md`](examples/slugcas9_5nnk/README.md#the-two-region-files).
+are recomputed here and differ from upstream's published region — the reason, and the
+evidence, are in [`docs/REGION.md`](docs/REGION.md).
 
 **`config/best/`** is entirely derived from upstream's study. The ten entries marked
-`status: tuned` are its selected LoRA configurations, taken from that project's own
+`status: tuned` are its selected LoRA configurations, taken from
 `results/p90_lora/selected_lora_configs.csv`, each the product of a 40-trial Optuna study
 whose top three trials were re-trained across 3 split seeds × 3 model seeds. The other 18
 are placeholders computed as the median of those ten, and say so at load time. The
@@ -168,8 +164,8 @@ figures in `README.md`, in `config/best/README.md`, in each `_meta` block and in
 notebook's own dropdown — 0.5478 to 0.5636 on SlugCas9 5NNK — are upstream's
 re-evaluation results, not measurements made here. Exactly one training run has ever gone
 through `colabsd`'s own path end to end, and it is labelled as an illustration where it
-appears. The one-hot floor numbers quoted in `TUTORIAL.md` are the exception: they are
-this repository's own, produced by running `colabsd.baseline` over the bundled library.
+appears. The one-hot floor numbers and the region-investigation timings in `results/` are
+this repository's own.
 
 ## Licence
 
@@ -193,8 +189,8 @@ discovery (`colabsd/region.py`), wild-type 3Di construction (`colabsd/structure.
 best-config lookup (`colabsd/bestconfig.py`), the run orchestration and locked-test
 protocol (`colabsd/train.py`), the one-hot floor's harness (`colabsd/baseline.py`),
 reporting (`colabsd/report.py`), the model bundle (`colabsd/bundle.py`), scoring
-(`colabsd/predict.py`), the notebook wizards (`colabsd/ui/`), the three notebooks and
-the documentation.
+(`colabsd/predict.py`), the notebook wizards (`colabsd/ui/`), the notebook generator, the
+tests and the documentation.
 
 ## Citation
 

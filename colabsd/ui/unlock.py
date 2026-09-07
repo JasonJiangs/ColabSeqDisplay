@@ -18,10 +18,18 @@ this run directory has already been unlocked before you can unlock it again, the
 confirmation resets after every unlock so the next one has to be given deliberately, and the
 final report carries the count beside the numbers it qualifies.
 
+What it writes. The same `performance_report.zip` the export cell above writes — the report
+CSV, the figure, and the JSON that records what they show — rewritten through
+`colabsd.ui.exports` so that it now carries the test numbers and the unlock count. The
+validation archive is obtainable without ever running this cell; that is the point of it.
+This cell only changes what is inside the archive, and the archive says which it is.
+
 The decision layer is pure — `status_notices`, `blocking`, `condition_rows`, `report_html`,
 `floor_line` — and `UnlockPanel` only wires it to two widgets. Presentation is
 `colabsd.ui.theme` and `colabsd.ui.core.Message`, the vocabulary the other three interfaces
-use, so this cell does not look like a different program.
+use, so this cell does not look like a different program. The sentence that says what a test
+number is worth after N reads lives in `colabsd.ui.exports`, so the panel, the archive's JSON
+and its README all say it the same way.
 """
 
 from __future__ import annotations
@@ -32,15 +40,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from colabsd.ui import theme
+from colabsd.ui import exports, theme
 from colabsd.ui.core import Message, render_messages
+from colabsd.ui.exports import number, unlock_verdict
 
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 
 #: Only used when `colabsd.train` cannot be imported at all. It is a fallback, not a
 #: mirror: the dropdown is filled from `colabsd.train.METRICS` itself whenever that import
 #: works, so what the form offers is what a run records, by construction rather than by
-#: someone remembering to edit two lists.
+#: someone remembering to edit two lists. `tests/test_ui_side.py` holds them equal.
 FALLBACK_METRICS: tuple[str, ...] = ("R2", "Pearson", "Spearman", "P@10", "P@50", "NDCG@10", "NDCG@50")
 
 
@@ -53,7 +62,8 @@ def _recorded_metrics() -> tuple[str, ...]:
 
 
 METRICS: tuple[str, ...] = _recorded_metrics()
-DEFAULT_METRIC = "Spearman"
+#: One value, so the dropdown, the archive and the report cannot default to different metrics.
+DEFAULT_METRIC = exports.DEFAULT_METRIC
 
 
 @dataclass(frozen=True)
@@ -75,8 +85,8 @@ class UnlockInputs:
 class ConditionRow:
     """One condition's test-partition number for the metric on show.
 
-    Named for the condition rather than for the partition, so that a test-collection tool
-    reading this module never mistakes it for a test case of its own.
+    Named for the condition rather than for the partition so that pytest never mistakes it
+    for a test case of its own.
     """
 
     condition: str
@@ -99,6 +109,8 @@ class FinalReport:
     model_label: str
     paths: dict[str, Path]
     html: str
+    #: The performance archive rewritten by this unlock, the one file worth keeping.
+    archive: Path | None = None
 
 
 #: What a training wizard might have called each thing it hands over. Aliases, so this cell
@@ -254,11 +266,6 @@ def macro_summary(payload: dict, metric: str) -> tuple[float, float]:
     return float(entry.get("mean", float("nan"))), float(entry.get("sd", float("nan")))
 
 
-def number(value: float) -> str:
-    """A metric, or the words for one that was never recorded — never a bare `nan`."""
-    return "not recorded" if value != value else f"{value:.4f}"
-
-
 def floor_line(floor: dict | None, macro_mean: float, metric: str) -> str:
     """The one-hot floor, and how far above it the language model actually is."""
     if not floor:
@@ -277,19 +284,6 @@ def floor_line(floor: dict | None, macro_mean: float, metric: str) -> str:
     below = f"<b style='color:{theme.SEVERITY_COLOR['stop']}'>below</b>"
     verdict = "above" if margin >= 0 else below
     return f"{head} The language model is {abs(margin):.4f} {verdict} it."
-
-
-def unlock_verdict(unlock_count: int) -> str:
-    """What the number below means, given how many times it has now been read."""
-    if unlock_count <= 1:
-        return (
-            "Read once, deliberately, after the choices were made. This number means what a held-out number "
-            "is supposed to mean."
-        )
-    return (
-        f"This is read number {unlock_count} of the same test partition. Choices made after the first read "
-        "were informed by it, so treat this as an optimistic estimate, not a held-out one."
-    )
 
 
 # ----------------------------------------------------------------------------------------
@@ -562,7 +556,9 @@ class UnlockPanel:
             return None
 
         macro_mean, macro_sd = macro_summary(payload, metric)
-        paths, shown_partition = self._write_report(metric)
+        export = self._export_performance(metric)
+        paths = {} if export is None else export.written()
+        shown_partition = "test" if export is None else export.facts.partition
         assembled = FinalReport(
             unlock_count=int(payload.get("unlock_count", self.unlock_count)),
             metric=metric,
@@ -574,50 +570,63 @@ class UnlockPanel:
             model_label=str(payload.get("model_name", "this model")),
             paths=paths,
             html="",
+            archive=None if export is None else export.path,
         )
         self.report = replace(assembled, html=render_report(assembled))
         count = self.report.unlock_count
         self.report_box.value = self.report.html
         self._say(f"unlock #{count} at {payload.get('unlocked_utc', 'unknown time')}")
         self._say(f"test {metric}, averaged over conditions: {macro_mean:.4f} ± {macro_sd:.4f}")
-        for path in paths.values():
-            self.runners.download(Path(path))
+        if export is not None:
+            # Two downloads and no more: the archive is what to keep — it says which
+            # partition and how many reads — and the figure is what to look at now.
+            self._say(f"performance archive: {export.path} — {export.facts.describe()}")
+            self.runners.download(export.path)
+            figure = export.report_paths.get("report.png")
+            if figure is not None:
+                self.runners.download(Path(figure))
         # A second unlock stays possible, but it has to be confirmed again on purpose.
         self.confirm.value = False
         self.refresh()
         return self.report
 
-    def _write_report(self, metric: str) -> tuple[dict[str, Path], str]:
-        """Write report.csv / report.json / report.png, and say which partition they show."""
+    def _export_runners(self) -> exports.ExportRunners:
+        """This panel's injected side effects, handed to `colabsd.ui.exports` unchanged.
+
+        The export module writes the archive, but it writes it through whatever this panel
+        was given — so a test that fakes the report writer fakes it here too.
+        """
+        return exports.ExportRunners(
+            build_report=self.runners.build_report,
+            read_unlock_count=self.runners.read_unlock_count,
+            download=self.runners.download,
+        )
+
+    def _export_performance(self, metric: str) -> exports.PerformanceExport | None:
+        """Rewrite the performance archive, now that there are test numbers to put in it.
+
+        The same file name the export cell above writes with validation numbers. Which
+        partition it describes is `colabsd.report`'s decision, recorded in `report.json` and
+        copied into the archive's own manifest — this panel does not get a second opinion.
+        """
         if self.inputs.output_dir is None:
-            return {}, "test"
-        out_dir = Path(self.inputs.work_dir or self.inputs.output_dir) / "report"
+            return None
+        work_dir = Path(self.inputs.work_dir or self.inputs.output_dir)
         try:
-            written = self.runners.build_report(
-                self.inputs.run_result,
-                self.inputs.baseline,
-                self.inputs.spec,
-                out_dir=out_dir,
+            return exports.export_performance(
+                run_result=self.inputs.run_result,
+                baseline=self.inputs.baseline,
+                spec=self.inputs.spec,
+                best=None,
+                work_dir=work_dir,
+                report_dir=work_dir / "report",
                 metric=metric,
+                runners=self._export_runners(),
+                download=False,
             )
         except Exception as exc:
             self._say(f"the report could not be written: {exc}")
-            return {}, "test"
-        paths = {
-            name: Path(getattr(written, name))
-            for name in ("csv", "png", "json")
-            if getattr(written, name, None) is not None
-        }
-        shown = "test"
-        json_path = paths.get("json")
-        if json_path is not None and json_path.is_file():
-            import json
-
-            try:
-                shown = str(json.loads(json_path.read_text()).get("shown_partition", "test"))
-            except (OSError, ValueError):
-                shown = "test"
-        return paths, shown
+            return None
 
     def _floor(self, metric: str, partition: str) -> dict | None:
         """The one-hot floor on the partition the report is showing."""

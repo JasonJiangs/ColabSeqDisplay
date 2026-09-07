@@ -20,8 +20,8 @@ two HPC workers cannot share a study, and expose two ``argparse`` command lines.
 ColabSeqDisplay runs *one* already-chosen configuration out of ``config/best/``,
 so none of that is reachable from a notebook and none of it is here.
 
-Changed while copying, both deliberate and both checked side by side against the
-original:
+Changed while copying, both deliberate and both covered by the side-by-side
+equivalence test in ``tests/test_engine_train_config.py``:
 
 1. **``micro_batch_size: auto`` no longer raises in the loader.** Upstream
    defaults ``training.micro_batch_size`` to the string ``"auto"`` and then calls

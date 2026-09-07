@@ -21,7 +21,8 @@ PROVISIONAL = "provisional"
 
 #: Registry filenames are ``<model>_<pooling>.yaml``; model names may contain
 #: hyphens and pooling names contain underscores, so the split needs the known
-#: pooling suffixes. These stay identical to the engine's `POOLING_REGIONS`.
+#: pooling suffixes. `tests/test_bestconfig.py` asserts these stay identical to
+#: upstream `POOLING_REGIONS`.
 POOLING_NAMES: tuple[str, ...] = (
     "cosine_p90_mean",
     "cosine_p95_mean",

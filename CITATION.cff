@@ -21,7 +21,7 @@ cff-version: 1.2.0
 message: "If you use ColabSeqDisplay in your research, please cite it using the metadata in this file."
 title: "ColabSeqDisplay: no-code protein language model fine-tuning for sequence-display variant libraries"
 abstract: >-
-  ColabSeqDisplay is a set of three Google Colab notebooks that fine-tune a protein
+  ColabSeqDisplay is a pair of Google Colab notebooks that fine-tune a protein
   language model on a sequence-display variant library and predict activity for new
   variants. Hyperparameters are looked up per (backbone, pooling) pair from a committed
   registry rather than tuned in the notebook, the test partition is locked until it is

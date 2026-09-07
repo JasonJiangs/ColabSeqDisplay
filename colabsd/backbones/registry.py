@@ -4,6 +4,15 @@ Importing this module stays free: it holds metadata only and never imports
 `torch`, `transformers`, `colabsd.engine` or an adapter module. `create_adapter`
 imports the adapter module on demand.
 
+Two different questions are answered here, and they are deliberately not the same
+question. *Registered* (`BACKBONES`, `available`, `create_adapter`) is what the
+package can build: fourteen entries, thirteen of them with a working adapter.
+*Offered* (`OFFERED_FAMILIES`, `offered`, `is_offered`) is the much shorter list the
+two notebooks put on screen. Nothing is deleted to shorten a dropdown — a family
+the notebooks do not list is still one `create_adapter` call away, and
+`withheld_reason` says in words why it is not on screen, so a user who goes looking
+for their model finds an answer rather than silence.
+
 `embed_dim` is the width of the *pooled feature* the adapter returns, which is
 what a downstream head is built with. It is not always the encoder hidden size:
 ESMDance pools its 50-dim `res_pred` output, not its 480-dim trunk. The values
@@ -19,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
+from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
@@ -192,6 +202,53 @@ _FAMILY_ADAPTERS: dict[str, tuple[str, str]] = {
 }
 
 
+# --- what the notebooks offer ------------------------------------------------
+
+#: The families the notebooks list. The panel asks two questions — which backbone,
+#: which pooling — and every later step is derived from the answers, so the first
+#: question stays a real comparison (one sequence-only family, one structure-aware
+#: one) rather than a menu of fourteen. This says nothing about what the package can
+#: run: `create_adapter` builds every entry that has an adapter, offered or not.
+#: Putting a family back on screen is one line — move its name out of
+#: `WITHHELD_FAMILY_REASONS` and into this tuple.
+OFFERED_FAMILIES: tuple[str, ...] = ("ESM2", "SaProt")
+
+#: Why each remaining family is in the package but not on screen, phrased for the user
+#: who goes looking for their model. Every family in `BACKBONES` sits in exactly one of
+#: these two places, and `tests/test_backbone_surface.py` keeps it that way, so a family
+#: can never be dropped from the notebooks without leaving a reason behind.
+WITHHELD_FAMILY_REASONS: dict[str, str] = {
+    "ProtT5": (
+        "a 1.2B-parameter encoder that needs an L4 or A100 and an extra sentencepiece install, "
+        "where the notebooks target a free T4 and install nothing beyond colabsd"
+    ),
+    "Ankh": "a 1.2B-parameter encoder that needs an L4 or A100, where the notebooks target a free T4",
+    "ESMC": (
+        "it loads only through the EvolutionaryScale SDK (`pip install esm`), an install the "
+        "notebooks do not make on a user's behalf"
+    ),
+    "SeqDance": (
+        "a dynamics-pretrained ESM2-35M — a good model, but it answers a narrower question than "
+        "the sequence-versus-structure choice the notebooks are built around"
+    ),
+    "ESMDance": (
+        "a dynamics-tuned ESM2-35M whose pooled feature is its 50-dim prediction head rather than "
+        "the trunk, so it is not read like the other entries in a single comparison"
+    ),
+    "METL": "Rosetta-pretrained and protein-specific, with no HuggingFace weights for anything to load",
+}
+
+#: Families whose adapter cannot tokenize a variant without a wild-type 3Di string.
+#: Narrower than `BackboneEntry.needs_structure`: METL needs a structure too, but a
+#: Rosetta-relaxed one that no notebook step produces, and it has no adapter at all.
+THREE_DI_FAMILIES: frozenset[str] = frozenset({"SaProt"})
+
+#: What `hyperparameter_state` can answer. "placeholder" is `config/best/`'s own
+#: `_meta.status: provisional` — a median of the tuned entries, standing in until a
+#: study is run for that pair.
+HYPERPARAMETER_STATES: tuple[str, ...] = ("tuned", "placeholder", "missing")
+
+
 def get_entry(name: str) -> BackboneEntry:
     """Return registry metadata for *name*."""
     try:
@@ -201,12 +258,129 @@ def get_entry(name: str) -> BackboneEntry:
 
 
 def available(tier: str | None = None) -> list[str]:
-    """Return registered backbone names, optionally restricted to one tier."""
+    """Return registered backbone names, optionally restricted to one tier.
+
+    This is what the package can build, not what the notebooks show: for the
+    dropdown, ask `offered()`.
+    """
     if tier is None:
         return list(BACKBONES)
     if tier not in TIERS:
         raise BackboneError(f"Unknown tier '{tier}'. Pick one of: {', '.join(TIERS)}.")
     return [name for name, entry in BACKBONES.items() if entry.tier == tier]
+
+
+def has_adapter(name: str) -> bool:
+    """True when `create_adapter` can build *name* (a `local_only` entry has no adapter)."""
+    return get_entry(name).family in _FAMILY_ADAPTERS
+
+
+# --- the notebook surface ----------------------------------------------------
+
+
+def is_offered(name: str) -> bool:
+    """True when the notebooks list *name* among the backbones a user can pick."""
+    return get_entry(name).family in OFFERED_FAMILIES
+
+
+def offered() -> list[str]:
+    """The backbones the notebooks offer, in registry order: the ESM2 ladder, then SaProt.
+
+    Every panel, dropdown and generated table reads this rather than keeping a literal
+    list of its own, so the registry stays the only place the answer changes.
+    """
+    return [name for name in BACKBONES if is_offered(name)]
+
+
+def withheld() -> list[str]:
+    """Registered backbones the notebooks do not list, in registry order.
+
+    They are withheld from the *dropdown*, not from the package: each one that has an
+    adapter is still built by `create_adapter`.
+    """
+    return [name for name in BACKBONES if not is_offered(name)]
+
+
+def withheld_reason(name: str) -> str | None:
+    """Why *name* is not offered in the notebooks, or None when it is offered."""
+    entry = get_entry(name)
+    if entry.family in OFFERED_FAMILIES:
+        return None
+    try:
+        return WITHHELD_FAMILY_REASONS[entry.family]
+    except KeyError:
+        raise BackboneError(
+            f"Family '{entry.family}' is in neither OFFERED_FAMILIES nor WITHHELD_FAMILY_REASONS, "
+            f"so there is nothing to tell a user who goes looking for '{name}'. "
+            "Add the family to one of them in colabsd/backbones/registry.py."
+        ) from None
+
+
+def withheld_note(name: str) -> str:
+    """One paragraph for a reader who went looking for a backbone the panel does not list."""
+    reason = withheld_reason(name)
+    if reason is None:
+        return f"`{name}` is one of the backbones the notebooks offer."
+    lines = [f"`{name}` is in this package but the notebooks do not offer it: {reason}."]
+    if has_adapter(name):
+        lines.append(
+            f"Its adapter is still here and still tested — `create_adapter({name!r}, pooling=...)` builds it "
+            "from Python, and `config/best/` still carries its hyperparameters."
+        )
+    else:
+        lines.append("It has no adapter in this package, so there is nothing here to run it with.")
+    return " ".join(lines)
+
+
+# --- the two questions the preparation step is derived from ------------------
+
+
+def needs_wt_3di(name: str) -> bool:
+    """True when *name* cannot be tokenized without a wild-type 3Di string.
+
+    This is the question preparation is derived from rather than asked about: a SaProt
+    backbone makes the 3Di step appear, an ESM2 backbone removes it from the panel.
+    """
+    return get_entry(name).family in THREE_DI_FAMILIES
+
+
+def hyperparameter_state(name: str, pooling: str, root: str | Path | None = None) -> str:
+    """Whether `config/best/` holds `"tuned"` values for this pair, a `"placeholder"`, or `"missing"`.
+
+    `colabsd.bestconfig` owns the answer; this is the join, so no panel has to re-derive
+    it from a literal list of pairs. A placeholder is a real, runnable configuration —
+    the median of the tuned entries — but no study selected it, so nothing it produces
+    is a result.
+    """
+    from colabsd import bestconfig
+
+    get_entry(name)  # an unknown backbone is a backbone error, not a missing-file report
+    try:
+        best = bestconfig.load_best_config(name, pooling, root)
+    except bestconfig.BestConfigNotFound:
+        return "missing"
+    return "placeholder" if best.is_provisional else "tuned"
+
+
+def is_tuned(name: str, pooling: str, root: str | Path | None = None) -> bool:
+    """True only when `config/best/` carries tuned hyperparameters for this pair."""
+    return hyperparameter_state(name, pooling, root) == "tuned"
+
+
+def tuned_pairs(root: str | Path | None = None, *, offered_only: bool = True) -> list[tuple[str, str]]:
+    """The (backbone, pooling) pairs with tuned hyperparameters, sorted.
+
+    Restricted to offered backbones by default, which is the list a notebook should
+    quote; pass `offered_only=False` for every tuned pair the registry holds.
+    """
+    from colabsd import bestconfig
+
+    pairs = [
+        (model, pooling)
+        for model, pooling in bestconfig.available_pairs(root)
+        if model in BACKBONES and (not offered_only or is_offered(model)) and is_tuned(model, pooling, root)
+    ]
+    return sorted(pairs)
 
 
 def _adapter_class(module: ModuleType, class_name: str) -> type:
@@ -227,7 +401,11 @@ def _adapter_class(module: ModuleType, class_name: str) -> type:
 
 
 def create_adapter(name: str, **kwargs: Any) -> SequenceAdapter:
-    """Instantiate the adapter for *name*, importing its module on demand."""
+    """Instantiate the adapter for *name*, importing its module on demand.
+
+    Every registered backbone with an adapter is built here, whether or not the
+    notebooks offer it: what the panel shows is `offered()`, not what this can do.
+    """
     entry = get_entry(name)
     target = _FAMILY_ADAPTERS.get(entry.family)
     if target is None:

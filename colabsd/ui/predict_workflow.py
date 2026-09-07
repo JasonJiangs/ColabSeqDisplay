@@ -10,26 +10,42 @@ single variant is scored.
 Everything said about the backbone comes from `colabsd.backbones.registry` rather than from
 the bundle's name: whether it needs a 3Di string (and therefore whether this bundle can be
 scored at all), how wide its pooled feature is, whether it fits a free card, and what a run
-will cost. A backbone the registry does not know is called that, not guessed at.
+will cost. A backbone the registry does not know is called that, not guessed at — and a
+backbone the registry knows but the notebooks no longer offer is called that too, in as many
+words, because narrowing what a panel offers must not quietly break work already saved.
+`offered_backbones()` asks the registry which those are; no list of names is written here.
 
-As in `colabsd.ui.prepare_workflow`, every decision is a pure function of a `PredictState`
-(plus the `BundleFacts` read off the bundle): `visible_fields`, `notices`,
-`estimate_scoring_runtime`, `missing_columns`, `scale_note`. `PredictWizard` only wires
-those to ipywidgets with `observe()`/`on_click()`, which is all Colab needs — nothing here
-blocks a cell waiting for an answer, so `jupyter_ui_poll` would buy nothing. Presentation is
-`colabsd.ui.theme` and `colabsd.ui.core.Message`, the vocabulary the main wizard uses.
+The training notebook exports two archives now — the model bundle and the performance
+report — so the commonest upload mistake is the wrong one of the two. `identify_upload`
+reads the zip and says which it is, instead of letting `load_bundle` complain about a
+missing `manifest.json`.
+
+Every decision is a pure function of a `PredictState` (plus the `BundleFacts` read off the
+bundle): `visible_fields`, `notices`, `estimate_scoring_runtime`, `missing_columns`,
+`scale_note`, `load_failure_text`. `PredictWizard` only wires those to ipywidgets with
+`observe()`/`on_click()`. One call here does block the kernel — `google.colab.files.upload()`
+— and every call site says what it is waiting for before it opens (`upload_wait_text`),
+because a panel that freezes with every callback dead and says nothing looks broken.
+Presentation is `colabsd.ui.theme` and `colabsd.ui.core.Message`, the vocabulary the main
+wizard uses.
 """
 
 from __future__ import annotations
 
 import re
+import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from importlib import import_module
+from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import Any
 
+from colabsd.backbones import registry
 from colabsd.backbones.registry import BACKBONES, BackboneEntry
-from colabsd.ui import core, theme
+from colabsd.bundle import HEAD_NAME, LORA_NAME, MANIFEST_NAME
+from colabsd.errors import BackboneError
+from colabsd.ui import core, exports, theme
 from colabsd.ui.core import (
     COLAB_SESSION_MINUTES,
     Message,
@@ -37,12 +53,6 @@ from colabsd.ui.core import (
     render_messages,
     set_display,
 )
-
-# Scoring a variant is the same frozen forward pass region discovery makes, so it is costed
-# by the same function, off the same timed run, with the same registry ratios. Importing it
-# rather than restating it is the point: a second table of per-backbone rates here is a
-# table that would disagree with that one within a release.
-from colabsd.ui.prepare_workflow import forward_pass_minutes
 
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 
@@ -59,6 +69,198 @@ VARIANT_INPUTS = frozenset({"variants_source", "how_many", "random_seed"})
 
 #: Fields that decide which bundle **Load the bundle** reads.
 BUNDLE_INPUTS = frozenset({"bundle_source", "bundle_filename"})
+
+#: What `colabsd.bundle.save_bundle` writes into a model bundle, taken from that module so
+#: the two cannot drift apart.
+BUNDLE_MEMBERS: tuple[str, ...] = (MANIFEST_NAME, LORA_NAME, HEAD_NAME)
+
+#: What the other archive the main notebook exports holds, named by `colabsd.ui.exports` —
+#: the module that writes it. Somebody with two zips uploads the wrong one eventually, and
+#: these are the names that recognise it; a copy of them here would drift within a release.
+PERFORMANCE_MEMBERS: tuple[str, ...] = (
+    exports.MANIFEST_NAME,
+    exports.README_NAME,
+    *exports.REPORT_MEMBERS.values(),
+)
+
+#: The three report files inside it, which is what a user calls "the performance report".
+REPORT_MEMBERS: tuple[str, ...] = tuple(exports.REPORT_MEMBERS.values())
+
+#: Where a helper this panel shares with the training panel may live. `prepare_workflow`
+#: owns the forward-pass estimate today; folding preparation into the main notebook may hoist
+#: it into `core`. Asked at call time, in this order, so this module uses whichever copy
+#: exists instead of keeping a second one.
+SHARED_MODULES: tuple[str, ...] = ("colabsd.ui.core", "colabsd.ui.prepare_workflow")
+
+# ----------------------------------------------------------------------------------------
+# What the registry offers, and what it merely still knows.
+# ----------------------------------------------------------------------------------------
+
+
+def offered_backbones() -> list[str]:
+    """The backbones the notebooks let a user choose — `colabsd.backbones.registry.offered()`.
+
+    Not a list of names here, and not `BACKBONES` either. The two are different questions:
+    the registry still holds (and still builds) every backbone whose adapter ships with the
+    package, while the notebooks put a shorter list on screen. This panel is on the loading
+    side of that line, so it asks the registry which the short list is and never enforces it.
+    """
+    return registry.offered()
+
+
+def is_offered(backbone: str) -> bool:
+    """True when the notebooks still offer *backbone*. False, not an error, for a stranger."""
+    return backbone in BACKBONES and registry.is_offered(backbone)
+
+
+def withheld_note(backbone: str) -> str:
+    """The registry's answer to "where did my model go?", and something sayable if it has none.
+
+    `registry.withheld_note` raises when a family is offered nowhere and explained nowhere,
+    which is right for a test of the registry and wrong here: a panel whose whole job is to
+    explain a bundle must not fail while explaining one.
+    """
+    try:
+        return registry.withheld_note(backbone)
+    except BackboneError:
+        return f"`{backbone}` is in this colabsd, but the notebooks do not offer it."
+
+
+def families_phrase() -> str:
+    """`the ESM2 and SaProt families`, from the registry, however many there turn out to be."""
+    families = list(registry.OFFERED_FAMILIES)
+    if not families:  # pragma: no cover - a registry that offers nothing at all
+        return "no backbones at all"
+    if len(families) == 1:
+        return f"the {families[0]} family"
+    return "the " + ", ".join(families[:-1]) + f" and {families[-1]} families"
+
+
+# ----------------------------------------------------------------------------------------
+# The shared cost model, borrowed rather than restated.
+# ----------------------------------------------------------------------------------------
+
+
+def estimate_owner() -> ModuleType:
+    """The module that owns `forward_pass_minutes` — the one timed pass both panels quote."""
+    for module_name in SHARED_MODULES:
+        try:
+            module = import_module(module_name)
+        except ImportError:  # pragma: no cover - only a partial install gets here
+            continue
+        if hasattr(module, "forward_pass_minutes"):
+            return module
+    raise RuntimeError(
+        "None of " + ", ".join(SHARED_MODULES) + " defines forward_pass_minutes(), so the shared cost "
+        "model this panel quotes has moved. Point SHARED_MODULES at wherever it went rather than "
+        "writing a second table of per-backbone rates here."
+    )
+
+
+def forward_pass_minutes(
+    backbone: str, *, n_sequences: int, length: int, has_gpu: bool
+) -> tuple[float, float] | None:
+    """Minutes for `n_sequences` frozen forward passes of `length` residues, low to high.
+
+    Scoring a variant is the same frozen forward pass region discovery makes, so it is costed
+    by the same function, off the same timed run, with the same registry ratios. A second
+    table of per-backbone rates here is a table that would disagree with that one within a
+    release, so this delegates to `estimate_owner()` rather than restating the arithmetic.
+    """
+    owner = estimate_owner()
+    return owner.forward_pass_minutes(backbone, n_sequences=n_sequences, length=length, has_gpu=has_gpu)
+
+
+# ----------------------------------------------------------------------------------------
+# Uploading: the one call that stops the panel dead.
+# ----------------------------------------------------------------------------------------
+
+
+def upload_wait_text(what: str) -> str:
+    """What to say *before* `files.upload()` takes the kernel, so the freeze is explained.
+
+    `google.colab.files.upload()` blocks the cell until the browser answers. While it waits
+    every widget callback in this panel is dead: nothing responds, nothing redraws, and the
+    panel keeps whatever state it had when the button was pressed. Said afterwards the
+    sentence is useless, so every call site here says it first — in `colabsd.ui.core`'s
+    words, because the main panel blocks on the same call and two wordings would drift.
+    """
+    return core.upload_notice(what)
+
+
+def upload_cancelled_text(what: str) -> str:
+    """What to say when the picker came back with nothing in it.
+
+    `colabsd.ui.core`'s words again: the main panel blocks on the same call and cancels the
+    same way, and two wordings for one outcome drift.
+    """
+    return core.upload_cancelled_notice(what)
+
+
+# ----------------------------------------------------------------------------------------
+# Which of the two archives did they just hand us?
+# ----------------------------------------------------------------------------------------
+
+
+def archive_kind(names: Sequence[str]) -> str:
+    """What a zip's member list says the zip is: `model_bundle`, `performance_report`, `unknown`.
+
+    Compared on base names so a zip that nests its files under a folder is still recognised,
+    which is what a user who unzipped and rezipped one hands over.
+    """
+    found = {PurePosixPath(str(name)).name.lower() for name in names if not str(name).endswith("/")}
+    if all(member.lower() in found for member in BUNDLE_MEMBERS):
+        return "model_bundle"
+    if found & {member.lower() for member in PERFORMANCE_MEMBERS}:
+        return "performance_report"
+    return "unknown"
+
+
+def identify_upload(path: Path | str) -> str:
+    """Read *path* far enough to name it: `missing`, `not_a_zip`, or an `archive_kind`."""
+    path = Path(path)
+    if not path.is_file():
+        return "missing"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive_kind(archive.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return "not_a_zip"
+
+
+def load_failure_text(path: Path | str, error: Exception) -> str:
+    """Why a file could not be loaded as a bundle, in terms of what the file actually is.
+
+    The performance archive and the model bundle are both zips written by the same export
+    step, so uploading the wrong one is the mistake to expect. Saying "missing manifest.json"
+    to somebody holding the report archive tells them nothing they can act on.
+    """
+    path = Path(path)
+    kind = identify_upload(path)
+    if kind == "performance_report":
+        also_called = "" if path.name == exports.DEFAULT_ARCHIVE_NAME else f" (`{exports.DEFAULT_ARCHIVE_NAME}`)"
+        return (
+            f"`{path.name}` is the **performance archive**{also_called}, not the model bundle. It holds "
+            f"`{'`, `'.join(REPORT_MEMBERS)}` — the numbers and the figure from a training run — and no model "
+            "weights, so nothing here can score with it. The file this step wants is the other archive that "
+            f"export step wrote, `{exports.DEFAULT_BUNDLE_NAME}`, which holds `{'`, `'.join(BUNDLE_MEMBERS)}`."
+        )
+    if kind == "missing":
+        return (
+            f"There is no file at `{path}`. Check the name, or switch **Bundle** back to "
+            "`upload_model_bundle_zip` and upload it."
+        )
+    if kind == "not_a_zip":
+        return (
+            f"`{path.name}` is not a readable .zip. A model bundle is a zip written by ColabSeqDisplay's "
+            "export step; re-download it, in case the transfer truncated it."
+        )
+    if kind == "unknown":
+        return (
+            f"`{path.name}` is a zip, but it carries none of `{'`, `'.join(BUNDLE_MEMBERS)}`, so it was "
+            f"not written by ColabSeqDisplay's export step ({error})."
+        )
+    return f"`{path.name}` looks like a model bundle but could not be loaded: {error}"
 
 
 @dataclass(frozen=True)
@@ -105,9 +307,28 @@ class BundleFacts:
         return self.entry is not None
 
     @property
+    def offered(self) -> bool:
+        """True when the notebooks would still let somebody choose this backbone today.
+
+        A bundle built from one they no longer offer loads, describes and scores exactly as
+        it always did: the narrowing is about what can be trained from the panel, not about
+        what a saved model is allowed to do.
+        """
+        return self.registered and is_offered(self.backbone)
+
+    @property
     def needs_structure(self) -> bool:
-        """True when the registry says this backbone reads a 3Di string as well as residues."""
-        return bool(self.entry and self.entry.needs_structure)
+        """True when this backbone cannot be tokenized without a wild-type 3Di string.
+
+        `registry.needs_wt_3di`, not `BackboneEntry.needs_structure`: METL needs a structure
+        too, but a Rosetta-relaxed one no step here produces, and it has no adapter to feed.
+        """
+        return self.registered and registry.needs_wt_3di(self.backbone)
+
+    @property
+    def runnable(self) -> bool:
+        """True when `registry.create_adapter` can rebuild this backbone to score with."""
+        return self.registered and registry.has_adapter(self.backbone)
 
     @property
     def fits_a_free_card(self) -> bool:
@@ -122,6 +343,8 @@ class BundleFacts:
         parts = [f"{self.entry.family} family", f"{self.entry.embed_dim}-d pooled feature"]
         if self.entry.hf_id:
             parts.append(self.entry.hf_id)
+        if not self.offered:
+            parts.append("no longer offered in the notebooks — still loaded and scored here")
         return ", ".join(parts)
 
     @property
@@ -174,7 +397,8 @@ class PredictState:
     """Everything scoring is decided from. No widgets, no side effects."""
 
     bundle_source: str = "upload_model_bundle_zip"
-    bundle_filename: str = "model_bundle.zip"
+    #: The export step names the file; this only has to agree with it.
+    bundle_filename: str = exports.DEFAULT_BUNDLE_NAME
     variants_source: str = "upload_variants_csv"
     how_many: int = 200
     random_seed: int = 0
@@ -186,6 +410,9 @@ class PredictState:
     facts: BundleFacts | None = None
     n_variants: int = 0
     variant_columns: tuple[str, ...] = ()
+    #: Why the last **Load the bundle** was refused, in words a user can act on. Empty until
+    #: something goes wrong; cleared as soon as a bundle loads.
+    load_problem: str = ""
 
 
 def parse_list(text: str) -> list[str]:
@@ -237,9 +464,9 @@ def estimate_scoring_runtime(
 ) -> RuntimeEstimate:
     """Cost the scoring run before it starts, from the registry and the wild-type length.
 
-    `prepare_workflow.forward_pass_minutes` owns the arithmetic and the one timed pass it
-    is scaled from. A backbone the registry cannot cost gets no number at all rather than
-    an invented one.
+    `forward_pass_minutes` borrows the arithmetic, and the one timed pass it is scaled from,
+    from whichever module owns it. A backbone the registry cannot cost gets no number at all
+    rather than an invented one.
     """
     backbone = "" if facts is None else facts.backbone
     length = ASSUMED_LENGTH if facts is None or facts.wt_length <= 0 else facts.wt_length
@@ -307,15 +534,18 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
     facts = state.facts
     out: list[Message] = []
     if facts is None:
-        out.append(
-            Message(
-                "no_bundle",
-                "stop",
-                "No bundle loaded yet. Upload the `model_bundle.zip` written by the export step of "
-                "ColabSeqDisplay.ipynb — it carries its own backbone, pooling, spec and weights, so nothing "
-                "else has to match.",
+        if state.load_problem:
+            out.append(Message("bundle_rejected", "stop", state.load_problem))
+        else:
+            out.append(
+                Message(
+                    "no_bundle",
+                    "stop",
+                    "No bundle loaded yet. Upload `model_bundle.zip` — the archive with the weights in it, "
+                    "not the performance archive ColabSeqDisplay.ipynb exports beside it. The bundle carries "
+                    "its own backbone, pooling, spec and weights, so nothing else has to match.",
+                )
             )
-        )
         return out
 
     if not facts.registered:
@@ -325,7 +555,8 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "warning",
                 f"This bundle names the backbone `{facts.backbone}`, which is not in this colabsd's registry. "
                 "It can still be rebuilt if the bundle records a HuggingFace id, but nothing here can tell you "
-                "what it needs or what it will cost. Upgrading colabsd is the usual fix.",
+                "what it needs or what it will cost. Upgrading colabsd is the usual fix; this one offers "
+                f"{', '.join(offered_backbones())}.",
             )
         )
     elif facts.needs_structure and not facts.carries_three_di:
@@ -335,7 +566,29 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "stop",
                 f"`{facts.backbone}` reads a wild-type 3Di string alongside the residues, and this bundle's "
                 "spec carries none — scoring would fail while rebuilding the backbone. Re-export the bundle "
-                "from a run whose spec had `wt_3di` set (the Prepare notebook writes that string).",
+                "from a run whose spec had `wt_3di` set; the wild-type 3Di step of ColabSeqDisplay.ipynb "
+                "writes that string.",
+            )
+        )
+    if facts.registered and not facts.offered:
+        out.append(
+            Message(
+                "backbone_not_offered",
+                "info",
+                withheld_note(facts.backbone)
+                + f" ColabSeqDisplay.ipynb offers {families_phrase()} now. None of that changes this bundle: "
+                "it loads, it describes itself, and it scores exactly as it did. What you cannot do from the "
+                "notebook any more is train a new one on this backbone.",
+            )
+        )
+    if facts.registered and not facts.runnable:
+        out.append(
+            Message(
+                "no_adapter",
+                "stop",
+                f"`{facts.backbone}` is in this colabsd's registry but has no adapter in the package, so "
+                "nothing here can rebuild it and this bundle cannot be scored. "
+                + withheld_note(facts.backbone),
             )
         )
     if facts.registered and not facts.fits_a_free_card:
@@ -469,7 +722,10 @@ def intro_html() -> str:
     return theme.heading_html("Score variants with a saved model") + theme.note_html(
         "Upload a `model_bundle.zip` and a table of variants; get a ranked prediction table back. No training "
         "happens here, and the bundle needs nothing else: it carries its backbone, its LoRA weights, its head, "
-        "its library spec, its frozen pooling coordinates and its provenance."
+        "its library spec, its frozen pooling coordinates and its provenance.\n\n"
+        f"ColabSeqDisplay.ipynb exports two archives. This step wants `{exports.DEFAULT_BUNDLE_NAME}`; the "
+        f"other one, `{exports.DEFAULT_ARCHIVE_NAME}`, holds the performance report "
+        "(`" + "`, `".join(REPORT_MEMBERS) + "`) and carries no weights."
     )
 
 
@@ -560,7 +816,10 @@ class PredictRunners:
     score_variants: Callable[..., Any]
     read_variant_csv: Callable[[Path], Any]
     one_to_three_letter: Callable[[], dict[str, str]]
-    upload: Callable[[str], Path]
+    #: `upload(what, announce=None)`. `announce` is where the "this is about to freeze the
+    #: panel" sentence goes, so the explanation is printed by the code that does the blocking
+    #: rather than by a caller who might forget.
+    upload: Callable[..., Path]
     download: Callable[[Path], None]
     show_table: Callable[[Any], None]
 
@@ -572,16 +831,18 @@ def default_runners() -> PredictRunners:
     from colabsd.data import read_variant_csv
     from colabsd.predict import score_variants
 
-    def upload(what: str) -> Path:
+    def upload(what: str, announce: Callable[[str], None] | None = None) -> Path:
         try:
             from google.colab import files  # noqa: PLC0415
         except ImportError:
-            raise RuntimeError(
-                f"Uploading needs Colab. Outside it, put {what} in the working folder and name it in the form."
-            ) from None
+            raise RuntimeError(core.upload_needs_colab_notice(what)) from None
+        # Said here, immediately before the call and never after it: files.upload() holds the
+        # kernel until the browser answers, and a panel that freezes without a word looks
+        # broken. Colab flushes this to the output before the picker opens.
+        (announce or print)(upload_wait_text(what))
         uploaded = files.upload()
         if not uploaded:
-            raise RuntimeError(f"No file was uploaded for {what}.")
+            raise RuntimeError(upload_cancelled_text(what))
         return Path(next(iter(uploaded))).resolve()
 
     def download(path: Path) -> None:
@@ -627,6 +888,7 @@ class PredictWizard:
         self.variants: Any = None
         self.ranked: Any = None
         self.ranked_path: Path | None = None
+        self.load_problem: str = ""
 
         style = {"description_width": "initial"}
 
@@ -644,7 +906,7 @@ class PredictWizard:
                 layout=ipywidgets.Layout(width="max-content"),
             ),
             "bundle_filename": ipywidgets.Text(
-                value="model_bundle.zip", description="File name:", style=style, layout=wide()
+                value=exports.DEFAULT_BUNDLE_NAME, description="File name:", style=style, layout=wide()
             ),
             "variants_source": ipywidgets.RadioButtons(
                 options=list(VARIANT_SOURCES),
@@ -714,6 +976,7 @@ class PredictWizard:
             facts=self.facts,
             n_variants=n_variants,
             variant_columns=columns,
+            load_problem=self.load_problem,
         )
 
     def shown(self) -> frozenset[str]:
@@ -765,6 +1028,7 @@ class PredictWizard:
         self.bundle = None
         self.facts = None
         self.variants = None
+        self.load_problem = ""
         self.result_box.value = ""
         self._say("that change invalidated the loaded bundle; press Load the bundle again")
 
@@ -781,7 +1045,7 @@ class PredictWizard:
         self.notice_box.value = render_messages(notices(state, estimate=estimate))
 
     def display_box(self) -> Any:
-        """The whole form as one `VBox`, built but not shown — see `PrepareWizard.display_box`."""
+        """The whole form as one `VBox`, built but not shown, so a test can walk its children."""
         import ipywidgets
 
         order = [
@@ -815,22 +1079,43 @@ class PredictWizard:
 
     # -- actions -------------------------------------------------------------------------
 
+    def _ask_for_file(self, what: str) -> Path:
+        """Say what is being waited on, on screen and in the log, then block on the upload.
+
+        Both surfaces on purpose: the banner is what somebody staring at a dead panel reads,
+        the log line is the transcript that shows the explanation came first. The next
+        `refresh()` overwrites the banner.
+        """
+        self.notice_box.value = theme.message_html(upload_wait_text(what), "warning") + self.notice_box.value
+        return Path(self.runners.upload(what, announce=lambda text: self._say(plain_text(text))))
+
     def on_load_bundle(self, _button: Any = None) -> BundleFacts | None:
         """Load the bundle and put everything it contains on the screen."""
         state = self.state()
+        self.load_problem = ""
         try:
             path = (
-                self.runners.upload("model_bundle.zip")
+                self._ask_for_file(f"the `{exports.DEFAULT_BUNDLE_NAME}` written by ColabSeqDisplay.ipynb")
                 if state.bundle_source == "upload_model_bundle_zip"
                 else self.work_dir / state.bundle_filename.strip()
             )
+        except Exception as exc:
+            self.bundle, self.facts = None, None
+            self.load_problem = str(exc)
+            self._say(plain_text(self.load_problem))
+            self.refresh()
+            return None
+        try:
             self.bundle = self.runners.load_bundle(Path(path))
             self.facts = describe_bundle(self.bundle)
             self.variants = None
             self._say(f"loaded {path}")
         except Exception as exc:
             self.bundle, self.facts = None, None
-            self._say(f"could not load the bundle: {exc}")
+            # What the file actually is, rather than which key load_bundle missed: with two
+            # archives coming out of one export step, the wrong zip is the likely mistake.
+            self.load_problem = load_failure_text(Path(path), exc)
+            self._say("could not load the bundle: " + plain_text(self.load_problem))
         self.refresh()
         return self.facts
 
@@ -858,9 +1143,9 @@ class PredictWizard:
         assert facts is not None
         columns = list(facts.mutation_columns)
         if state.variants_source == "upload_variants_csv":
-            return self.runners.read_variant_csv(self.runners.upload(f"a variants CSV with the columns {columns}"))
+            return self.runners.read_variant_csv(self._ask_for_file(f"a variants CSV with the columns {columns}"))
         if state.variants_source == "rows_of_a_library_csv":
-            frame = self.runners.read_variant_csv(self.runners.upload(f"a library CSV with the columns {columns}"))
+            frame = self.runners.read_variant_csv(self._ask_for_file(f"a library CSV with the columns {columns}"))
             return frame.head(max(1, state.how_many)).reset_index(drop=True)
         residues = list(AMINO_ACIDS)
         if facts.three_letter:

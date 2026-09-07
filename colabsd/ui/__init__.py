@@ -85,13 +85,18 @@ from colabsd.ui.core import (
     structure_messages,
     t4_class,
     test_unlock_messages,
+    upload_cancelled_notice,
+    upload_needs_colab_notice,
+    upload_notice,
     visible_fields,
     visible_sections,
+    withdrawn_backbones,
+    withdrawn_text,
 )
 
 #: Every public name `colabsd.ui.core` defines, so a wizard can import the whole
-#: vocabulary from the package. Keep it in step with `core`, so that a new rule or
-#: helper cannot be added there and quietly left unreachable here.
+#: vocabulary from the package. `tests/test_ui_core.py` asserts the two agree, so a
+#: new rule or helper cannot be added to `core` and quietly left unreachable here.
 __all__ = [
     "DEFAULT_WORK_DIR",
     "apply_field_visibility",
@@ -166,7 +171,12 @@ __all__ = [
     "test_unlock_messages",
     "theme",
     "THREE_DI_SOURCES",
+    "upload_cancelled_notice",
+    "upload_needs_colab_notice",
+    "upload_notice",
     "visible_fields",
     "visible_sections",
+    "withdrawn_backbones",
+    "withdrawn_text",
     "WizardState",
 ]

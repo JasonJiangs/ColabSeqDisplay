@@ -9,7 +9,8 @@ Vendored from the *SequenceDisplay Workflow Optimization* research package
   ``validation_log_row``.
 
 Copied verbatim except where noted, so that ColabSeqDisplay installs without the research
-checkout. Every metric was checked against the original, value for value.
+checkout. ``tests/test_engine_heads.py`` asserts metric-for-metric equality against the
+original whenever that checkout is present.
 
 Changed while copying: upstream names the first four unnamed targets after the four 5NNK
 PAMs through a module-private ``INDEX2PAM`` table, which surprises anyone whose conditions

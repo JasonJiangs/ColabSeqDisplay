@@ -37,23 +37,30 @@ So:
 
 ## How the copy is held to the original
 
-Equality was established by running the two side by side, not by reading them. For the
-modules that carry a number — `lora.py`, `pooling.py`, `heads.py`, `train_config.py` —
-the vendored copy and the original were driven on real input (the bundled
-16,424-variant SlugCas9 library, all 28 shipped configs, a full LoRA fine-tune) and their
-outputs compared, rather than their source.
+`tests/test_engine_lora.py`, `tests/test_engine_pooling.py`, `tests/test_engine_heads.py`
+and `tests/test_engine_train_config.py` import the vendored module *and* the original and
+compare their outputs on real input, rather than comparing source.
 
-Three further checks close the gaps that leaves. `create_split` is pinned to the
-*recorded* index lists the study selected `config/best/` on, so it holds even if the
-original changes later. `inject_lora` is exercised against real HuggingFace attention
-naming (`EsmModel`, `T5EncoderModel`, built from a small config with no weights and no
-network) rather than a toy module tree. And every shared definition is compared at AST
-level, with docstrings, annotations, formatting and the deliberate renames normalised
-away, so an undocumented edit to a body here is caught even where no behavioural check
-reaches it — with the departures `ATTRIBUTION.md` records as the allow-list.
+`tests/test_engine_fidelity.py` closes three gaps in that argument. It pins `create_split`
+to the study's *recorded* index lists (`results/selection/split/seed_*/indices.pt`), which
+are the artefacts `config/best/` was selected on and hold even if upstream's source later
+changes; it runs `inject_lora` against real HuggingFace attention naming (`EsmModel`,
+`T5EncoderModel`, built from a small config with no weights and no network) rather than a
+toy module tree; and it compares every shared definition at AST level, with docstrings,
+annotations, formatting and the deliberate renames normalised away, so an undocumented
+edit to a body here fails even where no behavioural test reaches it. The six bodies that
+`ATTRIBUTION.md` records as deliberate departures are its allow-list: adding a seventh
+without recording it fails, and so does leaving one listed after it has been reverted.
 
-Anything that changes a module in this directory has to be put back through those
-comparisons, which need a copy of the original to compare against.
+These comparisons need the research checkout and skip cleanly without it, so the suite
+stays green for a user who only has this repository:
+
+```bash
+python -m pytest tests/ -q                                    # comparisons skip
+SEQDISPLAY_OPT_ROOT=/path/to/checkout python -m pytest tests/ -q   # comparisons run
+```
+
+Run the second form before merging any change to this directory.
 
 ## Layout
 

@@ -9,8 +9,9 @@ Vendored from the *SequenceDisplay Workflow Optimization* research package
 * ``seqdisplay_opt/utils/device.py`` — ``select_safe_device``, a transitive dependency of
   the torch training loop.
 
-Copied so that ColabSeqDisplay installs without the research checkout. Both copies were
-fitted on real data side by side: they predict identically for the same seed.
+Copied so that ColabSeqDisplay installs without the research checkout.
+``tests/test_engine_heads.py`` fits both copies on real data and asserts identical
+predictions for the same seed whenever that checkout is present.
 
 Left behind on purpose: the heads ColabSeqDisplay never reaches. Upstream registers eleven
 (``linear``, ``cnn``, ``random_forest``, ``hgb``, ``knn``, ``xgboost``, ``elastic_net``,

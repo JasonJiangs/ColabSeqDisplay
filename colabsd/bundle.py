@@ -18,6 +18,11 @@ Layout::
 `label_scaler` (the train-split z-score statistics upstream fits) and
 `unlock_count`. Without a label scaler `colabsd.predict` returns z-scored
 predictions and says so in the manifest.
+
+The provenance block is built by `provenance_block`, and `colabsd.ui.exports`
+stamps the same block into the performance archive a session downloads beside the
+bundle. The two therefore say "tuned" or "PROVISIONAL", and count the test-set
+reads, in one vocabulary rather than two that can drift apart.
 """
 
 from __future__ import annotations
@@ -44,6 +49,61 @@ SCHEMA_VERSION = 1
 MANIFEST_NAME = "manifest.json"
 LORA_NAME = "lora.pt"
 HEAD_NAME = "head.pt"
+
+#: What the hyperparameters behind a number are worth, in one word. Every artefact this
+#: package writes uses these two strings, so a reader who learns what "PROVISIONAL" means
+#: on a bundle already knows what it means on a performance archive.
+PROVISIONAL_STATUS = "PROVISIONAL"
+TUNED_STATUS = "tuned"
+
+
+def hyperparameter_status(is_provisional: bool) -> str:
+    """`"PROVISIONAL"` or `"tuned"` -- the one phrase every export uses for this."""
+    return PROVISIONAL_STATUS if is_provisional else TUNED_STATUS
+
+
+def utc_now() -> str:
+    """The timestamp every artefact written here is stamped with."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")  # noqa: UP017 -- datetime.UTC needs 3.11
+
+
+def sha256_hex(blob: bytes) -> str:
+    """The checksum every archived file is recorded under."""
+    return hashlib.sha256(blob).hexdigest()
+
+
+def file_sha256(path: str | Path) -> str:
+    """`sha256_hex` of a file on disk, read in chunks so a figure is never held twice."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def provenance_block(
+    *,
+    is_provisional: bool,
+    unlock_count: int,
+    notes: str | None = None,
+    best_config_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Who wrote this, from which registry entry, and how often the test set had been read.
+
+    Shared with `colabsd.ui.exports` so the model bundle and the performance archive
+    downloaded beside it describe the same run in the same words. `hyperparameter_status`
+    is spelled out next to the boolean because a reader opening the JSON months later
+    should not have to know which way round `is_provisional` points.
+    """
+    return {
+        "created_utc": utc_now(),
+        "colabsd_version": __version__,
+        "is_provisional": bool(is_provisional),
+        "hyperparameter_status": hyperparameter_status(bool(is_provisional)),
+        "best_config_meta": dict(best_config_meta or {}),
+        "unlock_count": int(unlock_count),
+        "notes": notes,
+    }
 
 
 @dataclass(frozen=True)
@@ -89,7 +149,7 @@ class Bundle:
     def describe(self) -> str:
         """One human-readable line for a notebook."""
         provenance = self.manifest.get("provenance", {})
-        status = "PROVISIONAL hyperparameters" if self.is_provisional else "tuned hyperparameters"
+        status = f"{hyperparameter_status(self.is_provisional)} hyperparameters"
         return (
             f"{self.model_name} · {self.pooling} · {status} · "
             f"{len(self.condition_columns)} conditions · test unlocked {self.unlock_count}x · "
@@ -158,13 +218,14 @@ def save_bundle(
         "metrics": metrics,
         "label_scaler": _label_scaler_payload(label_scaler),
         "provenance": {
-            "created_utc": _utc_now(),
-            "colabsd_version": __version__,
+            **provenance_block(
+                is_provisional=bool(getattr(best, "is_provisional", False)),
+                unlock_count=int(unlock_count),
+                notes=notes,
+                best_config_meta=dict(getattr(best, "meta", {}) or {}),
+            ),
+            # Only a bundle carries tensors, so only a bundle records what wrote them.
             "torch_version": torch.__version__,
-            "is_provisional": bool(getattr(best, "is_provisional", False)),
-            "best_config_meta": dict(getattr(best, "meta", {}) or {}),
-            "unlock_count": int(unlock_count),
-            "notes": notes,
         },
         "tensors": {
             "lora": _tensor_manifest(LORA_NAME, lora, lora_blob),
@@ -241,8 +302,15 @@ def save_bundle_from_run(
     region: dict[str, Any] | None = None,
     checkpoint: str | Path | None = None,
     notes: str | None = None,
+    unlock_count: int | None = None,
 ) -> Path:
-    """Bundle the best-validation run of a `colabsd.train.RunResult`."""
+    """Bundle the best-validation run of a `colabsd.train.RunResult`.
+
+    `unlock_count` is for a caller that has read `unlock.json` off disk: a `RunResult` held
+    in a notebook variable can only ever *undercount*, because it predates any unlock taken
+    after it was built, so the larger of the two numbers is the honest one and that is what
+    the manifest records. `colabsd.report` reads the counter the same way.
+    """
     import torch
 
     run = run_result.best_run() if checkpoint is None else None
@@ -254,12 +322,14 @@ def save_bundle_from_run(
         )
     blob = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     _require_checkpoint_pooling(blob, spec, run_result.pooling, region, checkpoint_path)
+    recorded = int(getattr(run_result, "unlock_count", 0) or 0)
+    unlocks = recorded if unlock_count is None else max(int(unlock_count), recorded)
     metrics = {
         "validation_summary": run_result.validation_summary,
         "validation_runs": run_result.runs,
         "selection_metric": run_result.selection_metric,
         "n_runs": run_result.n_runs,
-        "unlock_count": run_result.unlock_count,
+        "unlock_count": unlocks,
         "split_seeds": run_result.split_seeds,
         "model_seeds": run_result.model_seeds,
         "source_run": None if run is None else {"split_seed": run["split_seed"], "model_seed": run["model_seed"]},
@@ -277,7 +347,7 @@ def save_bundle_from_run(
         region=region,
         metrics=metrics,
         label_scaler=blob.get("label_scaler"),
-        unlock_count=run_result.unlock_count,
+        unlock_count=unlocks,
         notes=notes,
         adapter_dtype=getattr(run_result, "adapter_dtype", None),
         adapter_hf_id=getattr(run_result, "adapter_hf_id", None),
@@ -310,10 +380,6 @@ def _require_checkpoint_pooling(
         )
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")  # noqa: UP017 -- datetime.UTC needs 3.11
-
-
 def _serialize(state: dict[str, torch.Tensor]) -> bytes:
     import torch
 
@@ -333,7 +399,7 @@ def _read_tensors(
 
     blob = archive.read(name)
     expected = manifest.get("tensors", {}).get(key, {}).get("sha256")
-    if expected and hashlib.sha256(blob).hexdigest() != expected:
+    if expected and sha256_hex(blob) != expected:
         raise BundleError(
             f"{name} in {path} does not match its manifest checksum. The bundle is corrupt; re-download it."
         )
@@ -368,7 +434,7 @@ def _tensor_manifest(name: str, state: dict[str, torch.Tensor], blob: bytes) -> 
         "n_parameters": int(sum(int(tensor.numel()) for tensor in state.values())),
         "keys": sorted(state),
         "dtypes": {key: str(value.dtype) for key, value in sorted(state.items())},
-        "sha256": hashlib.sha256(blob).hexdigest(),
+        "sha256": sha256_hex(blob),
     }
 
 

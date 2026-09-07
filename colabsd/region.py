@@ -19,8 +19,8 @@ The forward pass keeps one `(batch, L, D)` tensor at a time and drops it.
 
 Precision matters here more than anywhere else in the package. Variants differ at a
 handful of residues, so away from them the score is O(1e-5) and the arithmetic noise
-of the forward pass is not negligible against it. Two rules follow, both established by
-running this module at each dtype over the bundled library:
+of the forward pass is not negligible against it. Two rules follow, both measured in
+`docs/REGION.md`:
 
 * Load the backbone with `from_pretrained(torch_dtype=...)`; never `model.to(dtype)`.
   ESM2 derives its rotary position index as `arange(L).type_as(inv_freq)`, and

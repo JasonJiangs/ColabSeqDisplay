@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
+from colabsd.backbones import registry
 from colabsd.backbones.registry import BACKBONES, BackboneEntry
 from colabsd.ui import theme
 from colabsd.ui.theme import Severity
@@ -42,14 +43,20 @@ DEFAULT_WORK_DIR = "colabsd_work"
 """Where a wizard writes when the notebook cell does not say. Relative on purpose: an
 absolute fallback would silently point outside whatever Drive folder the user mounted."""
 
-#: The three wizards. `train` is the main notebook, `prepare` builds a 3Di string
-#: and a pooling region for a new protein, `predict` scores variants from a bundle.
-MODES: tuple[str, ...] = ("train", "prepare", "predict")
+#: The two wizards left. `train` is the main notebook and `predict` scores variants from a
+#: bundle. There was a third — a standalone Prepare wizard that built a 3Di string and a
+#: pooling region — and it is gone: preparation is a *step* of the training panel now,
+#: derived from the backbone and the pooling chosen there rather than asked about again.
+#: `colabsd.ui.prepare_workflow` still owns those two blocks; nothing sets a mode for them.
+MODES: tuple[str, ...] = ("train", "predict")
 
-#: Where a wild-type 3Di string can come from, matching `colabsd.structure`.
+#: Where a wild-type 3Di string can come from, matching `colabsd.structure`. `bundled_example`
+#: and `session` are the two that need no work at all: a string that is already here, either
+#: shipped with the package or made earlier in this session.
 THREE_DI_SOURCES: tuple[str, ...] = (
     "none",
     "bundled_example",
+    "session",
     "paste",
     "upload_3di",
     "upload_structure",
@@ -70,11 +77,10 @@ FREE_T4_MEMORY_GB: float = 16.0
 L4_MEMORY_GB: float = 26.0
 
 #: Fallback for `reference_library_variants()` when the bundled example is not
-#: installed. When it is installed, the count is read from `library.csv` itself.
+#: installed. `tests/test_ui_core.py` asserts the two agree when it is.
 REFERENCE_LIBRARY_VARIANTS: int = 16424
 
-#: Fallback for `esmfold_safe_length()` when `colabsd.structure` cannot be imported;
-#: it is that module that owns the real limit.
+#: Fallback for `esmfold_safe_length()`; pinned against `colabsd.structure` in the tests.
 ESMFOLD_FALLBACK_LENGTH: int = 700
 
 GPU_TIERS: tuple[str, ...] = ("none", "t4", "l4", "a100", "other")
@@ -85,7 +91,6 @@ SECTION_ORDER: tuple[str, ...] = (
     "model",
     "hyperparameters",
     "training",
-    "region",
     "bundle",
     "variants",
     "storage",
@@ -98,7 +103,6 @@ SECTION_TITLES: dict[str, str] = {
     "model": "Backbone and pooling",
     "hyperparameters": "Hyperparameters for this pair",
     "training": "How many runs",
-    "region": "Pooling region",
     "bundle": "The trained model",
     "variants": "Variants to score",
     "storage": "Where the results are kept",
@@ -177,10 +181,36 @@ def backbone_entry(name: str) -> BackboneEntry | None:
     return BACKBONES.get(name)
 
 
+def _offered(name: str) -> bool:
+    """Whether the notebooks put this backbone in front of a user.
+
+    `colabsd.backbones.registry` owns the answer and nothing here keeps a second copy of it:
+    this is the join. A list of families kept here as well would let the dropdown and
+    `registry.offered()` disagree, and the dropdown is the one a user believes.
+    """
+    return registry.is_offered(name)
+
+
 def colab_backbones() -> list[str]:
-    """Registered backbones that have a Colab adapter, cheapest T4 run first."""
-    names = [name for name, entry in BACKBONES.items() if entry.tier != "local_only"]
+    """The backbones these notebooks offer, cheapest T4 run first.
+
+    Registered, not local-only, and in an offered family. Every user-facing list is built
+    from this one, so withdrawing a family withdraws it from the dropdown, from the
+    "pick one of these instead" messages and from the runtime summary at once.
+    """
+    names = [name for name, entry in BACKBONES.items() if entry.tier != "local_only" and _offered(name)]
     return sorted(names, key=_backbone_sort_key)
+
+
+def withdrawn_backbones() -> list[str]:
+    """Registered backbones the notebooks do not offer — the answer to "where did mine go?".
+
+    Deliberately only the *list*. Why each one is off the form differs — a 1.2B encoder that
+    needs an L4, an SDK the notebooks will not install, a model with no HuggingFace weights at
+    all — and `colabsd.backbones.registry.withheld_reason` is where those reasons are written.
+    A single sentence here covering all of them was wrong about four of the seven.
+    """
+    return sorted(name for name in BACKBONES if not _offered(name))
 
 
 def _backbone_sort_key(name: str) -> tuple[int, int, str]:
@@ -456,13 +486,19 @@ def has_three_di(state: WizardState) -> bool:
 
 
 def _data_section(state: WizardState) -> bool:
-    if state.mode in ("train", "prepare"):
+    if state.mode == "train":
         return True
     return state.mode == "predict" and state.variant_source == "library_head"
 
 
 def _structure_section(state: WizardState) -> bool:
-    return state.mode == "prepare" or needs_structure(state)
+    """The 3Di question exists only for a backbone that reads one.
+
+    Not "show it and grey it out": with a Prepare wizard of its own the section was always
+    on screen and the backbone only decided whether it mattered. It is a step of the
+    training panel now, so an ESM2 removes it.
+    """
+    return needs_structure(state)
 
 
 def _three_di_is(source: str) -> Predicate:
@@ -507,18 +543,16 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("structure_file", "structure", _three_di_is("upload_structure")),
     FieldRule("chain", "structure", _three_di_is("upload_structure")),
     FieldRule("esmfold_note", "structure", _three_di_is("esmfold")),
-    FieldRule("backbone", "model", _mode("train", "prepare")),
+    FieldRule("backbone", "model", _mode("train")),
     FieldRule("pooling", "model", _mode("train")),
     FieldRule("region_source", "model", _all(_mode("train"), _cosine_pooling)),
     FieldRule("region_filename", "model", _all(_mode("train"), _cosine_pooling)),
-    FieldRule("dtype", "model", _all(_mode("train", "prepare"), _advanced)),
+    FieldRule("dtype", "model", _all(_mode("train"), _advanced)),
     FieldRule("hyperparameters", "hyperparameters", _mode("train")),
     FieldRule("n_split_seeds", "training", _mode("train")),
     FieldRule("n_model_seeds", "training", _mode("train")),
     FieldRule("run_name", "training", _all(_mode("train"), _advanced)),
     FieldRule("resume_finished_runs", "training", _all(_mode("train"), _advanced)),
-    FieldRule("region_percentile", "region", _mode("prepare")),
-    FieldRule("region_n_sample", "region", _mode("prepare")),
     FieldRule("bundle_path", "bundle", _mode("predict")),
     FieldRule("variant_source", "variants", _mode("predict")),
     FieldRule("variants_csv", "variants", _all(_mode("predict"), _upload_variants)),
@@ -605,6 +639,8 @@ def backbone_messages(state: WizardState, runtime: Runtime | None = None) -> lis
         ]
     if entry.tier == "local_only":
         return [Message("backbone_not_in_colab", "stop", f"**{name}** cannot run in Colab. {entry.notes}")]
+    if not _offered(name):
+        return [Message("backbone_withdrawn", "stop", withdrawn_text(name))]
     out: list[Message] = []
     if entry.approx_lora_minutes_t4 is None and t4_class(runtime):
         card = ""
@@ -628,6 +664,21 @@ def backbone_messages(state: WizardState, runtime: Runtime | None = None) -> lis
             )
         )
     return out
+
+
+def withdrawn_text(name: str) -> str:
+    """Why this backbone is not on the form, in the registry's words, plus what to pick instead.
+
+    The reason is per backbone and it is asked for rather than asserted, because the reasons
+    genuinely differ and a blanket one is a sentence that is false about somebody's model. A
+    family the registry has not explained is a bug in the registry, not a red box on the page
+    that takes the panel down: say the short thing and still name the offered list.
+    """
+    try:
+        reason = registry.withheld_note(name)
+    except Exception:
+        reason = f"`{name}` is in this package but the notebooks do not offer it."
+    return f"{reason} Pick one of: {', '.join(colab_backbones())}."
 
 
 def t4_class(runtime: Runtime | None) -> bool:
@@ -984,11 +1035,17 @@ def detect_runtime(*, drive_mount_point: str | Path = "/content/drive") -> Runti
 
 
 def backbone_fit(runtime: Runtime | None) -> dict[str, str]:
-    """Every registered backbone mapped to `ok` / `needs_bigger_gpu` / `needs_gpu` / `unavailable`."""
+    """Every registered backbone mapped to `ok` / `needs_bigger_gpu` / `needs_gpu` / `unavailable` / `not_offered`.
+
+    `not_offered` is not a verdict about the machine: the adapter exists and would run,
+    but the notebooks do not put that family on the form. `withdrawn_backbones` says which.
+    """
     verdicts: dict[str, str] = {}
     for name, entry in BACKBONES.items():
         if entry.tier == "local_only":
             verdicts[name] = "unavailable"
+        elif not _offered(name):
+            verdicts[name] = "not_offered"
         elif runtime is None or not runtime.has_gpu:
             verdicts[name] = "needs_gpu"
         elif entry.approx_lora_minutes_t4 is None and runtime.is_t4:
@@ -1134,6 +1191,42 @@ def mount_drive(
 # ------------------------------------------------------------------------ widget layer
 
 
+def upload_notice(what: str) -> str:
+    """What to say *before* `google.colab.files.upload()`, which blocks the kernel.
+
+    While that picker is open the kernel is inside a blocking call, so every widget callback
+    on the page is dead: the panel freezes in whatever state the button left it in, nothing
+    updates, and nothing on screen says why. The only thing that can be done about it is to
+    say so first — which is what this is for, printed before the call, never after.
+    """
+    return (
+        f"**Waiting for {what}.** The file picker below blocks this notebook while it is open: until you "
+        "choose a file, every control on this page is frozen and no message will change. That is Colab's "
+        "upload, not a crash. **Cancel upload** in the picker releases the page again."
+    )
+
+
+def upload_cancelled_notice(what: str) -> str:
+    """What to say when the picker came back empty, so the freeze has a stated end.
+
+    Cancelling is the documented way out of the block `upload_notice` warns about, so the
+    outcome cannot be a bare "no file": it has to say the page is answering again.
+    """
+    return (
+        f"Nothing was uploaded for {what} — the picker was cancelled or it timed out. The panel is live "
+        "again; press the button again when you have the file."
+    )
+
+
+def upload_needs_colab_notice(what: str) -> str:
+    """What to say when there is no browser picker to open, because this is not Colab.
+
+    An `ImportError` on `google.colab` is true and useless. The panel already accepts a typed
+    path beside every upload button, so the answer is to name that route.
+    """
+    return f"Uploading needs Colab. Outside it, put {what} in the working folder and name it in the form."
+
+
 def set_display(widget: Any, visible: bool) -> None:
     """Show or hide one widget — the whole of the ColabPLM interaction, in one line."""
     widget.layout.display = None if visible else "none"
@@ -1179,6 +1272,16 @@ class Section:
         self.visible = bool(visible)
         if self._box is not None:
             set_display(self._box, self.visible)
+
+    def set_title(self, title: str) -> None:
+        """Rename a built section.
+
+        A page whose steps appear and disappear has to number the ones that are there:
+        skipping from 2 to 4 reads as a step the user has failed to find.
+        """
+        self.title = title
+        if self._box is not None:
+            self._box.children[0].value = theme.heading_html(title)
 
     def show(self) -> None:
         self.set_visible(True)
