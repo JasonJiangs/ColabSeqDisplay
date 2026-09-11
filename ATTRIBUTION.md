@@ -1,8 +1,8 @@
 # Attribution
 
 **The science in this repository is not ours.** The LoRA implementation, the training
-loop, the pooling strategies, the metrics, the head registry, the split protocol and every
-tuned hyperparameter in `config/best/` come from a separate research project:
+loop, the pooling, the metrics, the head registry, the split protocol and every tuned
+hyperparameter in `config/best/` come from a separate research project:
 
 > **SequenceDisplay-Workflow-Optimization** — Python package `seqdisplay_opt`.
 > A research pipeline that compares protein language model representations for predicting
@@ -11,9 +11,9 @@ tuned hyperparameter in `config/best/` come from a separate research project:
 > Repository: <https://github.com/JasonJiangs/SequenceDisplay-Workflow-Optimization>
 
 `ColabSeqDisplay` is the notebook layer over that work: it loads backbones from
-HuggingFace, builds variant sequences from a user's CSV, discovers pooling regions,
-looks up a pre-tuned configuration, orchestrates a run, reports it against a one-hot
-floor, and packs the result into a `.zip`. It performs no method development. If you
+HuggingFace, builds variant sequences from a user's CSV, looks up a pre-tuned
+configuration, orchestrates a run, reports it against a one-hot floor, and packs the
+result into a `.zip`. It performs no method development. If you
 publish a result produced with this tool, the method you are using is theirs — see
 [Citation](#citation).
 
@@ -42,9 +42,9 @@ authoritative for the details.
 | `colabsd/engine/train_config.py` | `seqdisplay_opt/finetuning/lora_reevaluate.py`, `seqdisplay_opt/finetuning/lora_optuna.py` | `train_eval_config`, `load_lora_best_config`, `SourceTrial`, `LabelScaler`, the model-configuration, state-dict, prediction and split-evaluation helpers |
 | `colabsd/engine/heads.py` | `seqdisplay_opt/models/heads.py`, `models/factory.py`, `utils/device.py` | `HEAD_REGISTRY`, `register_head`, `BaseHead`, `TorchHeadBase`, `MLPHead`, `RidgeHead`, `create_head`, `select_safe_device` |
 | `colabsd/engine/metrics.py` | `seqdisplay_opt/metrics/evaluation.py`, `seqdisplay_opt/finetuning/validation.py` | `evaluate_predictions`, `precision_k`, `ndcg_k`, `mean_metric`, `TRACKED_METRICS`, `summarize_metrics`, `validation_log_row` |
-| `colabsd/engine/pooling.py` | `seqdisplay_opt/pooling/{base,factory,reducers,regions,named_mean}.py` | The five modules flattened into one: `PoolingStrategy`, the registry, `pool`, `mean_reduce`, position/region selection and the five named mean-pooling strategies |
+| `colabsd/engine/pooling.py` | `seqdisplay_opt/pooling/{reducers,regions}.py` | `mean_reduce` and `select_positions`, verbatim. Upstream's strategy base class, registry, factory and five named poolings are not here: this pipeline pools one way, so `pool` composes the two reducers directly |
 | `colabsd/engine/splits.py` | `seqdisplay_opt/data/splits.py`, `seqdisplay_opt/utils/torch_io.py` | `create_split`, `create_all_splits`, `load_split`, `create_nested_selection_split`; `load_torch` inlined as the private `_load_torch` |
-| `colabsd/engine/protein_db.py` | `seqdisplay_opt/data/protein_database.py` | The region-resolution half: `POOLING_REGIONS`, `load_protein_record`, `resolve_region_positions_0based`, `resolve_pooling_positions_0based` |
+| `colabsd/engine/protein_db.py` | `seqdisplay_opt/data/protein_database.py` | The record loader: `load_database` and `load_protein_record`. Upstream's `POOLING_REGIONS` table and its named-region resolvers are not here — a record lists the sites the library mutates, and there is no region to name |
 | `colabsd/engine/config_space.py` | `seqdisplay_opt/config/optuna_space.py` | Three resolution helpers and `OBJECTIVE_METRICS`. The Optuna search space itself stayed upstream |
 | `colabsd/engine/schema.py` | `seqdisplay_opt/config/schema.py` | `TrainingConfig` |
 | `colabsd/engine/one_hot.py` | `seqdisplay_opt/baselines/one_hot.py` | The `AA3` vocabulary, `AA3_TO_INDEX`, and the per-site one-hot encoder |
@@ -58,8 +58,10 @@ Only what the notebooks reach was copied. Not here, and still upstream's: the Op
 machinery (study databases, trial pruning, the `fcntl` locking that lets two HPC workers
 share a study), every `argparse` command line and console-script entry point, the
 `fair-esm` and local-catalogue checkpoint loaders, the cached-embedding selection CLI, the
-one-hot baseline's run harness and predictor registry, and nine of upstream's eleven
-regression heads — dropping those also drops a hard `xgboost` dependency.
+one-hot baseline's run harness and predictor registry, nine of upstream's eleven
+regression heads — dropping those also drops a hard `xgboost` dependency — and the whole
+pooling-strategy layer: the registry, the factory, the five named poolings and the
+protein-region tables they resolve through.
 
 ## What we changed while copying, and why
 
@@ -102,6 +104,21 @@ covered by a test.
    rather than against upstream's checkout root.
 7. **Imports are lazy where they were eager**, so that importing `colabsd.engine.pooling`
    or `colabsd.engine.formats` does not pull in `torch`. No behaviour depends on it.
+8. **There is one pooling, so nothing dispatches on a name.** Upstream registers five
+   `PoolingStrategy` classes and `pool(name, ...)` looks one up, each resolving a named
+   region of a protein through `POOLING_REGIONS`. This pipeline averages the embeddings at
+   the residues the library mutates and offers no alternative, so `pool(token_embs,
+   positions)` composes `select_positions` and `mean_reduce` directly, a protein record
+   lists `mutated_positions_1based` instead of a `regions` mapping, and
+   `config_space.pooling_positions_0based` reads those positions rather than the pooling's
+   name. `mutation_site_mean` survives as a *label* — the `config/best/` filename suffix
+   and the string every artefact records — not as a choice.
+9. **`load_lora_best_config` defaults nothing to upstream's own study.** Its
+   `training.pooling` default is `POOLING_NAME` and its `protein:` default is empty, where
+   upstream's are the strategy its study selected and the protein record packaged in its
+   checkout. All 28 shipped entries set the pooling explicitly and none declares a protein,
+   so no file on disk parses differently; what changes is that a config which omits the
+   block is told so instead of being resolved against somebody else's protein.
 
 Three upstream quirks were **kept on purpose**, because changing them would move a
 guard or a number: `create_split` still caches on the output directory alone (`colabsd.data`
@@ -115,14 +132,14 @@ holds it.
 Equality is asserted, not assumed. `tests/test_engine_lora.py`,
 `tests/test_engine_pooling.py`, `tests/test_engine_heads.py` and
 `tests/test_engine_train_config.py` import both the vendored module and the original and
-run them side by side on real input — the bundled 16,424-variant SlugCas9 library, all 28
+run them side by side on real input — the bundled 124-variant MG8 PETase library, all 28
 shipped configs, a full LoRA fine-tune — asserting equal outputs rather than equal source.
 
 Those comparisons need the research checkout. They locate it by importing `seqdisplay_opt`
 and then by the `SEQDISPLAY_OPT_ROOT` environment variable, and **skip cleanly when neither
 is available**, so the suite is green for a user who has only this repository. On a bare
 clone every test passes and the skips are exactly these comparisons plus four that want
-HuggingFace weights; with a checkout reachable, roughly eighty more tests run and only the
+HuggingFace weights; with a checkout reachable, around sixty more tests run and only the
 four weight-dependent ones skip. To run them:
 
 ```bash
@@ -137,20 +154,19 @@ it: the search space (`load_lora_optuna_config`, `suggest_lora_params`,
 `DEFAULT_LORA_CONFIG`) and the per-trial training entry point (`train_one_trial`) stayed
 upstream. It reaches them through one guarded helper, `_import_research`, which names the
 checkout and the environment variable when it is missing rather than raising a bare
-`ModuleNotFoundError`. `scripts/investigate_region.py --stage compare` is the same shape:
-it compares against a published region only that repository holds.
+`ModuleNotFoundError`. It also stages the protein record in *both* shapes, because
+upstream's own validator reaches the pooled residues through a `regions` mapping.
 
-Neither is part of the product. The notebooks, `colabsd`, the 28 shipped configs and the
-test suite are all standalone; these two developer scripts are the documented exception.
+It is not part of the product. The notebooks, `colabsd`, the 28 shipped configs and the
+test suite are all standalone; this one developer script is the documented exception.
 
 ## Data and hyperparameters
 
-**`examples/slugcas9_5nnk/`** is upstream's SlugCas9 5NNK dataset, rearranged into the
-shape `colabsd` expects. `library.csv`, `wt.fasta` and `wt_3di.txt` are byte-identical to
-upstream's `data/processed/5nnk_avg_mut_num.csv`, `data/protein/slugcas9_wt.fasta` and
-`data/protein/slugcas9_wt_3di.txt`. The two `region_*.json` files are the exception: they
-are recomputed here and differ from upstream's published region — the reason, and the
-evidence, are in [`docs/REGION.md`](docs/REGION.md).
+**`examples/mg8_petases/`** is not upstream's. It is a 124-variant engineered-PETase
+library, derived here from the spreadsheet that ships beside it, and it replaced upstream's
+much larger dataset as the bundled example so that a complete run fits inside one Colab
+session. [`examples/mg8_petases/README.md`](examples/mg8_petases/README.md) records how the
+table was built and what is known about it.
 
 **`config/best/`** is entirely derived from upstream's study. The ten entries marked
 `status: tuned` are its selected LoRA configurations, taken from
@@ -164,8 +180,8 @@ figures in `README.md`, in `config/best/README.md`, in each `_meta` block and in
 notebook's own dropdown — 0.5478 to 0.5636 on SlugCas9 5NNK — are upstream's
 re-evaluation results, not measurements made here. Exactly one training run has ever gone
 through `colabsd`'s own path end to end, and it is labelled as an illustration where it
-appears. The one-hot floor numbers and the region-investigation timings in `results/` are
-this repository's own.
+appears. The one-hot floor numbers, and the single timed forward pass
+`colabsd.ui.core.TIMED_PASS` records, are this repository's own.
 
 ## Licence
 
@@ -184,8 +200,8 @@ grant permissions over code it did not originate.
 
 So the boundary is clear, everything outside `colabsd/engine/` was written for this
 project: the HuggingFace backbone adapters and registry (`colabsd/backbones/`), the
-library specification and CSV handling (`colabsd/spec.py`, `colabsd/data.py`), region
-discovery (`colabsd/region.py`), wild-type 3Di construction (`colabsd/structure.py`),
+library specification and CSV handling (`colabsd/spec.py`, `colabsd/data.py`),
+wild-type 3Di construction (`colabsd/structure.py`),
 best-config lookup (`colabsd/bestconfig.py`), the run orchestration and locked-test
 protocol (`colabsd/train.py`), the one-hot floor's harness (`colabsd/baseline.py`),
 reporting (`colabsd/report.py`), the model bundle (`colabsd/bundle.py`), scoring

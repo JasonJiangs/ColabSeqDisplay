@@ -1,11 +1,11 @@
 """ColabSeqDisplay — a no-code Colab facade over a protein-language-model workflow.
 
-`colabsd.engine` owns the science: LoRA injection, the training loop, pooling,
-metrics and splits. It is vendored from the SequenceDisplay-Workflow-Optimization
-research code (see ATTRIBUTION.md and the header of each engine module). The rest
-of this package owns everything that makes it runnable from a notebook:
-HuggingFace backbone loading, building sequences from a user's CSV, WT 3Di
-construction, region discovery, best-config lookup, orchestration, reporting and
+`colabsd.engine` owns the science: LoRA injection, the training loop, the mean of
+the embeddings at the mutated sites, metrics and splits. It is vendored from the
+SequenceDisplay-Workflow-Optimization research code (see ATTRIBUTION.md and the
+header of each engine module). The rest of this package owns everything that makes
+it runnable from a notebook: HuggingFace backbone loading, building sequences from
+a user's CSV, WT 3Di construction, best-config lookup, orchestration, reporting and
 model bundles.
 
 The package is standalone: importing it pulls in no external research checkout

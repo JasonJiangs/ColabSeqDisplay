@@ -1,8 +1,8 @@
 """Presentation vocabulary for the ColabSeqDisplay wizards.
 
-Everything the user reads is a short HTML block built here, the way the ColabPLM
-notebooks build theirs: markdown rendered to HTML and dropped into an
-`ipywidgets.HTML`. There are four registers and deliberately no more.
+Everything the user reads is a short HTML block built here: markdown rendered to
+HTML and dropped into an `ipywidgets.HTML`. There are four registers and
+deliberately no more.
 
 * `heading` — where you are in the form.
 * `note` — one or two sentences of plain language, aimed at a biologist.
@@ -17,8 +17,7 @@ notebooks build theirs: markdown rendered to HTML and dropped into an
       the run will fail, or it will waste an hour. This is the red one.
 
 The string builders (`*_html`) are pure and import no widget library, so the
-wording and the severity of every message is testable without a display; the
-widget wrappers under them are one line each.
+wording and the severity of every message is testable without a display.
 """
 
 from __future__ import annotations
@@ -57,11 +56,11 @@ def check_severity(severity: str) -> Severity:
 
 
 def render_markdown(text: str) -> str:
-    """Render markdown to HTML, exactly as the ColabPLM notebooks do.
+    """Render markdown to HTML.
 
-    Falls back to `_fallback_markdown` when the `markdown` package is absent, so
-    the wizards still read correctly in a bare environment. Raw HTML in `text`
-    passes through untouched either way, which is what lets a note carry a link.
+    Falls back to `_fallback_markdown` when the `markdown` package is absent, so the wizards
+    still read correctly in a bare environment. Raw HTML in `text` passes through untouched
+    either way, which is what lets a note carry a link.
     """
     try:
         import markdown as _markdown
@@ -146,7 +145,7 @@ def message_html(text: str, severity: str = "info") -> str:
 
 
 def rule_html() -> str:
-    """A separator, in place of the ColabPLM `### -------` heading."""
+    """A separator."""
     return '<hr style="border:none;border-top:1px solid rgba(128,128,128,0.35);margin:14px 0">'
 
 

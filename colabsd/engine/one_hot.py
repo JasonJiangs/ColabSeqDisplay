@@ -6,8 +6,8 @@ vocabulary, its ``AA3_TO_INDEX`` inverse and the encoder upstream calls
 ``encode_five_site_one_hot``.
 
 Copied so that ColabSeqDisplay installs without the research checkout.
-``tests/test_engine_heads.py`` encodes the bundled 16,424-variant SlugCas9 library under
-both copies and asserts the arrays are identical whenever that checkout is present.
+``tests/test_engine_heads.py`` encodes the bundled example library under both copies and
+asserts the arrays are identical whenever that checkout is present.
 
 Left behind on purpose: everything else in that 650-line module — the ``argparse`` CLI, the
 YAML config plumbing, ``BaselineContext``, the ``BASELINE_REGISTRY`` of sklearn/torch

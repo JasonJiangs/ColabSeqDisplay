@@ -11,22 +11,21 @@ form into a `LibrarySpec`, assembling the exact call into `colabsd.train.finetun
 presenting the looked-up hyperparameters, and the outlets that only exist once something
 has been trained — the results, the two exports, and a scored table.
 
-**Preparation is part of this page.** It used to be a notebook of its own, and both
-notebooks were about to ask the same two questions — which backbone, which pooling — whose
-answers decide everything else. A user answered them once in Prepare, downloaded
-`wt_3di.txt` and `region_p90.json`, opened this notebook, answered them again and uploaded
-the files back. Now the questions are asked once, in step 2, and step 3 is whatever those
-answers imply: `colabsd.ui.prepare_workflow` decides what has to be prepared and builds the
-sections that prepare it, and what they produce stays in the session. When nothing has to
-be prepared — an ESM2 backbone with `mutation_site_mean` pooling —
-there is no step 3 at all.
+**Preparation is part of this page.** It used to be a notebook of its own, which meant the
+backbone question — the one whose answer decides everything else — was asked twice, with a
+`wt_3di.txt` downloaded between them. It is asked once now, in step 2, and step 3 is
+whatever that answer implies: a SaProt backbone reads structure and needs a wild-type 3Di
+string, which `colabsd.ui.prepare_workflow` builds the section for and which stays in the
+session. An ESM2 backbone needs nothing, and then there is no step 3 at all.
 
 Two deliberate differences from the ColabPLM notebooks we are otherwise copying:
 
 * **The hyperparameters are read-only.** They hand the user LoRA and trainer widgets; we
   look the values up from a study that was already run and show them with their provenance
   and their measured test Spearman, or, for a placeholder entry, in red. A hyperparameter
-  re-tuned while you watch your own validation score has quietly eaten your test set.
+  re-tuned while you watch your own validation score has quietly eaten your test set. How
+  the model is read out is decided the same way and is not on the form either: the pooled
+  feature is the mean of the embeddings at the mutated sites.
 * **The test set is not unlocked here.** There is no widget on this page that can read it.
   That is a separate cell, run on purpose, which counts every unlock. The performance
   archive is written from validation numbers with that partition still locked, because the
@@ -49,13 +48,13 @@ from colabsd.ui import prepare_workflow as prep
 # What is on the page
 # --------------------------------------------------------------------------------------
 
-#: Page order. The user answers the two questions that decide everything — backbone and
-#: pooling — in step 2, and step 3 is whatever those answers imply. It is not a question of
-#: its own, and for the common pair (ESM2 with `mutation_site_mean`) it is not on the page.
+#: Page order, which is also everywhere a contextual message can be put. The keys are
+#: `core.SECTION_ORDER`'s, so a section this page shows and a section `core` has a rule for
+#: are the same section under the same name.
 PAGE_ORDER: tuple[str, ...] = (
     "data",
     "model",
-    "preparation",
+    "structure",
     "hyperparameters",
     "training",
     "storage",
@@ -64,14 +63,6 @@ PAGE_ORDER: tuple[str, ...] = (
     "export",
     "score",
 )
-
-#: The two blocks inside the preparation step. They are message *slots* rather than page
-#: sections, so a 3Di refusal sits under the 3Di controls and a region warning under the
-#: region controls instead of both landing in one pile under the step heading.
-PREPARATION_SLOTS: tuple[str, ...] = ("structure", "region")
-
-#: Everywhere a contextual message can be put.
-MESSAGE_SLOTS: tuple[str, ...] = PAGE_ORDER + PREPARATION_SLOTS
 
 #: Sections this module adds to `core.SECTION_ORDER`, gated on progress rather than choice.
 OUTLET_SECTIONS: tuple[str, ...] = ("results", "export", "score")
@@ -90,25 +81,14 @@ OUTLET_FIELDS: tuple[str, ...] = (
     "score_rank_by",
 )
 
-#: The preparation fields `core` does not declare either. `prepare_workflow` owns their
-#: rules, because they only exist because of an answer given in step 2.
-PREPARATION_FIELDS: tuple[str, ...] = (
-    "esmfold_risk_accepted",
-    "region_model",
-    "region_n_sample",
-    "region_seed",
-    "region_batch_size",
-    "region_run_on_cpu",
-)
-
 #: Section names without their numbers: which step a section *is* depends on which other
 #: sections this configuration has, and `numbered_titles` works that out at every refresh.
 #: A page that skips from 2 to 4 reads as a step the user has failed to find.
 SECTION_TITLES: dict[str, str] = {
     "data": "Your variant library",
-    "model": "Backbone and pooling",
-    "preparation": "What that choice needs prepared",
-    "hyperparameters": "The hyperparameters for this pair",
+    "model": "The backbone",
+    "structure": "The wild-type shape, as a 3Di string",
+    "hyperparameters": "The hyperparameters for this backbone",
     "training": "How many runs",
     "storage": "Where the results are kept",
     "run": "Train",
@@ -117,78 +97,51 @@ SECTION_TITLES: dict[str, str] = {
     "score": "Score some variants",
 }
 
-#: The two blocks inside the preparation step. They are lettered only when both are there;
-#: on their own a block carries the step's own number, because "3b" with no "3a" is a
-#: missing half. Whether either exists at all is `prepare_workflow`'s decision.
-PREPARATION_TITLES: dict[str, str] = {
-    "structure": "The wild-type shape, as a 3Di string",
-    "region": "The pooling region",
-}
-
 SECTION_NOTES: dict[str, str] = {
     "data": (
-        "One row per variant: which residue sits at each mutated site, and what you measured for it. "
-        "Full-length sequences are **built** by substituting those residues into your wild type, never "
-        "read from a FASTA, so every variant is the same length and every position is checked against "
-        "the sequence you gave."
+        "One row per variant: the residue at each mutated site, and what you measured for it. Full-length "
+        "sequences are **built** by substituting those residues into your wild type, never read from a FASTA."
     ),
     "model": (
-        "These are the two questions that decide everything below, and they are asked once, here. The "
-        "backbone is the protein language model that reads each sequence; the pooling decides *which "
-        "residues* it is read out from. Do not agonise over the backbone — the default is tuned, reads "
-        "sequence only and fits a free T4. Pooling is the choice that matters. Whatever either answer "
-        "needs prepared appears as the next step; for the default pair there is nothing to prepare, and that "
-        "step is not on the page at all."
+        "Which protein language model reads each sequence. The default reads sequence only, fits a free T4 "
+        "and needs nothing prepared. Every backbone here is read out the same way: the mean of the "
+        "embeddings at your mutated sites. A SaProt backbone adds a preparation step below; ESM2 adds none."
     ),
-    "preparation": (
-        "A control you cannot see here is one your answers above do not need: choosing ESM2 does not grey the "
-        "3Di controls out, it removes them. Change the backbone or the pooling and this step changes with it, "
-        "or goes away entirely."
-    ),
+    "structure": "",  # `prepare_workflow.section_note` writes this one: it names the backbone that caused it.
     "hyperparameters": (
-        "Nothing here is editable, on purpose. These seven numbers were selected once, by a search that "
-        "was run and recorded, and are looked up for the backbone and pooling above. There are no sliders "
-        "because a hyperparameter you re-tune while watching your own validation score is a hyperparameter "
-        "that has quietly eaten your test set."
+        "Nothing here is editable. Everything below is looked up for the backbone above and shown with "
+        "its provenance."
     ),
-    "training": (
-        "A run is one split seed x one model seed. Repeating over several of each is the only thing that "
-        "makes a ± mean anything, because the spread you report is the spread across runs."
-    ),
+    "training": "A run is one split seed x one model seed, and the ± you report is the spread across them.",
     "storage": core.DRIVE_NOTE,
     "run": (
-        "LoRA adapters on the attention projections plus a small head; the backbone itself stays frozen. "
-        "Each run trains on the training split and early-stops on validation. **Validation numbers only** "
-        "come back — the test partition is moved out of reach as each run finishes, and the last cell of "
-        "this notebook is the only thing that can read it."
+        "LoRA adapters on the attention projections plus a small head; the backbone stays frozen. Each run "
+        "trains on the training split and early-stops on validation. **Validation numbers only** come back: "
+        "the test partition is moved out of reach as each run finishes, and only the last cell of this "
+        "notebook can open it, which counts every unlock."
     ),
     "results": (
         "The language model and the one-hot floor, side by side. The floor is twenty features per mutated "
-        "site fitted by ridge and a small MLP on the same splits, and it is the number that says whether "
-        "the language model earned its keep: a 650M-parameter model that ties a ridge regression on "
-        "one-hot residues has told you the landscape is additive, not that the model is good."
+        "site, fitted by ridge and a small MLP on the same splits; a model that does not clear it has not "
+        "earned its keep."
     ),
     "export": (
-        "**The model**, as one `.zip` you can keep, share, or hand to the Predict notebook months from now: "
-        "the LoRA weights, the head, your library description, the *frozen* pooling coordinates — so scoring "
-        "never depends on a region file being around — the hyperparameters and the provenance.\n"
-        "- **The performance**, as a second `.zip`: the report CSV, the figure, and a `performance.json` that "
-        "says which partition those numbers describe and how many times the test set has been read. It is "
-        "written from **validation** numbers with the test partition still locked — which is the state you "
-        "should be in while you are still deciding anything. Unlock the test set later and press it again, and "
-        "the same archive comes back carrying the test numbers and the count."
+        "- **The model**, as one `.zip` the Predict notebook reads: the LoRA weights, the head, your library "
+        "description, the *frozen* pooled coordinates, the hyperparameters and the provenance.\n"
+        "- **The performance**, as a second `.zip`: the report CSV, the figure, and a `performance.json` "
+        "saying which partition the numbers describe and how many times the test set has been read. It is "
+        "written from **validation** numbers with the test partition still locked; unlock it later and press "
+        "again for the same archive carrying the test numbers and the count."
     ),
     "score": (
-        "The smallest useful prediction outlet, so this page ends with something you can act on. "
-        "`pred_min` is the one to rank by when you want a variant that works in **every** condition rather "
-        "than on average. For a real screen open **ColabSeqDisplay_Predict.ipynb**, which needs nothing "
-        "but the `.zip` above."
+        "The smallest useful prediction outlet. For a real screen open "
+        "**ColabSeqDisplay_Predict.ipynb**, which needs nothing but the `.zip` above."
     ),
 }
 
-#: Which slot a contextual message belongs beside. ColabPLM puts its red text right under the
-#: control that caused it; a message whose slot is hidden falls back to the board above the
-#: train button, so nothing is ever silently dropped.
+#: Which section a contextual message belongs beside, right under the control that caused it.
+#: A message whose section is hidden falls back to the board above the train button, so
+#: nothing is ever silently dropped.
 MESSAGE_SECTIONS: dict[str, str] = {
     "min_count_without_count_column": "data",
     "library_not_loaded": "data",
@@ -206,17 +159,6 @@ MESSAGE_SECTIONS: dict[str, str] = {
     "esmfold_expensive": "structure",
     "esmfold_needs_gpu": "structure",
     "esmfold_risk_not_accepted": "structure",
-    "region_not_ready": "region",
-    "region_file_missing": "region",
-    "region_pooling_unknown": "region",
-    "region_reuse_available": "region",
-    "region_reuse_gone": "region",
-    "region_needs_gpu": "region",
-    "region_cpu_override": "region",
-    "region_subset_only": "region",
-    "region_full_library": "region",
-    "region_long_run": "region",
-    "region_batch_memory": "region",
     "config_provisional": "hyperparameters",
     "config_missing": "hyperparameters",
     "config_unreadable": "hyperparameters",
@@ -229,12 +171,11 @@ MESSAGE_SECTIONS: dict[str, str] = {
     "scoring_on_cpu": "score",
 }
 
-#: `core` marks a message `stop` when it means "this is a bad idea"; only some of those
-#: make the run impossible. An unsaved run lost to a disconnect is a bad idea and is said
-#: loudly; a missing 3Di string is a crash three minutes in. The button refuses the second
-#: kind only, and shows both. The refusals that belong to a preparation *button* — an
-#: unaccepted ESMFold risk, a CPU-only region discovery — are not here: they stop that step,
-#: and the step not having finished is what stops the run.
+#: `core` marks a message `stop` when it means "this is a bad idea"; only some of those make
+#: the run impossible. An unsaved run lost to a disconnect is a bad idea; a missing 3Di
+#: string is a crash three minutes in. The button refuses the second kind only, and shows
+#: both. The refusals that belong to the preparation *button* — an unaccepted ESMFold risk —
+#: are not here: they stop that step, and the step not having finished is what stops the run.
 BLOCKING_KEYS: frozenset[str] = frozenset(
     {
         "library_not_loaded",
@@ -250,38 +191,17 @@ BLOCKING_KEYS: frozenset[str] = frozenset(
         "esmfold_too_long",
         "config_missing",
         "config_unreadable",
-        "region_not_ready",
-        "region_file_missing",
-        "region_pooling_unknown",
-        "region_reuse_gone",
     }
 )
 
-POOLING_NOTES: dict[str, str] = {
-    "cosine_p90_mean": (
-        "**cosine_p90_mean** averages the residues whose embeddings move most across your variants — a "
-        "region discovered once and saved to a file. It usually reads out more than the mutated sites "
-        "alone, because a mutation changes how the model sees its neighbours too."
-    ),
-    "cosine_p95_mean": (
-        "**cosine_p95_mean** is the same idea as `cosine_p90_mean` over a stricter percentile: about half "
-        "as many residues, all of them ones that move a lot."
-    ),
-    "mutation_site_mean": (
-        "**mutation_site_mean** averages the mutated sites themselves and nothing else. It needs no extra "
-        "file, and it is the honest default for a protein you have not run region discovery on."
-    ),
-    "full_mean": "**full_mean** averages every residue in the protein, mutated or not.",
-    "last150_mean": "**last150_mean** averages the last 150 residues, whatever is there.",
-}
-
-#: The bundled example's name, taken from `prepare_workflow` so the two halves of the page
-#: cannot end up calling the same library different things.
-EXAMPLE_NAME = prep.EXAMPLE_NAME
-EXAMPLE_POSITIONS = "984, 985, 990, 1012, 1016"
-EXAMPLE_MUTATION_COLUMNS = "nnk1, nnk2, nnk3, nnk4, nnk5"
-EXAMPLE_CONDITION_COLUMNS = "NNGA, NNGT, NNGC, NNGG"
-EXAMPLE_DIR = ("slugcas9_5nnk",)
+#: The bundled example, described once here and read from its own files everywhere else.
+EXAMPLE_NAME = "MG8 PETases"
+EXAMPLE_POSITIONS = "22, 42, 49, 72, 78, 79, 80, 130, 131, 132, 150, 198, 199, 205, 206, 215, 216, 225, 279"
+EXAMPLE_MUTATION_COLUMNS = (
+    "p22, p42, p49, p72, p78, p79, p80, p130, p131, p132, p150, p198, p199, p205, p206, p215, p216, p225, p279"
+)
+EXAMPLE_CONDITION_COLUMNS = "activity"
+EXAMPLE_DIR = ("mg8_petases",)
 
 
 def example_path(*parts: str) -> Path:
@@ -300,20 +220,40 @@ def example_wt_length() -> int:
     return len("".join(line.strip() for line in text.splitlines() if not line.startswith(">")))
 
 
+def example_variants() -> int:
+    """Rows in the bundled example library, counted from the CSV. 0 when it cannot be read."""
+    try:
+        with example_path("library.csv").open("rb") as handle:
+            rows = sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+    return max(rows - 1, 0)
+
+
+def example_test_rows() -> int:
+    """How many of the bundled variants an 8:1:1 split leaves to test on.
+
+    `create_split` needs a directory to write into, so the sentence repeats its arithmetic
+    rather than the answer: a typed-in count survives the CSV it was counted from.
+    """
+    n = example_variants()
+    return n - int(0.8 * n) - int(0.1 * n)
+
+
 def example_note() -> str:
     """The bundled example described from the files themselves, so the prose cannot drift."""
-    variants = core.reference_library_variants()
+    variants = example_variants()
     length = example_wt_length()
     size = f"{variants:,d} variants" if variants else "the variants"
-    protein = f"a {length:,d}-residue Cas9" if length else "a Cas9"
+    protein = f"a {length:,d}-residue PET hydrolase" if length else "a PET hydrolase"
     sites = len(parse_list(EXAMPLE_MUTATION_COLUMNS))
-    conditions = parse_list(EXAMPLE_CONDITION_COLUMNS)
-    return (
-        f"The bundled **{EXAMPLE_NAME}** library: {size} of {protein}, {sites} randomised "
-        f"sites (`{EXAMPLE_POSITIONS}`) measured against {len(conditions)} PAM conditions "
-        f"(`{EXAMPLE_CONDITION_COLUMNS}`). Its wild type, its 3Di string and its pooling regions all ship "
-        "with the package, so this runs end to end with nothing to prepare."
+    note = (
+        f"The bundled **{EXAMPLE_NAME}** library: {size} of {protein}, {sites} mutated sites against one "
+        f"measured condition, `{EXAMPLE_CONDITION_COLUMNS}` — the log of the assay reading. It runs, end "
+        "to end, inside one Colab session, and it is far too small to measure a backbone with"
     )
+    rows = example_test_rows()
+    return note + (f": an 8:1:1 split leaves {rows} variants to test on." if rows > 0 else ".")
 
 
 def withdrawn_note() -> str:
@@ -323,7 +263,9 @@ def withdrawn_note() -> str:
     and no explanation, and the answer is not "they were deleted". It is also not one
     sentence: this note used to say every withdrawn backbone had a tested adapter and no
     tuned hyperparameters, and that was wrong four times over — METL has no adapter at all,
-    and ProtT5-XL, ESMC-300M, ESMDance and METL each ship a tuned entry in `config/best/`.
+    and ProtT5-XL, ESMC-300M, ESMDance and METL each ship a tuned `cosine_p90_mean` entry in
+    `config/best/` (the half `colabsd.bestconfig` never opens, so `hyperparameter_state`
+    still calls all four placeholders).
     So the reason is asked of `colabsd.backbones.registry` per name, which is where it is
     written and where the notebook's own guide reads it from.
     """
@@ -334,9 +276,8 @@ def withdrawn_note() -> str:
         return ""
     families = " and ".join(registry.OFFERED_FAMILIES)
     lines = [
-        f"**Only {families} are offered here**, so the two questions above stay a real comparison — read the "
-        f"sequence, or read the sequence and the shape — rather than a menu of {len(BACKBONES)}. The other "
-        f"{len(withdrawn)} are in the package and not on this form, each for its own reason:"
+        f"**Only {families} are offered here** — read the sequence, or read the sequence and the shape. "
+        f"The other {len(withdrawn)} of the {len(BACKBONES)} are in the package and not on this form:"
     ]
     for name in withdrawn:
         tail = (
@@ -351,27 +292,22 @@ def withdrawn_note() -> str:
             reason = "no reason is recorded for it in the registry, which is a bug worth reporting"
         lines.append(f"- `{name}` — {reason}; {tail}.")
     lines.append(
-        "Putting one back on the form is one line: its name moves out of `WITHHELD_FAMILY_REASONS` and into "
+        "To put one back on the form, move its family out of `WITHHELD_FAMILY_REASONS` and into "
         "`OFFERED_FAMILIES` in `colabsd/backbones/registry.py`."
     )
     return "\n".join(lines)
 
 
 LIBRARY_NOTE = (
-    "**Mutated positions** — where the randomised residues sit in the wild type, counted from 1, so "
-    "`984` is the 984th residue of the sequence above.\n"
-    "- **Mutation columns** — the CSV columns holding the residue at each of those positions, in the "
-    "same order: column *i* names position *i*.\n"
-    "- **Condition columns** — the CSV columns holding what you measured. One per condition; the model "
-    "predicts all of them at once.\n"
-    "- **Read-count column** — if your table has sequencing counts, name it and you can drop the "
-    "variants that were seen too few times to trust. Leave it empty if there is none."
+    "- **Mutated positions** — where the mutated residues sit in the wild type, counted from 1.\n"
+    "- **Mutation columns** — the CSV columns holding the residue at each of those positions: column *i* "
+    "names position *i*.\n"
+    "- **Condition columns** — the CSV columns holding what you measured; one per condition, all "
+    "predicted at once.\n"
+    "- **Read-count column** — name it if your table has sequencing counts, and the box below can drop "
+    "the variants seen too few times. Leave it empty if there is none."
 )
 
-SEED_NOTE = (
-    "One of each is the fast default, and it reports `nan` for the spread — honestly, because a single "
-    "run cannot show reproducibility. The registry's own protocol uses three of each."
-)
 
 #: Everything this wizard keeps in `WizardState.extra`, and what it starts as.
 EXTRA_DEFAULTS: dict[str, Any] = {
@@ -384,18 +320,9 @@ EXTRA_DEFAULTS: dict[str, Any] = {
     "positions_1based": EXAMPLE_POSITIONS,
     "mutation_columns": EXAMPLE_MUTATION_COLUMNS,
     "condition_columns": EXAMPLE_CONDITION_COLUMNS,
-    "three_letter_residues": True,
-    "count_column": "count",
+    "three_letter_residues": False,
+    "count_column": "",
     "min_count": 0,
-    "region_source": "available",
-    "region_filename": "",
-    "region_model": prep.DEFAULT_REGION_MODEL,
-    "region_n_sample": 2000,
-    "region_seed": 0,
-    "region_batch_size": 2,
-    "region_run_on_cpu": False,
-    "region_ready": False,
-    "region_path": "",
     "three_di_text": "",
     "three_di_file": "",
     "structure_file": "",
@@ -458,11 +385,7 @@ def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
         str(state.get("count_column") or ""),
         int(state.get("min_count") or 0),
         state.backbone,
-        state.pooling,
         state.dtype,
-        str(state.get("region_source") or ""),
-        str(state.get("region_filename") or ""),
-        str(state.get("region_path") or ""),
         state.three_di_source,
         int(state.wt_3di_length),
         int(state.n_split_seeds),
@@ -470,27 +393,12 @@ def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
     )
 
 
-def region_key(state: core.WizardState) -> tuple[Any, ...]:
-    """What a resolved pooling region has to keep describing to stay usable.
-
-    Not the whole training fingerprint: re-reading the library at the same length does not
-    invalidate a region, but changing the pooling, the protein or where the file came from
-    does — and a region kept across any of those is pooled under a name it does not have.
-    """
-    return (
-        str(state.pooling),
-        int(state.wt_length),
-        str(state.get("region_source") or ""),
-        str(state.get("region_filename") or ""),
-    )
-
-
 def results_are_stale(state: core.WizardState) -> bool:
     """True when the form has been changed since the run whose numbers are on screen.
 
-    Without this the page will happily show one pair's validation table under another
-    pair's name, and -- worse -- write the second pair's hyperparameters into the `.zip`
-    the first pair's weights are in.
+    Without this the page will happily show one backbone's validation table under another
+    backbone's name, and -- worse -- write the second one's hyperparameters into the `.zip`
+    the first one's weights are in.
     """
     if not state.get("trained"):
         return False
@@ -511,32 +419,20 @@ def has_bundle(state: core.WizardState) -> bool:
 def section_visibility(state: core.WizardState) -> dict[str, bool]:
     """Which sections are on screen: `core`'s rules, gated on how far the user has got.
 
-    `core` decides which sections this *configuration* calls for; `prepare_workflow` decides
-    whether the configuration needs anything prepared at all. This adds the one thing
-    neither has an opinion about: nothing below the library appears until the library has
-    actually loaded, because the runtime estimate, the ESMFold length check, the region
-    subsample and the pooled coordinates all need to know how big it is and how long the
-    wild type is.
+    `core` decides which sections this *configuration* calls for. This adds the one thing it
+    has no opinion about: nothing below the library appears until the library has loaded,
+    because the runtime estimate, the ESMFold length check and the pooled coordinates all
+    need its size and its wild-type length.
     """
     live = set(core.visible_sections(state))
     loaded = bool(state.get("library_loaded"))
     trained = has_results(state)
     visible = {name: (name in live and loaded) for name in core.SECTION_ORDER}
     visible["data"] = True
-    visible["preparation"] = loaded and bool(prep.preparation_steps(state))
     visible["results"] = trained
     visible["export"] = trained
     visible["score"] = has_bundle(state)
     return {name: visible.get(name, False) for name in PAGE_ORDER}
-
-
-def slot_visibility(state: core.WizardState) -> dict[str, bool]:
-    """Every message slot: the page sections, plus the two blocks inside step 3."""
-    visible = dict(section_visibility(state))
-    steps = prep.preparation_steps(state)
-    visible["structure"] = visible["preparation"] and prep.STEP_THREE_DI in steps
-    visible["region"] = visible["preparation"] and prep.STEP_REGION in steps
-    return {name: visible.get(name, False) for name in MESSAGE_SLOTS}
 
 
 def visible_sections(state: core.WizardState) -> list[str]:
@@ -546,56 +442,16 @@ def visible_sections(state: core.WizardState) -> list[str]:
 
 
 def numbered_titles(state: core.WizardState) -> dict[str, str]:
-    """Every slot's heading, numbered by where it actually falls on this page.
+    """Every section's heading, numbered by where it actually falls on this page.
 
-    The steps a configuration does not need are absent, not greyed out, so their numbers
-    have to close up behind them: an ESM2 run with `mutation_site_mean` pooling has no
-    preparation step, and its hyperparameters are step 3 rather than a step 4 after a
-    step 3 nobody can find.
+    A step this configuration does not need is absent, not greyed out, so the numbers close
+    up behind it: an ESM2 run has no preparation step, and its hyperparameters are step 3.
     """
     shown = visible_sections(state)
     titles = {name: f"{index} · {SECTION_TITLES[name]}" for index, name in enumerate(shown, start=1)}
     for name in PAGE_ORDER:
         titles.setdefault(name, SECTION_TITLES[name])
-    step = shown.index("preparation") + 1 if "preparation" in shown else 0
-    slots = slot_visibility(state)
-    blocks = [name for name in PREPARATION_SLOTS if slots[name]]
-    for position, name in enumerate(blocks):
-        # One block on its own is the step, and the step is already numbered above it.
-        prefix = f"{step}{chr(ord('a') + position)} · " if step and len(blocks) > 1 else ""
-        titles[name] = f"{prefix}{PREPARATION_TITLES[name]}"
-    for name in PREPARATION_SLOTS:
-        titles.setdefault(name, PREPARATION_TITLES[name])
     return titles
-
-
-def field_overrides(state: core.WizardState) -> dict[str, bool]:
-    """The declared fields whose rule depends on a radio only this page has.
-
-    `core.FIELD_RULES` shows `region_filename` for any cosine pooling, because `core` does
-    not know about this page's "reuse, upload or discover?" radio. Leaving the upload row on
-    screen beside "reuse the one that is already here" invites a path that is then silently
-    ignored.
-    """
-    return {
-        "region_filename": prep.needs_region(state) and state.get("region_source") == "upload",
-    }
-
-
-def preparation_field_visibility(
-    state: core.WizardState, *, artefacts: Sequence[prep.Artefact] = (), runtime: core.Runtime | None = None
-) -> dict[str, bool]:
-    """The step-3 fields `core` does not declare. The rules are `prepare_workflow`'s.
-
-    `core.FIELD_RULES` declared `region_n_sample` too while a standalone Prepare wizard
-    existed, and the live rule here had to be applied after `core`'s to win. That mode is
-    gone and so is the duplicate: one field, one rule, and it lives where the step does.
-    """
-    return prep.preparation_field_visibility(
-        state,
-        artefact=prep.pick(artefacts, prep.STEP_REGION),
-        has_gpu=None if runtime is None else bool(runtime.has_gpu),
-    )
 
 
 def outlet_field_visibility(state: core.WizardState) -> dict[str, bool]:
@@ -644,8 +500,7 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
             core.Message(
                 "library_not_loaded",
                 "stop",
-                "Nothing has been read yet. Press **Check my library** below: the runtime estimate, the "
-                "pooled coordinates and the length checks all need to know how big it is.",
+                "Your library has not been read yet. Press **Check my library** below.",
             )
         )
     if int(state.get("min_count") or 0) > 0 and not str(state.get("count_column") or "").strip():
@@ -654,7 +509,7 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
                 "min_count_without_count_column",
                 "warning",
                 f"You asked to drop variants seen fewer than {state.get('min_count')} times, but no read-count "
-                "column is named, so nothing can be filtered and every row will be kept.",
+                "column is named, so every row will be kept. Name the column above, or set the threshold to 0.",
             )
         )
     if three_di_is_promised_but_missing(state):
@@ -663,8 +518,8 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
                 "three_di_not_attached",
                 "stop",
                 f"You chose where the 3Di string should come from, but nothing has fetched it yet, so "
-                f"**{state.backbone}** would be trained with no structure at all — silently, and on a model "
-                "whose whole point is that it reads one. Press **Get the 3Di string** in the preparation step.",
+                f"**{state.backbone}** would be trained with no structure at all. Press **Get the 3Di "
+                "string** in the preparation step.",
             )
         )
     if results_are_stale(state):
@@ -672,9 +527,8 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
             core.Message(
                 "results_stale",
                 "warning",
-                "The settings above have changed since the last run, so the results, the bundle and the "
-                "scoring outlet have been put away rather than left describing a run that no longer matches "
-                "this form. Press **Train** again, or change the settings back.",
+                "The settings have changed since the last run, so the results, the bundle and the scoring "
+                "outlet have been put away. Press **Train** again, or change the settings back.",
             )
         )
     cleared = state.get("floor_cleared")
@@ -683,10 +537,9 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
             core.Message(
                 "plm_below_floor",
                 "warning",
-                "The language model did not clear the one-hot floor. On this library, twenty features per "
-                "mutated site do as well as a fine-tuned protein language model, which usually means the "
-                "landscape is close to additive. That is a result, not a failure — but do not report the "
-                "model as an improvement.",
+                "The language model did not clear the one-hot floor: twenty features per mutated site do as "
+                "well, which usually means the landscape is close to additive. Do not report the model as "
+                "an improvement.",
             )
         )
     return out
@@ -696,29 +549,17 @@ def preparation_messages(
     state: core.WizardState,
     *,
     runtime: core.Runtime | None = None,
-    artefacts: Sequence[prep.Artefact] | None = None,
+    artefact: prep.Artefact | None = None,
 ) -> list[core.Message]:
-    """`prepare_workflow.notices` for this state, with the machine and the preview filled in.
+    """`prepare_workflow.notices` for this state, with the machine filled in.
 
-    Silent when this configuration needs nothing prepared, which is the point of the merge:
-    the step that does not exist says nothing either.
+    Silent when this backbone needs nothing prepared, which is the point of the merge: the
+    step that does not exist says nothing either.
     """
-    if not prep.preparation_steps(state):
-        return []
-    found = prep.available_artefacts(state) if artefacts is None else list(artefacts)
-    has_gpu = None if runtime is None else bool(runtime.has_gpu)
-    preview = prep.region_preview(state) if prep.needs_region(state) else None
-    estimate = (
-        prep.region_estimate(state, has_gpu=bool(has_gpu), preview=preview) if preview is not None else None
-    )
     return prep.notices(
         state,
-        artefacts=found,
-        preview=preview,
-        estimate=estimate,
-        has_gpu=has_gpu,
-        gpu_gb=float(getattr(runtime, "gpu_memory_gb", 0.0) or 0.0),
-        region_ready=bool(state.get("region_ready")),
+        artefact=prep.session_artefact(state, artefact),
+        has_gpu=None if runtime is None else bool(runtime.has_gpu),
     )
 
 
@@ -728,12 +569,12 @@ def messages(
     runtime: core.Runtime | None = None,
     status: core.ConfigStatus | None = None,
     root: str | Path | None = None,
-    artefacts: Sequence[prep.Artefact] | None = None,
+    artefact: prep.Artefact | None = None,
 ) -> list[core.Message]:
     """Every message this state earns, worst first: `core`'s, preparation's, and this page's."""
     collected = list(core.messages_for(state, runtime=runtime, status=status, root=root))
     collected += extra_messages(state)
-    collected += preparation_messages(state, runtime=runtime, artefacts=artefacts)
+    collected += preparation_messages(state, runtime=runtime, artefact=artefact)
     if runtime is not None and not runtime.has_gpu and has_bundle(state):
         collected.append(
             core.Message(
@@ -766,7 +607,7 @@ def messages_by_section(
     A message whose section is hidden would otherwise be invisible, which is how a wizard
     ends up refusing to start for a reason nobody can see.
     """
-    grouped: dict[str, list[core.Message]] = {name: [] for name in MESSAGE_SLOTS}
+    grouped: dict[str, list[core.Message]] = {name: [] for name in PAGE_ORDER}
     for item in items:
         section = MESSAGE_SECTIONS.get(item.key, "run")
         if visible is not None and not visible.get(section, False):
@@ -803,8 +644,8 @@ def parse_positions(text: Any) -> list[int]:
             positions.append(int(item))
         except ValueError:
             raise ValueError(
-                f"{item!r} is not a residue number. Mutated positions are whole numbers counted from 1 along "
-                f"the wild-type sequence, for example {EXAMPLE_POSITIONS}."
+                f"{item!r} is not a residue number. Mutated positions are whole numbers counted from 1 "
+                "along the wild-type sequence."
             ) from None
     return positions
 
@@ -830,8 +671,8 @@ def load_blockers(state: core.WizardState) -> list[str]:
             problems.append("No CSV yet. Upload one with the button above, or type the path of a file on this machine.")
         if not str(state.get("wt_sequence") or "").strip():
             problems.append(
-                "The wild-type box is empty. Paste the full-length amino-acid sequence, or the URL of its "
-                "FASTA file — an AlphaFold or UniProt link works."
+                "The wild-type box is empty. Paste the full-length amino-acid sequence, or the URL of a "
+                "FASTA file."
             )
     positions = parse_positions(state.get("positions_1based"))
     columns = parse_list(state.get("mutation_columns"))
@@ -841,14 +682,14 @@ def load_blockers(state: core.WizardState) -> list[str]:
         problems.append("No condition columns named. List at least one CSV column holding a measured activity.")
     if columns and len(columns) != len(positions):
         problems.append(
-            f"{len(columns)} mutation columns for {len(positions)} positions. There must be exactly one column "
-            "per position, in the same order, so that column i still names position i."
+            f"{len(columns)} mutation columns for {len(positions)} positions. Name exactly one column per "
+            "position, in the same order."
         )
     return problems
 
 
-#: What stops the two preparation buttons is `prepare_workflow`'s decision, because the
-#: controls those buttons read are its: `prep.three_di_blockers` and `prep.region_blockers`.
+#: What stops the preparation button is `prepare_workflow`'s decision, because the controls
+#: that button reads are its: `prep.three_di_blockers`.
 
 
 def export_blockers(state: core.WizardState) -> list[str]:
@@ -857,8 +698,8 @@ def export_blockers(state: core.WizardState) -> list[str]:
         return ["Nothing has been trained in this session, so there is no model to export."]
     if results_are_stale(state):
         return [
-            "The settings have changed since this model was trained, so exporting now would write the "
-            "settings on screen into a bundle holding the old run's weights. Press Train again first."
+            "The settings have changed since this model was trained, so the bundle would carry the old "
+            "run's weights under the settings on screen. Press Train again first."
         ]
     return []
 
@@ -877,69 +718,19 @@ def score_blockers(state: core.WizardState) -> list[str]:
 
 
 # --------------------------------------------------------------------------------------
-# Pure decisions -- region, adapter, and the call into colabsd.train
+# Pure decisions -- the adapter, and the call into colabsd.train
 # --------------------------------------------------------------------------------------
 
 
-def region_problems(
-    region: dict[str, Any], pooling: str, wt_length: int, *, source: str = "the region file"
-) -> list[str]:
-    """Check a region record against the run it is about to be pooled under.
+def adapter_kwargs(state: core.WizardState, spec: LibrarySpec) -> dict[str, Any]:
+    """The keyword arguments `colabsd.backbones.registry.create_adapter` is called with.
 
-    Averaging one region under another region's name is silently wrong, and so is a region
-    computed for a different protein, so both are refused rather than warned about.
+    The pooled coordinates are the mutated sites, which is where the model is read out for
+    every backbone: the sites are the only residues the library varies, and they are the
+    ones the assay moved. Nothing on the page decides this and nothing else can be chosen.
     """
-    problems = []
-    declared = region.get("pooling") or f"{region.get('region_name', '')}_mean"
-    if declared != pooling:
-        problems.append(
-            f"{source} holds the {declared} region, but this run pools {pooling}. Averaging one region under "
-            "another region's name is silently wrong: pick the matching file."
-        )
-    length = region.get("seq_length")
-    if length is not None and int(length) != int(wt_length):
-        problems.append(
-            f"{source} was computed for a {length}-residue protein, but this wild type is {wt_length} residues. "
-            "Discover a region for this one in the preparation step instead."
-        )
-    return problems
-
-
-def region_notes(region: dict[str, Any], backbone: str) -> list[str]:
-    """What the region file records about its own making, when it bears on this run.
-
-    A region is a list of residues that moved under *some* model's embeddings; the file
-    says which. Pooling it under a different backbone is a decision, not an error, so this
-    is said once beside the choice rather than made into a refusal.
-    """
-    source = str(region.get("region_source_model") or "").strip()
-    if not source or source == backbone:
-        return []
-    return [
-        f"This region was discovered from **{source}** embeddings and you are training **{backbone}**. The "
-        "residues that move most under one model are not necessarily the ones that move most under another, "
-        f"so this pools {backbone} over a region {source} chose. Rediscover it in the preparation step, with "
-        f"{backbone} as the region model, if you want the region and the backbone to agree."
-    ]
-
-
-def pooling_positions_0based(spec: LibrarySpec, pooling: str, region: dict[str, Any] | None) -> list[int]:
-    """The residue offsets the pooled feature is averaged over."""
-    if not pooling.startswith("cosine_"):
-        return list(spec.positions_0based())
-    if not region:
-        raise ValueError(
-            f"{pooling} averages a discovered region, so it needs one. Finish the pooling-region step above, "
-            "or pick mutation_site_mean, which pools the mutated sites and needs nothing prepared."
-        )
-    return [int(position) - 1 for position in region["positions_1based"]]
-
-
-def adapter_kwargs(state: core.WizardState, spec: LibrarySpec, region: dict[str, Any] | None) -> dict[str, Any]:
-    """The keyword arguments `colabsd.backbones.registry.create_adapter` is called with."""
     return {
-        "pooling": state.pooling,
-        "pooling_positions_0based": pooling_positions_0based(spec, state.pooling, region),
+        "pooling_positions_0based": list(spec.positions_0based()),
         "wt_3di": spec.wt_3di,
         "dtype": state.dtype,
     }
@@ -1069,10 +860,13 @@ def _rows_html(rows: Sequence[tuple[str, str]]) -> str:
 def hyperparameter_html(view: HyperparameterView) -> str:
     """The looked-up hyperparameters, as a settled result or as a red placeholder."""
     if view.is_provisional:
+        # `view.headline` is `BestConfig.describe()`, which is also `core.config_provisional`'s
+        # text on the board below this table. Printing it here as well put the same sentence in
+        # two coloured boxes a few lines apart, so this banner says only what it alone can: the
+        # numbers directly under it were not selected. Where they came from is the provenance
+        # line, and what to do about it is core's message.
         banner = theme.message_html(
-            f"**PROVISIONAL.** {view.headline} These seven numbers are a placeholder taken from tuned entries "
-            "for other backbones. No study selected them for this pair, and no performance number stands "
-            "behind them.",
+            "**PROVISIONAL.** No study selected the numbers below for this backbone.",
             "stop",
         )
     else:
@@ -1094,16 +888,15 @@ def hyperparameter_html(view: HyperparameterView) -> str:
     )
 
 
-def no_hyperparameters_html(backbone: str, pooling: str, status: core.ConfigStatus | None) -> str:
-    """Section 4 when the registry has nothing for this pair.
+def no_hyperparameters_html(backbone: str, status: core.ConfigStatus | None) -> str:
+    """The hyperparameter section when the registry has nothing for this backbone.
 
-    It has to say something, because leaving the previous pair's numbers on screen is how a
-    user reads seven settled hyperparameters under a heading that has none.
+    It has to say something, because leaving the previous backbone's numbers on screen is
+    how a user reads seven settled hyperparameters under a heading that has none.
     """
     detail = status.description if status is not None else "The registry has not been read yet."
     return theme.message_html(
-        f"**No hyperparameters for {backbone} with `{pooling}` pooling.** {detail} Nothing is shown here "
-        "because there is nothing to show: pick a pair the registry has an entry for.",
+        f"**No hyperparameters for {backbone}.** {detail} Pick a backbone the registry has an entry for.",
         "stop",
     )
 
@@ -1149,14 +942,8 @@ def floor_comparison(model_label: str, plm_mean: float | None, floor: dict[str, 
         return line
     gap = float(plm_mean) - float(floor["mean"])
     if verdict:
-        return (
-            f"{line} {model_label} clears it by {gap:.4f} Spearman — the language model found structure that "
-            "per-site additivity does not explain."
-        )
-    return (
-        f"{line} {model_label} FAILS to clear it, by {abs(gap):.4f} Spearman. A one-hot encoding of the "
-        "mutated residues is as good as the language model on this library."
-    )
+        return f"{line} {model_label} clears it by {gap:.4f} Spearman."
+    return f"{line} {model_label} FAILS to clear it, by {abs(gap):.4f} Spearman."
 
 
 def validation_headline(summary: dict[str, Any] | None) -> str:
@@ -1167,7 +954,7 @@ def validation_headline(summary: dict[str, Any] | None) -> str:
     n_runs = int(macro.get("n_runs", 0))
     line = f"Validation Spearman, averaged over conditions: {mean:.4f} ± {sd:.4f} ({n_runs} run(s))"
     if n_runs < 2:
-        line += " — one run shows no spread, so that ± is `nan` on purpose."
+        line += " — one run shows no spread, so the ± is `nan`."
     return line
 
 
@@ -1182,8 +969,8 @@ def plan_line(state: core.WizardState, best: Any | None = None) -> str:
     protocol = len(getattr(best, "split_seeds", []) or []) * len(getattr(best, "model_seeds", []) or [])
     if protocol and estimate.n_runs < protocol:
         line += (
-            f" The registry entry was selected over {protocol} runs; {estimate.n_runs} is faster and says "
-            "correspondingly less about reproducibility."
+            f" The registry entry was selected over {protocol} runs; {estimate.n_runs} says less about "
+            "reproducibility."
         )
     return line
 
@@ -1221,27 +1008,10 @@ class Backend:
 
         return make_splits(n, seeds, out_dir)
 
-    def load_region(self, path: Path) -> dict[str, Any]:
-        from colabsd.region import load_region
-
-        return load_region(path)
-
-    def discover_region(self, sequences: Sequence[str], wt_sequence: str, **kwargs: Any) -> dict[str, Any]:
-        from colabsd.region import discover_region
-
-        return discover_region(sequences, wt_sequence, **kwargs)
-
-    def save_region(self, record: dict[str, Any], path: Path) -> Path:
-        from colabsd.region import save_region
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        save_region(record, path)
-        return path
-
-    def load_best_config(self, backbone: str, pooling: str) -> Any:
+    def load_best_config(self, backbone: str) -> Any:
         from colabsd.bestconfig import load_best_config
 
-        return load_best_config(backbone, pooling)
+        return load_best_config(backbone)
 
     def create_adapter(self, backbone: str, **kwargs: Any) -> Any:
         from colabsd.backbones.registry import create_adapter
@@ -1394,10 +1164,7 @@ class MainWizard:
         self.frame: Any = None
         self.sequences: list[str] | None = None
         self.targets: Any = None
-        self.region: dict[str, Any] | None = None
-        self.region_path: Path | None = None
-        self.session_artefacts: list[prep.Artefact] = []
-        self._region_key: tuple[Any, ...] | None = None
+        self.session_three_di: prep.Artefact | None = None
         self.best: Any = None
         self.adapter: Any = None
         self.splits: Any = None
@@ -1407,11 +1174,10 @@ class MainWizard:
         self.bundle: Any = None
         self.bundle_path: Path | None = None
         self.performance: exports.PerformanceExport | None = None
-        self._best_key: tuple[str, str] | None = None
+        self._best_key: str | None = None
         self._refreshing = False
         self.trained_best: Any = None
         self.trained_spec: LibrarySpec | None = None
-        self.trained_region: dict[str, Any] | None = None
         self.scores: Any = None
         self.plan: core.Plan | None = None
 
@@ -1424,8 +1190,8 @@ class MainWizard:
         import ipywidgets
 
         self.w = ipywidgets
-        self.logs = {name: theme.html("") for name in MESSAGE_SLOTS}
-        self.boards = {name: core.MessageBoard() for name in MESSAGE_SLOTS}
+        self.logs = {name: theme.html("") for name in PAGE_ORDER}
+        self.boards = {name: core.MessageBoard() for name in PAGE_ORDER}
 
         self.fields: dict[str, Any] = {}
         self.outlets: dict[str, Any] = {}
@@ -1433,7 +1199,7 @@ class MainWizard:
 
         self._build_data()
         self._build_model()
-        self._build_preparation()
+        self._build_structure()
         self._build_hyperparameters()
         self._build_training()
         self._build_storage()
@@ -1521,14 +1287,6 @@ class MainWizard:
             layout={"width": "760px"},
         )
         self.backbone_note = theme.note("")
-        self.fields["pooling"] = self.w.Dropdown(
-            options=core.pooling_choices(self.state.backbone) or [self.state.pooling],
-            value=self.state.pooling,
-            description="Pooling:",
-            style=_LABEL,
-            layout=_WIDE,
-        )
-        self.pooling_note = theme.note("")
         self.fields["dtype"] = self.w.Dropdown(
             options=["float32", "float16", "bfloat16"],
             value=self.state.dtype,
@@ -1541,57 +1299,29 @@ class MainWizard:
             self.fields["backbone"],
             self.backbone_note,
             self.withdrawn_note,
-            self.fields["pooling"],
-            self.pooling_note,
             self.fields["dtype"],
             self.boards["model"].widget,
             self.logs["model"],
         ]
 
-    def _build_preparation(self) -> None:
-        """Step 3, composed out of `prepare_workflow`'s two sections.
+    def _build_structure(self) -> None:
+        """Step 3, which is `prepare_workflow`'s one section and exists only for a SaProt.
 
-        The panel supplies its own widget factories, so a section built here looks like the
-        rest of the page and its uploads go through the one row that says what a blocking
-        `files.upload()` is about to do. Which of the two blocks exists on screen is not
-        decided here: `prep.preparation_steps` decides it, from step 2.
+        The panel supplies its own widget factories, so the section built here looks like the
+        rest of the page and its uploads go through the row that says what a blocking
+        `files.upload()` is about to do. `core.needs_structure` decides whether it is on
+        screen at all, from the backbone in step 2.
         """
         tools = prep.SectionTools(text=self._text, upload_row=self._upload_row, button=self._button)
         self.three_di = prep.ThreeDiSection(self.state, tools)
-        self.region_step = prep.RegionSection(self.state, tools)
         self.fields.update(self.three_di.fields)
-        self.fields.update(self.region_step.fields)
-        self.preparation_note = theme.note("")
         self.outputs_note = theme.html("")
-        self.sub_sections = {
-            "structure": core.Section(
-                "structure",
-                PREPARATION_TITLES["structure"],
-                [
-                    *self.three_di.children(),
-                    self.boards["structure"].widget,
-                    self.three_di.button,
-                    self.logs["structure"],
-                ],
-            ),
-            "region": core.Section(
-                "region",
-                PREPARATION_TITLES["region"],
-                [
-                    *self.region_step.children(),
-                    self.boards["region"].widget,
-                    self.region_step.button,
-                    self.logs["region"],
-                ],
-            ),
-        }
-        self._layout["preparation"] = [
-            self.preparation_note,
-            self.sub_sections["structure"].box(),
-            self.sub_sections["region"].box(),
+        self._layout["structure"] = [
+            *self.three_di.children(),
             self.outputs_note,
-            self.boards["preparation"].widget,
-            self.logs["preparation"],
+            self.boards["structure"].widget,
+            self.three_di.button,
+            self.logs["structure"],
         ]
 
     def _build_hyperparameters(self) -> None:
@@ -1621,7 +1351,6 @@ class MainWizard:
         )
         self.plan_note = theme.note("")
         self._layout["training"] = [
-            theme.note(SEED_NOTE),
             self.fields["n_split_seeds"],
             self.fields["n_model_seeds"],
             self.fields["run_name"],
@@ -1775,10 +1504,9 @@ class MainWizard:
     def _take_upload(self, path_widget: Any, what: str, section: str) -> None:
         """Say what is being waited for, *then* open the picker that freezes the page.
 
-        `files.upload()` blocks the kernel: while it waits, every observer on this page is
-        dead, so the panel sits in whatever state the button left it in and nothing on
-        screen says why. The explanation therefore has to be written before the call, not
-        after it — after it is an hour too late for the person watching a frozen form.
+        `files.upload()` blocks the kernel: while it waits every observer on this page is
+        dead, so the panel sits in whatever state the button left it in. The explanation has
+        to be written before the call, not after it.
         """
         self.logs[section].value = theme.message_html(core.upload_notice(what), "info")
         landed = self.backend.upload_file(what)
@@ -1799,7 +1527,6 @@ class MainWizard:
                 core.bind(widget, self.state, target, on_change=changed)
         core.on_click(self.check_button, self._guard("data", self.on_check_library))
         core.on_click(self.three_di.button, self._guard("structure", self.on_get_three_di))
-        core.on_click(self.region_step.button, self._guard("region", self.on_get_region))
         core.on_click(self.fields["run_button"], self._guard("run", self.on_train))
         core.on_click(self.export_button, self._guard("export", self.on_export))
         core.on_click(self.performance_button, self._guard("export", self.on_export_performance))
@@ -1830,7 +1557,7 @@ class MainWizard:
     def _changed(self, state: core.WizardState) -> None:
         """One observer for every field. Re-entrant calls are dropped, not recursed into.
 
-        `refresh` writes to widgets that are themselves observed -- the pooling options and
+        `refresh` writes to widgets that are themselves observed -- the 3Di source list and
         the seed maxima -- so without this a single keystroke would re-enter it.
         """
         if state.get("_reloading") or self._refreshing:
@@ -1864,29 +1591,18 @@ class MainWizard:
 
     def _refresh(self) -> core.Plan:
         status = self._config_status()
-        self._sync_pooling_options()
         self._sync_seed_limits()
-        self._forget_stale_region()
-        artefacts = self.artefacts()
-        self._sync_preparation(artefacts)
+        artefact = self.artefact()
+        self._sync_structure(artefact)
         self.plan = core.plan(self.state, runtime=self.runtime, status=status)
-        items = messages(self.state, runtime=self.runtime, status=status, artefacts=artefacts)
+        items = messages(self.state, runtime=self.runtime, status=status, artefact=artefact)
 
-        visible = slot_visibility(self.state)
+        visible = section_visibility(self.state)
         core.apply_field_visibility({k: v for k, v in self.fields.items() if k in core.FIELD_KEYS}, self.state)
-        for key, shown in field_overrides(self.state).items():
-            core.set_display(self.fields[key], shown)
-        for key, shown in preparation_field_visibility(
-            self.state, artefacts=artefacts, runtime=self.runtime
-        ).items():
-            core.set_display(self.fields[key], shown)
         for key, shown in outlet_field_visibility(self.state).items():
             core.set_display(self.outlets[key], shown)
         titles = numbered_titles(self.state)
         for name, section in self.sections.items():
-            section.set_visible(visible[name])
-            section.set_title(titles[name])
-        for name, section in self.sub_sections.items():
             section.set_visible(visible[name])
             section.set_title(titles[name])
 
@@ -1895,74 +1611,33 @@ class MainWizard:
             board.update(grouped[name])
 
         self.backbone_note.value = theme.note_html(core.backbone_summary(self.state.backbone))
-        self.pooling_note.value = theme.note_html(POOLING_NOTES.get(self.state.pooling, ""))
         self.plan_note.value = theme.note_html(plan_line(self.state, self.best))
         self.fields["run_button"].disabled = not can_train(items)
         if self.best is not None:
             self.fields["hyperparameters"].value = hyperparameter_html(hyperparameter_view(self.best))
         else:
-            self.fields["hyperparameters"].value = no_hyperparameters_html(
-                self.state.backbone, self.state.pooling, status
-            )
+            self.fields["hyperparameters"].value = no_hyperparameters_html(self.state.backbone, status)
         return self.plan
 
-    def artefacts(self) -> list[prep.Artefact]:
-        """What this session could reuse instead of making: its own output, then the example's."""
-        return list(prep.available_artefacts(self.state, session=self.session_artefacts))
+    def artefact(self) -> prep.Artefact | None:
+        """The 3Di string this session made, when it still describes the wild type on screen."""
+        return prep.session_artefact(self.state, self.session_three_di)
 
-    def _sync_preparation(self, artefacts: Sequence[prep.Artefact]) -> None:
-        """Rebuild step 3 from step 2: the source lists, the estimate, the button labels.
+    def _sync_structure(self, artefact: prep.Artefact | None) -> None:
+        """Rebuild step 3 from step 2: the source list, the note, and what it will write.
 
-        The source lists are built rather than written down because a choice that does not
-        apply must not be on screen at all -- "reuse the bundled region" is not greyed out
-        for somebody else's protein, it is absent.
+        The source list is built rather than written down because a choice that does not
+        apply must not be on screen at all -- "reuse the one this session made" is not
+        greyed out after the library has changed under it, it is absent.
         """
-        forced = self.three_di.sync(self.state, prep.pick(artefacts, prep.STEP_THREE_DI))
+        forced = self.three_di.sync(self.state, artefact)
         if forced is not None:
             self.state.three_di_source = forced
-        if prep.needs_region(self.state):
-            # Only worth the subsample when a region is actually going to be pooled; this
-            # runs on every keystroke.
-            preview = prep.region_preview(self.state)
-            estimate = prep.region_estimate(self.state, has_gpu=self._has_gpu(), preview=preview)
-            forced = self.region_step.sync(
-                self.state, prep.pick(artefacts, prep.STEP_REGION), preview=preview, estimate=estimate
-            )
-            if forced is not None:
-                self.state.set("region_source", forced)
-        self.preparation_note.value = theme.note_html(prep.step_note(self.state))
-        self.three_di.note.value = theme.note_html(prep.block_note(self.state, prep.STEP_THREE_DI))
-        self.region_step.note.value = theme.note_html(prep.block_note(self.state, prep.STEP_REGION))
+        self.three_di.note.value = theme.note_html(prep.section_note(self.state))
         self.outputs_note.value = prep.outputs_html(prep.output_files(self.state, work_dir=work_dir(self.state)))
-
-    def _forget_stale_region(self) -> None:
-        """Drop a resolved region the form has stopped describing.
-
-        A region is a list of residues of one protein under one pooling. Keeping the one
-        that was resolved before the pooling changed is how a run pools `cosine_p95_mean`
-        over the p90 residues and reports it under the p95 name.
-        """
-        if self.region is None:
-            return
-        if self._region_key == region_key(self.state):
-            return
-        self.region = None
-        self._region_key = None
-        self.state.set("region_ready", False)
-        self.state.set("region_path", "")
 
     def _has_gpu(self) -> bool:
         return bool(self.runtime is not None and self.runtime.has_gpu)
-
-    def _sync_pooling_options(self) -> None:
-        """Keep the pooling list the registry's, not a snapshot taken when the page was built."""
-        choices = list(core.pooling_choices(self.state.backbone)) or [self.state.pooling]
-        if tuple(self.fields["pooling"].options) == tuple(choices):
-            return
-        wanted = self.state.pooling if self.state.pooling in choices else choices[0]
-        self.fields["pooling"].options = choices
-        self.fields["pooling"].value = wanted
-        self.state.pooling = wanted
 
     def _sync_seed_limits(self) -> None:
         """Cap the seed spinners at the protocol the registry entry itself declares."""
@@ -1976,7 +1651,7 @@ class MainWizard:
                 widget.max = max(1, available)
 
     def _config_status(self) -> core.ConfigStatus | None:
-        """The registry lookup for the current pair, read once and cached.
+        """The registry lookup for the current backbone, read once and cached.
 
         `refresh` runs on every keystroke, and `self.best` is handed straight to
         `finetune`, so re-reading the YAML each time would both cost a file read and hand
@@ -1984,14 +1659,14 @@ class MainWizard:
         """
         if not self.state.get("library_loaded"):
             return None
-        key = (self.state.backbone, self.state.pooling)
-        status = core.config_status(*key)
+        key = self.state.backbone
+        status = core.config_status(key)
         if key == self._best_key and self.best is not None:
             return status
         self._best_key = key
         if status.found and status.error is None:
             try:
-                self.best = self.backend.load_best_config(*key)
+                self.best = self.backend.load_best_config(key)
             except Exception:  # noqa: BLE001 - config_status already turned this into a message
                 self.best = None
         else:
@@ -2033,10 +1708,7 @@ class MainWizard:
 
     def _resolve_library_inputs(self) -> tuple[Path, str]:
         if self.state.data_source == "bundled_example":
-            from colabsd import EXAMPLES_ROOT
-
-            example = Path(EXAMPLES_ROOT) / "slugcas9_5nnk"
-            return example / "library.csv", self.backend.load_wt_sequence(example / "wt.fasta")
+            return example_path("library.csv"), self.backend.load_wt_sequence(example_path("wt.fasta"))
         csv_path = Path(str(self.state.get("library_csv")).strip())
         typed = str(self.state.get("wt_sequence") or "").strip()
         if typed.lower().startswith(("http://", "https://")):
@@ -2047,9 +1719,8 @@ class MainWizard:
     def on_get_three_di(self) -> None:
         """The 3Di step: put a wild-type 3Di string in this session. It never leaves it.
 
-        Whatever the source — the example's, a file, a structure read by foldseek, or
-        ESMFold — the string is attached to the `LibrarySpec` here and written beside the
-        run, so nothing has to be downloaded and uploaded back.
+        Whatever the source — a file, a structure read by foldseek, or ESMFold — the string is
+        attached to the `LibrarySpec` here and written beside the run.
         """
         if self.spec is None:
             raise ValueError("Check the library first: the 3Di string is measured against its wild-type length.")
@@ -2057,74 +1728,25 @@ class MainWizard:
             self.state,
             self.backend,
             wt_sequence=self.spec.wt_sequence,
-            artefact=prep.pick(self.artefacts(), prep.STEP_THREE_DI),
+            artefact=self.artefact(),
             work_dir=work_dir(self.state),
             has_gpu=self._has_gpu(),
         )
         self.spec = replace(self.spec, wt_3di=three_di)
         self.spec.validate()
         self.state.wt_3di_length = len(three_di)
-        target = work_dir(self.state) / "wt_3di.txt"
+        target = work_dir(self.state) / prep.THREE_DI_FILENAME
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(three_di + "\n")
-        artefact = self.three_di.written_artefact(self.state, target, three_di)
-        self.session_artefacts = [
-            item for item in self.session_artefacts if item.kind != prep.STEP_THREE_DI
-        ] + [artefact]
+        self.session_three_di = prep.written_artefact(target, three_di)
         length = len(self.spec.wt_sequence)
         self._say(
             "structure",
             f"3Di attached: {len(three_di)} states for {length} residues, and kept in this session.\n"
             f"- sequence `{self.spec.wt_sequence[:60]}…`\n"
             f"- 3Di      `{three_di[:60]}…`\n"
-            f"- written to `{target}` so a Drive mount survives a disconnect",
+            f"- written to `{target}`",
         )
-
-    def on_get_region(self) -> None:
-        """The region step: put a pooling region in this session — reused, uploaded, or discovered.
-
-        Discovery is the one step on this page that can outlast a Colab session, which is
-        why it is a button of its own with its estimate printed beside it, and why **Train**
-        will never start it for you.
-        """
-        if self.spec is None:
-            raise ValueError("Check the library first: a region is checked against the wild-type length.")
-        record, path = self.region_step.resolve(
-            self.state,
-            self.backend,
-            artefact=prep.pick(self.artefacts(), prep.STEP_REGION),
-            sequences=self.sequences or [],
-            wt_sequence=self.spec.wt_sequence,
-            work_dir=work_dir(self.state),
-            has_gpu=self._has_gpu(),
-            progress=self._progress,
-            say=lambda line: self._say("region", line),
-        )
-        problems = region_problems(record, self.state.pooling, self.state.wt_length, source=str(path))
-        if problems:
-            raise ValueError(" ".join(problems))
-        self._hold_region(record, path)
-        selected = record.get("n_selected_positions", len(record.get("selected_positions_1based", []) or []))
-        self._say(
-            "region",
-            f"Region ready: **{selected} of {record.get('seq_length', '?')} residues** for "
-            f"`{self.state.pooling}`, from `{path}`. It stays in this session — nothing to download.",
-        )
-        for note in region_notes(record, self.state.backbone):
-            self.logs["region"].value += theme.message_html(note, "warning")
-
-    def _hold_region(self, record: dict[str, Any], path: Path | None) -> None:
-        """Keep a resolved region, and offer it back as something to reuse."""
-        self.region = record
-        self.region_path = Path(path) if path is not None else None
-        self._region_key = region_key(self.state)
-        self.state.set("region_ready", True)
-        self.state.set("region_path", str(path or ""))
-        if path is not None and str(self.state.get("region_source")) == "discover":
-            artefact = self.region_step.discovered_artefact(self.state, Path(path), record)
-            self.session_artefacts = [
-                item for item in self.session_artefacts if item.path != artefact.path
-            ] + [artefact]
 
     def on_train(self) -> None:
         items = messages(self.state, runtime=self.runtime, status=self._config_status())
@@ -2139,10 +1761,7 @@ class MainWizard:
                 "Press **Get the 3Di string** in the preparation step above."
             )
 
-        self.region = self._resolve_region()
-        self.adapter = self.backend.create_adapter(
-            self.state.backbone, **adapter_kwargs(self.state, self.spec, self.region)
-        )
+        self.adapter = self.backend.create_adapter(self.state.backbone, **adapter_kwargs(self.state, self.spec))
         split_seeds, model_seeds = training_seeds(self.state, self.best)
         self.splits = self.backend.make_splits(
             len(self.sequences), split_seeds, split_dir(self.state, len(self.sequences))
@@ -2172,35 +1791,15 @@ class MainWizard:
 
         macro = (getattr(self.run, "validation_summary", {}) or {}).get("Spearman", {})
         self.state.set("floor_cleared", clears_floor(macro.get("mean"), self.floor))
-        # Freeze what this run actually was. `self.best` follows the dropdowns; the bundle
-        # must not, or it records one pair's hyperparameters beside another pair's weights.
-        self.trained_best, self.trained_spec, self.trained_region = self.best, self.spec, self.region
+        # Freeze what this run actually was. `self.best` follows the dropdown; the bundle
+        # must not, or it records one backbone's hyperparameters beside another's weights.
+        self.trained_best, self.trained_spec = self.best, self.spec
         self.state.set("trained_fingerprint", training_fingerprint(self.state))
         self.state.set("trained", True)
         self.state.set("exported", False)
         self.results.value = self._results_html()
         for warning in getattr(self.run, "warnings", []) or []:
             self.logs["run"].value += theme.message_html(warning, "warning")
-
-    def _resolve_region(self) -> dict[str, Any] | None:
-        """The region this run pools over: the one the preparation step produced, or a cheap one read now.
-
-        Reading a file that is already here costs nothing, so Train does it rather than
-        dead-ending on a button. Discovering one costs a session, so Train refuses instead:
-        an hour of GPU time is not something a run should start on your behalf.
-        """
-        if not prep.needs_region(self.state):
-            return None
-        if self.region is not None and self._region_key == region_key(self.state):
-            return self.region
-        if str(self.state.get("region_source")) == "discover":
-            raise ValueError(
-                "No pooling region has been discovered in this session yet. Press **Discover the region** in "
-                "the preparation step — it is the one step here that can outlast a Colab session, so Train "
-                "will not start it for you."
-            )
-        self.on_get_region()
-        return self.region
 
     def _results_html(self) -> str:
         """The validation numbers and the one-hot floor, side by side."""
@@ -2226,10 +1825,7 @@ class MainWizard:
             + "<div style='display:flex;gap:28px;flex-wrap:wrap;margin-top:10px'>"
             + f"<div><b>{model_label} — validation</b>{model_table}</div>"
             + f"<div><b>One-hot floor — validation</b>{floor_table}</div></div>"
-            + theme.note_html(
-                "These are validation numbers. The test partition is still locked; the last cell of this "
-                "notebook is the only thing that opens it, and it counts every time it does."
-            )
+            + theme.note_html("These are validation numbers: the test partition is still locked.")
         )
 
     def _export_runners(self) -> exports.ExportRunners:
@@ -2258,7 +1854,6 @@ class MainWizard:
             spec=self.trained_spec,
             best=self.trained_best,
             path=work_dir(self.state) / bundle_name,
-            region=self.trained_region,
             notes=str(self.state.get("bundle_notes") or "").strip() or None,
             runners=self._export_runners(),
         )
@@ -2269,11 +1864,9 @@ class MainWizard:
     def on_export_performance(self) -> None:
         """Write the performance archive — with the test partition still locked.
 
-        This is the export a user should have while they are still deciding anything, and
-        until now it did not exist: the only call to `colabsd.report.build_report` was
-        inside the unlock handler, so the report was unreachable unless you spent the test
-        set to see it. Pressing this again after an unlock rewrites the same file with the
-        test numbers and the count.
+        The only call to `colabsd.report.build_report` used to be inside the unlock handler,
+        so the report was unreachable unless you spent the test set to see it. Pressing this
+        again after an unlock rewrites the same file with the test numbers and the count.
         """
         problems = export_blockers(self.state)
         if problems:

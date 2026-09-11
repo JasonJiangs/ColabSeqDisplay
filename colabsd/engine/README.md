@@ -31,7 +31,7 @@ So:
 - **Fix bugs upstream-first where you can.** What is fixed here (the `micro_batch_size:
   auto` crash in the config loader) is listed in `ATTRIBUTION.md` and is worth sending back.
 - **New behaviour does not belong here.** Everything that makes this runnable from a
-  notebook — HuggingFace loading, CSV handling, region discovery, best-config lookup,
+  notebook — HuggingFace loading, CSV handling, best-config lookup,
   orchestration, reporting, bundles — lives outside this directory and is ours to change
   freely.
 
@@ -74,9 +74,9 @@ module you need.
 | `train_config.py` | `train_eval_config` (one fine-tune + evaluation) and `load_lora_best_config` |
 | `heads.py` | the head registry, `MLPHead`, `RidgeHead`, `create_head`, `select_safe_device` |
 | `metrics.py` | `evaluate_predictions` and the validation-log helpers |
-| `pooling.py` | the pooling registry and the five named mean-pooling strategies |
+| `pooling.py` | position selection and the mean reducer, composed into one `pool` |
 | `splits.py` | the reproducible 8:1:1 split protocol |
-| `protein_db.py` | named residue-region lookup |
+| `protein_db.py` | the protein record: a wild type's length and the sites its library mutates |
 | `one_hot.py` | the amino-acid vocabulary and per-site one-hot encoder behind the floor |
 | `formats.py` | per-family input formatting (SaProt 3Di interleaving, ProtT5, Ankh, SeqDance) |
 | `adapters.py`, `schema.py`, `config_space.py`, `loader.py`, `sequences.py` | the protocol, config objects and small helpers the above depend on |

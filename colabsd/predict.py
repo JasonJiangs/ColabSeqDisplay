@@ -1,8 +1,9 @@
 """Score new variants with a saved bundle.
 
-Rebuilds the backbone adapter named in the manifest, re-injects the saved LoRA
-weights and head, and runs upstream's batched prediction. Sorting, filtering and
-top-N export belong to the notebook, not here.
+Rebuilds the backbone adapter named in the manifest over the mutated sites the
+bundled spec lists, re-injects the saved LoRA weights and head, and runs upstream's
+batched prediction. Sorting, filtering and top-N export belong to the notebook, not
+here.
 
 Sequences are built by `colabsd.data.build_sequences`, the same function the training path
 uses, so a residue the loader would have rejected cannot slip into a prediction table.
@@ -165,13 +166,6 @@ def _create_adapter(bundle: Bundle) -> Any:
         raise BackboneError(
             f"colabsd.backbones.registry is unavailable, so {bundle.adapter_name} cannot be rebuilt ({exc})."
         ) from exc
-    positions = bundle.pooling_positions_0based
-    if not positions:
-        raise BundleError(
-            f"The bundle manifest carries no frozen pooling coordinates for {bundle.pooling!r}, so scoring would "
-            "silently fall back to the packaged reference protein and average the wrong residues. Re-create the "
-            "bundle with colabsd.bundle.save_bundle(..., region=...)."
-        )
     optional = {
         name: value
         for name, value in (("dtype", bundle.adapter_dtype), ("hf_id", bundle.adapter_hf_id))
@@ -180,8 +174,7 @@ def _create_adapter(bundle: Bundle) -> Any:
     try:
         return create_adapter(
             bundle.adapter_name,
-            pooling=bundle.pooling,
-            pooling_positions_0based=list(positions),
+            pooling_positions_0based=bundle.pooling_positions_0based,
             wt_3di=bundle.spec.wt_3di,
             **optional,
         )

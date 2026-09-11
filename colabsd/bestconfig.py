@@ -1,9 +1,15 @@
-"""Best-config registry: one YAML per (backbone, pooling) pair.
+"""Best-config registry: the committed LoRA hyperparameters for one backbone.
 
 Schema validation is upstream's job. `load_lora_best_config` is the single
 authority on what a LoRA configuration must contain, so an entry it rejects is
 rejected here too; this module only adds the registry lookup and the `_meta`
 provenance block the notebook shows next to the backbone dropdown.
+
+The lookup takes a backbone name and nothing else. `config/best/` holds 28 files
+because it is the record of a study that compared pooling strategies, and their
+names still carry the strategy that produced them; only the `mutation_site_mean`
+half is reachable, because that is what the pipeline pools. `config/best/README.md`
+says which is which.
 """
 
 from __future__ import annotations
@@ -19,17 +25,12 @@ from colabsd.errors import ConfigError
 TUNED = "tuned"
 PROVISIONAL = "provisional"
 
-#: Registry filenames are ``<model>_<pooling>.yaml``; model names may contain
-#: hyphens and pooling names contain underscores, so the split needs the known
-#: pooling suffixes. `tests/test_bestconfig.py` asserts these stay identical to
-#: upstream `POOLING_REGIONS`.
-POOLING_NAMES: tuple[str, ...] = (
-    "cosine_p90_mean",
-    "cosine_p95_mean",
-    "full_mean",
-    "last150_mean",
-    "mutation_site_mean",
-)
+#: The filename suffix of every reachable entry, `<model>_<ENTRY_SUFFIX>.yaml`. It is a fact
+#: about the files on disk, not a choice offered to anyone: the pipeline averages the
+#: embeddings at the mutated sites, so this is the only half of the directory that is read.
+#: It is the same label the engine records in every artefact, `colabsd.engine.pooling.
+#: POOLING_NAME`; `tests/test_bestconfig.py` asserts the two stay identical.
+ENTRY_SUFFIX = "mutation_site_mean"
 
 LORA_PARAMETERS: tuple[str, ...] = (
     "adapter_lr",
@@ -43,7 +44,7 @@ LORA_PARAMETERS: tuple[str, ...] = (
 
 
 class BestConfigNotFound(ConfigError, LookupError):
-    """No registry entry exists for the requested (model, pooling) pair."""
+    """No registry entry exists for the requested model."""
 
 
 @dataclass(frozen=True)
@@ -58,10 +59,6 @@ class BestConfig:
     is_provisional: bool
     path: Path | None = None
     study: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def pooling(self) -> str:
-        return str(self.fixed["pooling"])
 
     @property
     def status(self) -> str:
@@ -99,10 +96,9 @@ class BestConfig:
 
     def describe(self) -> str:
         """One human-readable line for the notebook form."""
-        head = f"{self.model} · {self.pooling}"
         if self.is_provisional:
-            return f"{head} · PROVISIONAL — hyperparameters are a placeholder, performance unknown"
-        return f"{head} · {self.status}{_performance_suffix(self)}"
+            return f"{self.model} · PROVISIONAL — hyperparameters are a placeholder, performance unknown"
+        return f"{self.model} · {self.status}{_performance_suffix(self)}"
 
 
 def _as_float(value: Any) -> float | None:
@@ -129,64 +125,45 @@ def _root(root: str | Path | None) -> Path:
     return Path(root) if root is not None else BEST_CONFIG_ROOT
 
 
-def config_path(model_name: str, pooling: str, root: str | Path | None = None) -> Path:
-    """Return the registry path for a (model, pooling) pair; existence is not checked."""
-    for label, value in (("model_name", model_name), ("pooling", pooling)):
-        if not value or "/" in value or "\\" in value or value in {".", ".."}:
-            raise ConfigError(f"{label} must be a plain registry name, got {value!r}")
-    return _root(root) / f"{model_name}_{pooling}.yaml"
+def config_path(model_name: str, root: str | Path | None = None) -> Path:
+    """Return the registry path for *model_name*; existence is not checked."""
+    if not model_name or "/" in model_name or "\\" in model_name or model_name in {".", ".."}:
+        raise ConfigError(f"model_name must be a plain registry name, got {model_name!r}")
+    return _root(root) / f"{model_name}_{ENTRY_SUFFIX}.yaml"
 
 
-def available_pairs(root: str | Path | None = None) -> list[tuple[str, str]]:
-    """List the (model, pooling) pairs present in the registry, sorted."""
+def available_models(root: str | Path | None = None) -> list[str]:
+    """List the models the registry can be asked for, sorted.
+
+    A directory may hold entries from a study that compared several pooling strategies;
+    only the `<model>_mutation_site_mean.yaml` half is reachable, so only those are listed.
+    """
     directory = _root(root)
     if not directory.is_dir():
         return []
-    pairs = []
-    for path in sorted(directory.glob("*.yaml")):
+    models = set()
+    for path in sorted(directory.glob(f"*_{ENTRY_SUFFIX}.yaml")):
         if not path.is_file():
             continue
-        for pooling in POOLING_NAMES:
-            model = path.stem[: -len(pooling) - 1]
-            if model and path.stem.endswith(f"_{pooling}"):
-                pairs.append((model, pooling))
-                break
-    return sorted(pairs)
+        model = path.stem[: -len(ENTRY_SUFFIX) - 1]
+        if model:
+            models.add(model)
+    return sorted(models)
 
 
-def available_models(pooling: str | None = None, root: str | Path | None = None) -> list[str]:
-    """List registry models, optionally restricted to those tuned for one pooling."""
-    return sorted({model for model, name in available_pairs(root) if pooling is None or name == pooling})
-
-
-def available_poolings(model_name: str | None = None, root: str | Path | None = None) -> list[str]:
-    """List registry poolings, optionally restricted to those available for one model."""
-    return sorted({name for model, name in available_pairs(root) if model_name is None or model == model_name})
-
-
-def _missing_entry_error(model_name: str, pooling: str, path: Path, root: Path) -> BestConfigNotFound:
-    pairs = available_pairs(root)
-    if not pairs:
+def _missing_entry_error(model_name: str, path: Path, root: Path) -> BestConfigNotFound:
+    models = available_models(root)
+    if not models:
         return BestConfigNotFound(
-            f"The best-config registry at {root} is empty (looked for {path.name}). "
-            "Point `root` at a directory of <model>_<pooling>.yaml files, e.g. config/best/."
+            f"The best-config registry at {root} holds no entry this pipeline can read (looked for {path.name}). "
+            f"Point `root` at a directory of <model>_{ENTRY_SUFFIX}.yaml files, e.g. config/best/."
         )
-    models = available_models(root=root)
-    for_model = available_poolings(model_name, root)
-    for_pooling = available_models(pooling, root)
-    lines = [f"No best config for model {model_name!r} with pooling {pooling!r} in {root}."]
-    if for_model:
-        lines.append(f"{model_name} is available with pooling: {', '.join(for_model)}.")
-    else:
-        suggestion = difflib.get_close_matches(model_name, models, n=1)
-        hint = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
-        lines.append(f"Known models: {', '.join(models)}.{hint}")
-    if for_pooling:
-        lines.append(f"{pooling} is available for: {', '.join(for_pooling)}.")
-    else:
-        lines.append(f"Known poolings: {', '.join(available_poolings(root=root))}.")
-    lines.append(f"Pick a listed pair, or add {path.name} to that directory (see config/best/README.md).")
-    return BestConfigNotFound(" ".join(lines))
+    suggestion = difflib.get_close_matches(model_name, models, n=1)
+    hint = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+    return BestConfigNotFound(
+        f"No best config for model {model_name!r} in {root}. Known models: {', '.join(models)}.{hint} "
+        f"Pick a listed model, or add {path.name} to that directory (see config/best/README.md)."
+    )
 
 
 #: Blocks a registry entry may declare; each must be a YAML mapping when present.
@@ -202,7 +179,7 @@ def _read_entry(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ConfigError(
             f"{path} could not be read as YAML: {exc}. "
-            "Fix the file against config/best/README.md, or pick another (model, pooling) pair."
+            "Fix the file against config/best/README.md, or pick another model."
         ) from exc
     if not isinstance(raw, dict):
         raise ConfigError(
@@ -219,14 +196,14 @@ def _read_entry(path: Path) -> dict[str, Any]:
     return raw
 
 
-def load_best_config(model_name: str, pooling: str, root: str | Path | None = None) -> BestConfig:
-    """Load and validate one registry entry, keeping its `_meta` provenance."""
+def load_best_config(model_name: str, root: str | Path | None = None) -> BestConfig:
+    """Load and validate the registry entry for *model_name*, keeping its `_meta` provenance."""
     from colabsd.engine.train_config import load_lora_best_config
 
     directory = _root(root)
-    path = config_path(model_name, pooling, directory)
+    path = config_path(model_name, directory)
     if not path.is_file():
-        raise _missing_entry_error(model_name, pooling, path, directory)
+        raise _missing_entry_error(model_name, path, directory)
 
     raw = _read_entry(path)
     try:
@@ -234,26 +211,21 @@ def load_best_config(model_name: str, pooling: str, root: str | Path | None = No
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ConfigError(
             f"{path} is not a valid LoRA best-config: {exc}. "
-            "Fix the file against config/best/README.md, or pick another (model, pooling) pair."
+            "Fix the file against config/best/README.md, or pick another model."
         ) from exc
 
     meta = dict(raw.get("_meta") or {})
-    fixed = dict(runtime["fixed"])
     if loaded_model != model_name:
         raise ConfigError(
             f"{path} declares model {loaded_model!r} but is filed under {model_name!r}. "
             "Rename the file or fix its `model:` field."
         )
-    if str(fixed.get("pooling")) != pooling:
-        raise ConfigError(
-            f"{path} declares training.pooling {fixed.get('pooling')!r} but is filed under {pooling!r}. "
-            "Rename the file or fix its `training.pooling` field."
-        )
+    _require_matching_filename(raw, path)
 
     return BestConfig(
         model=loaded_model,
         params=dict(params),
-        fixed=fixed,
+        fixed=dict(runtime["fixed"]),
         evaluation=dict(raw.get("evaluation") or {}),
         meta=meta,
         is_provisional=str(meta.get("status", PROVISIONAL)).strip().lower() != TUNED,
@@ -262,6 +234,22 @@ def load_best_config(model_name: str, pooling: str, root: str | Path | None = No
     )
 
 
-def describe(model_name: str, pooling: str, root: str | Path | None = None) -> str:
+def _require_matching_filename(raw: dict[str, Any], path: Path) -> None:
+    """Refuse an entry filed under a name its own record contradicts.
+
+    The study these files came from recorded the pooling it used in `training.pooling`, and
+    the filename repeats it. A file that says one thing and is named another would hand this
+    pipeline the hyperparameters of a run it is not reproducing.
+    """
+    declared = (raw.get("training") or {}).get("pooling")
+    if declared is not None and str(declared) != ENTRY_SUFFIX:
+        raise ConfigError(
+            f"{path} records training.pooling {str(declared)!r} but is filed as an {ENTRY_SUFFIX} entry. "
+            "Those hyperparameters were selected for a different run: rename the file, or fix its "
+            "`training.pooling` field."
+        )
+
+
+def describe(model_name: str, root: str | Path | None = None) -> str:
     """One human-readable line for the notebook form, shouting about provisional entries."""
-    return load_best_config(model_name, pooling, root).describe()
+    return load_best_config(model_name, root).describe()

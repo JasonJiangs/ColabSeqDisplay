@@ -34,7 +34,7 @@ optuna = ["optuna>=3,<5"]
 # `config/best/` and `examples/` sit beside the package in the source tree, and a wheel
 # cannot carry files from outside a package directory. They are mapped in as
 # `colabsd.config` / `colabsd.examples` so an installed copy carries the 28-entry config
-# registry and the bundled SlugCas9 example rather than silently shipping an empty
+# registry and the bundled MG8 PETase example rather than silently shipping an empty
 # registry; `colabsd.DATA_ROOT` finds them in either layout. The list is explicit because
 # `package-dir` and `packages.find` cannot be combined, so a new subpackage or a new data
 # file extension has to be added here as well or it will be missing from the built
@@ -48,7 +48,7 @@ packages = [
     "colabsd.config",
     "colabsd.config.best",
     "colabsd.examples",
-    "colabsd.examples.slugcas9_5nnk",
+    "colabsd.examples.mg8_petases",
 ]
 
 [tool.setuptools.package-dir]
@@ -60,7 +60,7 @@ packages = [
 "colabsd.config" = ["*.md"]
 "colabsd.config.best" = ["*.yaml", "*.md"]
 "colabsd.examples" = ["*.md"]
-"colabsd.examples.slugcas9_5nnk" = ["*.csv", "*.fasta", "*.txt", "*.json", "*.md"]
+"colabsd.examples.mg8_petases" = ["*.csv", "*.fasta", "*.md", "*.xlsx"]
 
 [tool.ruff]
 line-length = 120

@@ -2,8 +2,8 @@
 
 Sequences are always constructed by substituting the row's residues into
 `LibrarySpec.wt_sequence`; nothing here reads a per-variant FASTA. That keeps
-every sequence exactly as long as the wild type, which is what the pooling
-coordinates and the region records assume.
+every sequence exactly as long as the wild type, so the mutated positions are the
+same residue offsets in every variant.
 
 This module is also where the package decides what an ambiguous variant table is: a CSV
 header that names the same column twice is refused rather than silently mangled by pandas,

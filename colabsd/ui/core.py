@@ -1,28 +1,22 @@
 """The shared machinery every ColabSeqDisplay wizard is made of.
 
-The ColabPLM notebooks put one 236 KB program in one cell and toggle
-`layout.display` 126 times inside it. The interaction is right; the packaging is
-not testable. So the *decisions* live here as pure functions over a
-`WizardState` — which sections are visible, which fields inside them, which
-contextual messages fire — and the widget layer below them does nothing but call
-those functions and assign `layout.display`.
-
-The rule is: if you cannot write ``assert plan(state).message_keys == (...)`` for
-it, it does not belong in an observer.
+The *decisions* live here as pure functions over a `WizardState` — which sections
+are visible, which fields inside them, which contextual messages fire — and the
+widget layer below them does nothing but call those functions and assign
+`layout.display`. The rule is: if you cannot write
+``assert plan(state).message_keys == (...)`` for it, it does not belong in an
+observer.
 
 Facts come from the repository, never from a number typed here:
 `colabsd.backbones.registry` says how long a backbone takes on a T4, whether it
 fits one at all, and whether it needs a 3Di string; `colabsd.bestconfig` says
-whether a (backbone, pooling) pair has tuned hyperparameters or a placeholder;
-`colabsd.structure` says how long a wild type ESMFold will fold on a free T4.
+whether a backbone has tuned hyperparameters or a placeholder; `colabsd.structure`
+says how long a wild type ESMFold will fold on a free T4.
 
-Plain `observe()` / `on_click()`, not `jupyter_ui_poll`. The ColabPLM cell needs
-`ui_events` because the whole program lives inside one still-running cell that
-drives training on a background thread and uses the cell's own run-button as its
-stop button. Our notebook cell installs, imports and launches, then ends; Colab
-keeps the widget comm alive afterwards, so ordinary observers fire, exceptions
-surface in an `Output` instead of being swallowed by the poll loop, and every
-handler is callable directly from a test.
+Plain `observe()` / `on_click()`, not `jupyter_ui_poll`: our notebook cell
+installs, imports and launches, then ends, and Colab keeps the widget comm alive
+afterwards, so ordinary observers fire, exceptions surface in an `Output` instead
+of being swallowed by a poll loop, and every handler is callable from a test.
 """
 
 from __future__ import annotations
@@ -43,19 +37,17 @@ DEFAULT_WORK_DIR = "colabsd_work"
 """Where a wizard writes when the notebook cell does not say. Relative on purpose: an
 absolute fallback would silently point outside whatever Drive folder the user mounted."""
 
-#: The two wizards left. `train` is the main notebook and `predict` scores variants from a
-#: bundle. There was a third — a standalone Prepare wizard that built a 3Di string and a
-#: pooling region — and it is gone: preparation is a *step* of the training panel now,
-#: derived from the backbone and the pooling chosen there rather than asked about again.
-#: `colabsd.ui.prepare_workflow` still owns those two blocks; nothing sets a mode for them.
+#: The two wizards. `train` is the main notebook; `predict` scores variants from a bundle.
+#: Preparing the wild-type 3Di string is a *step* of the training panel, derived from the
+#: backbone chosen there: `colabsd.ui.prepare_workflow` owns that block and nothing sets a
+#: mode for it.
 MODES: tuple[str, ...] = ("train", "predict")
 
-#: Where a wild-type 3Di string can come from, matching `colabsd.structure`. `bundled_example`
-#: and `session` are the two that need no work at all: a string that is already here, either
-#: shipped with the package or made earlier in this session.
+#: Where a wild-type 3Di string can come from, matching `colabsd.structure`. `session` reuses
+#: a string made earlier in this session; nothing ships one, so every other route starts from
+#: a structure or a file the user provides.
 THREE_DI_SOURCES: tuple[str, ...] = (
     "none",
-    "bundled_example",
     "session",
     "paste",
     "upload_3di",
@@ -63,8 +55,8 @@ THREE_DI_SOURCES: tuple[str, ...] = (
     "esmfold",
 )
 
-#: A Colab session drops well before this; SaprotHub's own notebooks warn above
-#: two hours of training. Not a repository fact — a fact about Colab.
+#: A Colab session drops well before this; SaprotHub's own notebooks warn above two hours of
+#: training. A fact about Colab, not one this repository measured.
 COLAB_SESSION_MINUTES: float = 120.0
 
 #: Past this much work, losing the machine hurts enough to be worth a Drive mount.
@@ -75,10 +67,6 @@ FREE_T4_MEMORY_GB: float = 16.0
 
 #: An L4 reports ~22.5 GB and a V100 16 GB; past this a card is A100-class.
 L4_MEMORY_GB: float = 26.0
-
-#: Fallback for `reference_library_variants()` when the bundled example is not
-#: installed. `tests/test_ui_core.py` asserts the two agree when it is.
-REFERENCE_LIBRARY_VARIANTS: int = 16424
 
 #: Fallback for `esmfold_safe_length()`; pinned against `colabsd.structure` in the tests.
 ESMFOLD_FALLBACK_LENGTH: int = 700
@@ -100,8 +88,8 @@ SECTION_ORDER: tuple[str, ...] = (
 SECTION_TITLES: dict[str, str] = {
     "data": "Your variant library",
     "structure": "Wild-type structure (3Di)",
-    "model": "Backbone and pooling",
-    "hyperparameters": "Hyperparameters for this pair",
+    "model": "The backbone",
+    "hyperparameters": "Hyperparameters for this backbone",
     "training": "How many runs",
     "bundle": "The trained model",
     "variants": "Variants to score",
@@ -117,9 +105,9 @@ SECTION_TITLES: dict[str, str] = {
 class WizardState:
     """Every choice a user has made, in one object the pure functions read.
 
-    The typed fields are the ones the visibility and warning rules depend on;
-    anything a single wizard needs and the rules do not goes in `extra`, so
-    `set()`/`get()` work uniformly for an observer that does not know which is which.
+    The typed fields are the ones the visibility and warning rules depend on; anything a
+    single wizard needs and the rules do not goes in `extra`, so `set()`/`get()` work
+    uniformly for an observer that does not know which is which.
     """
 
     mode: str = "train"
@@ -129,7 +117,6 @@ class WizardState:
     wt_length: int = 0
 
     backbone: str = "ESM2-35M"
-    pooling: str = "cosine_p90_mean"
     dtype: str = "float32"
 
     three_di_source: str = "none"
@@ -184,9 +171,8 @@ def backbone_entry(name: str) -> BackboneEntry | None:
 def _offered(name: str) -> bool:
     """Whether the notebooks put this backbone in front of a user.
 
-    `colabsd.backbones.registry` owns the answer and nothing here keeps a second copy of it:
-    this is the join. A list of families kept here as well would let the dropdown and
-    `registry.offered()` disagree, and the dropdown is the one a user believes.
+    `colabsd.backbones.registry` owns the answer; this is the join. A second list of families
+    kept here would let the dropdown and `registry.offered()` disagree.
     """
     return registry.is_offered(name)
 
@@ -205,10 +191,9 @@ def colab_backbones() -> list[str]:
 def withdrawn_backbones() -> list[str]:
     """Registered backbones the notebooks do not offer — the answer to "where did mine go?".
 
-    Deliberately only the *list*. Why each one is off the form differs — a 1.2B encoder that
-    needs an L4, an SDK the notebooks will not install, a model with no HuggingFace weights at
-    all — and `colabsd.backbones.registry.withheld_reason` is where those reasons are written.
-    A single sentence here covering all of them was wrong about four of the seven.
+    Deliberately only the *list*: the reasons differ per backbone and live in
+    `colabsd.backbones.registry.withheld_reason`. A single sentence here covering all of them
+    was wrong about four of the seven.
     """
     return sorted(name for name in BACKBONES if not _offered(name))
 
@@ -257,7 +242,7 @@ def backbone_summary(name: str) -> str:
     entry = backbone_entry(name)
     if entry is None:
         return f"**{name}** is not in the backbone registry. Pick one of: {', '.join(colab_backbones())}."
-    structure = "needs a wild-type 3Di string" if entry.needs_structure else "sequence only, no structure needed"
+    structure = "needs a wild-type 3Di string" if entry.needs_structure else "sequence only"
     lines = [
         f"**{name}** — {entry.family} family, {entry.embed_dim}-d pooled feature"
         + (f", `{entry.hf_id}`" if entry.hf_id else "")
@@ -266,44 +251,21 @@ def backbone_summary(name: str) -> str:
     ]
     minutes = entry.approx_lora_minutes_t4
     if minutes is None:
-        lines.append("Runtime: does **not** fit a free T4 — this one needs an L4 or an A100.")
+        lines.append("Runtime: does **not** fit a free T4 — needs an L4 or an A100.")
     else:
         lines.append(
-            f"Runtime: the registry estimates **{minutes} min per run** on a T4 for a library the size of the "
-            f"bundled example ({reference_library_variants():,d} variants)."
+            f"Runtime: the registry estimates **{minutes} min per run** on a T4 for a "
+            f"{REFERENCE_LIBRARY_VARIANTS:,d}-variant library, scaled to the size of yours."
         )
     lines.append(entry.notes)
     return "\n\n".join(lines)
 
 
-def pooling_choices(backbone: str | None = None, *, root: str | Path | None = None) -> list[str]:
-    """Poolings the best-config registry has an entry for, optionally for one backbone."""
+def registered_models(root: str | Path | None = None) -> list[str]:
+    """The backbones the best-config registry holds hyperparameters for."""
     from colabsd import bestconfig
 
-    return bestconfig.available_poolings(backbone, root)
-
-
-def reference_library_variants() -> int:
-    """Rows in the bundled example library — the size the registry's minute estimates assume."""
-    global _REFERENCE_VARIANTS
-    if _REFERENCE_VARIANTS is None:
-        _REFERENCE_VARIANTS = _count_example_rows()
-    return _REFERENCE_VARIANTS
-
-
-_REFERENCE_VARIANTS: int | None = None
-
-
-def _count_example_rows() -> int:
-    from colabsd import EXAMPLES_ROOT
-
-    path = EXAMPLES_ROOT / "slugcas9_5nnk" / "library.csv"
-    try:
-        with path.open("rb") as handle:
-            rows = sum(1 for line in handle if line.strip())
-    except OSError:
-        return REFERENCE_LIBRARY_VARIANTS
-    return max(rows - 1, 1)
+    return bestconfig.available_models(root=root)
 
 
 def esmfold_safe_length() -> int:
@@ -321,50 +283,121 @@ def esmfold_safe_length() -> int:
 
 @dataclass(frozen=True)
 class ConfigStatus:
-    """What the best-config registry has to say about one (backbone, pooling) pair."""
+    """What the best-config registry has to say about one backbone."""
 
     model: str
-    pooling: str
     found: bool
     provisional: bool
     description: str
-    poolings: tuple[str, ...] = ()
+    models: tuple[str, ...] = ()
     error: str | None = None
 
 
-def config_status(model: str, pooling: str, *, root: str | Path | None = None) -> ConfigStatus:
-    """Look the pair up, turning every failure into data rather than an exception."""
+def config_status(model: str, *, root: str | Path | None = None) -> ConfigStatus:
+    """Look the backbone up, turning every failure into data rather than an exception."""
     from colabsd import bestconfig
 
     try:
-        best = bestconfig.load_best_config(model, pooling, root)
+        best = bestconfig.load_best_config(model, root=root)
     except bestconfig.BestConfigNotFound as exc:
         return ConfigStatus(
             model=model,
-            pooling=pooling,
             found=False,
             provisional=True,
             description=str(exc),
-            poolings=tuple(pooling_choices(model, root=root)),
+            models=tuple(registered_models(root)),
         )
     except Exception as exc:  # unreadable YAML, or upstream not importable
         return ConfigStatus(
             model=model,
-            pooling=pooling,
             found=True,
             provisional=True,
             description=str(exc),
-            poolings=tuple(pooling_choices(model, root=root)),
+            models=tuple(registered_models(root)),
             error=f"{type(exc).__name__}: {exc}",
         )
     return ConfigStatus(
         model=model,
-        pooling=pooling,
         found=True,
         provisional=best.is_provisional,
         description=best.describe(),
-        poolings=tuple(pooling_choices(model, root=root)),
+        models=tuple(registered_models(root)),
     )
+
+
+# ------------------------------------------------- what one frozen forward pass costs
+# `colabsd.ui.predict_workflow` reads `forward_pass_minutes` from here: scoring a variant
+# is one frozen forward pass, so there is one cost model for it and not a second table.
+
+
+@dataclass(frozen=True)
+class TimedPass:
+    """The one forward pass over a real library that this repository has actually timed."""
+
+    backbone: str
+    n_sequences: int
+    length: int
+    seconds: float
+    source: str
+
+
+#: ESM2-650M in float16 over the whole tuning-study library -- 16,424 variants of 1054
+#: residues -- in 319 s on a B200. The only forward pass of this shape anyone here has
+#: stopwatched, and it was not on Colab, which is what `GPU_SLOWDOWN` is for.
+TIMED_PASS = TimedPass(
+    backbone="ESM2-650M",
+    n_sequences=16_424,
+    length=1054,
+    seconds=319.0,
+    source="ESM2-650M float16 on a B200, timed in this repository",
+)
+
+#: The library both measurements were made on, written once: the registry's per-run T4
+#: minutes and the timed pass above are the same 16,424-variant tuning-study library
+#: (`config/best/README.md`). Not the bundled example, which is far smaller.
+REFERENCE_LIBRARY_VARIANTS: int = TIMED_PASS.n_sequences
+
+#: How much slower a Colab GPU is than the B200 that was timed. Nobody has timed a T4, so
+#: this is a wide band and the only invented number in the estimate. Nothing on the scoring
+#: path reports the real rate back, so the band is never narrowed by a measurement.
+GPU_SLOWDOWN: tuple[float, float] = (5.0, 30.0)
+
+#: And a CPU is tens of times slower again than that T4.
+CPU_SLOWDOWN: tuple[float, float] = (200.0, 1200.0)
+
+
+def _anchor_minutes() -> int:
+    entry = BACKBONES[TIMED_PASS.backbone]
+    assert entry.approx_lora_minutes_t4 is not None
+    return entry.approx_lora_minutes_t4
+
+
+def relative_cost(backbone: str) -> float | None:
+    """How expensive one forward pass through *backbone* is, relative to the timed one.
+
+    The ratio of the registry's own `approx_lora_minutes_t4` figures, so a new backbone is
+    costed from the registry rather than from a table here that would drift away from it.
+    `None` when the registry has no T4 estimate for it.
+    """
+    entry = BACKBONES.get(backbone)
+    if entry is None or entry.approx_lora_minutes_t4 is None:
+        return None
+    return entry.approx_lora_minutes_t4 / float(_anchor_minutes())
+
+
+def forward_pass_minutes(backbone: str, *, n_sequences: int, length: int, has_gpu: bool) -> tuple[float, float] | None:
+    """Minutes for `n_sequences` frozen forward passes of `length` residues, low to high.
+
+    Linear in both, scaled off `TIMED_PASS` by the registry's relative cost and by the device
+    band. `None` when the registry cannot cost this backbone.
+    """
+    factor = relative_cost(backbone)
+    if factor is None:
+        return None
+    per_sequence = TIMED_PASS.seconds / TIMED_PASS.n_sequences / TIMED_PASS.length
+    seconds = per_sequence * factor * max(0, n_sequences) * max(0, length)
+    low, high = GPU_SLOWDOWN if has_gpu else CPU_SLOWDOWN
+    return seconds * low / 60.0, seconds * high / 60.0
 
 
 # ------------------------------------------------------------------------- estimates
@@ -403,9 +436,9 @@ class RuntimeEstimate:
             return f"{self.runs_phrase}; the registry has no T4 estimate for this backbone."
         scaled = "" if self.n_variants <= 0 else f", scaled to your {self.n_variants:,d} variants"
         return (
-            f"about {format_minutes(self.minutes or 0.0)} for {self.runs_phrase} — the registry's "
-            f"{self.per_run_minutes} min/run on a T4 for a {self.reference_variants:,d}-variant library{scaled}. "
-            "It is an estimate, not a measurement."
+            f"about {format_minutes(self.minutes or 0.0)} for {self.runs_phrase} — an estimate, not a measurement: "
+            f"the registry's {self.per_run_minutes} min/run on a T4 for a "
+            f"{self.reference_variants:,d}-variant library{scaled}."
         )
 
 
@@ -419,7 +452,7 @@ def estimate_runtime(state: WizardState) -> RuntimeEstimate:
     entry = backbone_entry(state.backbone)
     per_run = entry.approx_lora_minutes_t4 if entry else None
     runs = n_runs(state)
-    reference = reference_library_variants()
+    reference = REFERENCE_LIBRARY_VARIANTS
     minutes: float | None = None
     if per_run is not None:
         minutes = float(per_run) * runs
@@ -492,12 +525,7 @@ def _data_section(state: WizardState) -> bool:
 
 
 def _structure_section(state: WizardState) -> bool:
-    """The 3Di question exists only for a backbone that reads one.
-
-    Not "show it and grey it out": with a Prepare wizard of its own the section was always
-    on screen and the backbone only decided whether it mattered. It is a step of the
-    training panel now, so an ESM2 removes it.
-    """
+    """The 3Di question exists only for a backbone that reads one; an ESM2 removes it."""
     return needs_structure(state)
 
 
@@ -507,10 +535,6 @@ def _three_di_is(source: str) -> Predicate:
 
 def _upload_library(state: WizardState) -> bool:
     return state.data_source != "bundled_example"
-
-
-def _cosine_pooling(state: WizardState) -> bool:
-    return state.pooling.startswith("cosine_")
 
 
 def _advanced(state: WizardState) -> bool:
@@ -543,10 +567,8 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("structure_file", "structure", _three_di_is("upload_structure")),
     FieldRule("chain", "structure", _three_di_is("upload_structure")),
     FieldRule("esmfold_note", "structure", _three_di_is("esmfold")),
+    FieldRule("esmfold_risk_accepted", "structure", _three_di_is("esmfold")),
     FieldRule("backbone", "model", _mode("train")),
-    FieldRule("pooling", "model", _mode("train")),
-    FieldRule("region_source", "model", _all(_mode("train"), _cosine_pooling)),
-    FieldRule("region_filename", "model", _all(_mode("train"), _cosine_pooling)),
     FieldRule("dtype", "model", _all(_mode("train"), _advanced)),
     FieldRule("hyperparameters", "hyperparameters", _mode("train")),
     FieldRule("n_split_seeds", "training", _mode("train")),
@@ -620,10 +642,9 @@ def _backbone_is_usable(state: WizardState) -> bool:
 def backbone_messages(state: WizardState, runtime: Runtime | None = None) -> list[Message]:
     """What the backbone registry has to say about the chosen backbone.
 
-    `runtime` only ever silences a message: a backbone the registry marks as too
-    big for a T4 is fine once an L4 or an A100 has actually been detected. Whether
-    the backbone fits the card is this function's business alone, so that fact has
-    exactly one message key.
+    `runtime` only ever silences a message: a backbone the registry marks as too big for a
+    T4 is fine once an L4 or an A100 has been detected. Whether the backbone fits the card
+    is this function's business alone, so that fact has exactly one message key.
     """
     name = state.backbone
     if state.mode == "predict" or not name:
@@ -660,7 +681,7 @@ def backbone_messages(state: WizardState, runtime: Runtime | None = None) -> lis
             Message(
                 "backbone_extra_install",
                 "info",
-                f"**{name}** needs one extra package. {entry.notes} The loader says which one if it is missing.",
+                f"**{name}** needs one extra package. {entry.notes}",
             )
         )
     return out
@@ -669,10 +690,9 @@ def backbone_messages(state: WizardState, runtime: Runtime | None = None) -> lis
 def withdrawn_text(name: str) -> str:
     """Why this backbone is not on the form, in the registry's words, plus what to pick instead.
 
-    The reason is per backbone and it is asked for rather than asserted, because the reasons
-    genuinely differ and a blanket one is a sentence that is false about somebody's model. A
-    family the registry has not explained is a bug in the registry, not a red box on the page
-    that takes the panel down: say the short thing and still name the offered list.
+    Asked for rather than asserted: the reasons genuinely differ and a blanket one is false
+    about somebody's model. A family the registry has not explained is a bug in the registry,
+    not a red box that takes the panel down, so fall back and still name the offered list.
     """
     try:
         reason = registry.withheld_note(name)
@@ -695,7 +715,7 @@ def structure_messages(state: WizardState) -> list[Message]:
 
     Every message here is about the structure section, so none of them fires while that
     section is off screen: a 3Di string loaded for SaProt must not go on blocking the run
-    after the backbone has been changed to a sequence-only one that never reads it.
+    after the backbone has been changed to a sequence-only one.
     """
     entry = backbone_entry(state.backbone)
     if entry is not None and entry.tier == "local_only":
@@ -718,9 +738,9 @@ def structure_messages(state: WizardState) -> list[Message]:
                 Message(
                     "esmfold_too_long",
                     "stop",
-                    f"Your wild type is {state.wt_length:,d} residues. ESMFold is the most memory-hungry step in "
-                    f"this notebook and runs out of memory on a free T4 past about {limit:,d}. Download a real "
-                    "structure (`.pdb` / `.cif`) from the PDB or AlphaFold instead — it is better and it is free.",
+                    f"Your wild type is {state.wt_length:,d} residues; ESMFold runs out of memory on a free T4 "
+                    f"past about {limit:,d}. Download a structure (`.pdb` / `.cif`) from the PDB or AlphaFold "
+                    "and upload that instead.",
                 )
             )
         else:
@@ -728,9 +748,8 @@ def structure_messages(state: WizardState) -> list[Message]:
                 Message(
                     "esmfold_expensive",
                     "warning",
-                    "Folding the wild type with ESMFold is the last resort: it is the slowest and most "
-                    "memory-hungry step here. A real structure from the PDB or AlphaFold gives a better 3Di "
-                    "string in seconds.",
+                    "ESMFold is the most memory-hungry step in this notebook. A structure from the PDB or "
+                    "AlphaFold gives a 3Di string in seconds.",
                 )
             )
     mismatched = state.wt_3di_length and state.wt_length and state.wt_3di_length != state.wt_length
@@ -740,19 +759,17 @@ def structure_messages(state: WizardState) -> list[Message]:
                 "three_di_length_mismatch",
                 "stop",
                 f"The 3Di string is {state.wt_3di_length:,d} states long but the wild type is "
-                f"{state.wt_length:,d} residues. They must match one-to-one, or every position shifts.",
+                f"{state.wt_length:,d} residues. Reload the structure or the wild-type sequence.",
             )
         )
     return out
 
 
 def config_messages(state: WizardState, status: ConfigStatus, estimate: RuntimeEstimate | None = None) -> list[Message]:
-    """What the best-config registry has to say about this (backbone, pooling) pair.
+    """What the best-config registry has to say about this backbone.
 
-    Silent when the backbone itself is the problem. An unregistered name has no
-    registry entry either, and METL cannot run here at all: `backbone_messages`
-    has already said the one thing that matters, and a second red box about
-    missing hyperparameters only buries it.
+    Silent when the backbone itself is the problem: `backbone_messages` has already said the
+    one thing that matters, and a second red box about hyperparameters only buries it.
     """
     if state.mode != "train" or not _backbone_is_usable(state):
         return []
@@ -761,35 +778,35 @@ def config_messages(state: WizardState, status: ConfigStatus, estimate: RuntimeE
             Message(
                 "config_unreadable",
                 "stop",
-                f"The hyperparameters for **{status.model}** / `{status.pooling}` could not be read: "
-                f"{status.error}",
+                f"The hyperparameters for **{status.model}** could not be read: {status.error}",
             )
         ]
     if not status.found:
-        known = ", ".join(f"`{name}`" for name in status.poolings) or "none"
+        known = ", ".join(f"`{name}`" for name in status.models) or "none"
         return [
             Message(
                 "config_missing",
                 "stop",
-                f"No hyperparameters are registered for **{status.model}** with `{status.pooling}` pooling. "
-                f"Poolings available for {status.model}: {known}.",
+                f"No hyperparameters are registered for **{status.model}**. The registry has entries for: "
+                f"{known}.",
             )
         ]
     if not status.provisional:
         return []
-    long_run = estimate is not None and estimate.minutes is not None and estimate.minutes >= PERSISTENCE_MINUTES
+    # Every `mutation_site_mean` entry in `config/best/` is a placeholder, so this message is
+    # on every page: it may only escalate to `stop` when the hour it is about to waste is a
+    # *measured* length. Before a library has been read the estimate is the reference
+    # library's, and "this run is about 40 min" would be a number about somebody else's.
+    long_run = estimate is not None and estimate.scaled and (estimate.minutes or 0.0) >= PERSISTENCE_MINUTES
     tail = ""
     if long_run:
-        tail = (
-            f" This run is about {format_minutes(estimate.minutes or 0.0)} — a long time to spend on a "
-            "placeholder when a tuned pair costs the same."
-        )
+        tail = f" This run is about {format_minutes(estimate.minutes or 0.0)} on placeholder hyperparameters."
     return [
         Message(
             "config_provisional",
             "stop" if long_run else "warning",
-            f"{status.description} Nobody has tuned this pair and nobody has measured what it scores, so read "
-            f"every number it produces as a lower bound rather than a result.{tail}",
+            f"{status.description.rstrip('. ')}. Read every number it produces as a lower bound, not a "
+            f"result.{tail}",
         )
     ]
 
@@ -802,22 +819,21 @@ def schedule_messages(state: WizardState, estimate: RuntimeEstimate) -> list[Mes
         Message(
             "run_exceeds_session",
             "stop",
-            f"This is {estimate.describe()} A Colab session disconnects long before that — SaprotHub's own "
-            "notebooks warn above two hours — and a disconnect ends the run. Train fewer seeds, choose a faster "
-            "backbone, or split the work across sessions.",
+            f"This is {estimate.describe()} A Colab session disconnects long before that, and a disconnect ends "
+            "the run. Train fewer seeds, choose a faster backbone, or split the work across sessions.",
         )
     ]
 
 
 def persistence_messages(state: WizardState, estimate: RuntimeEstimate) -> list[Message]:
-    """Long run + no Drive = an hour that Colab will delete when the session ends."""
+    """Long run + no Drive = an hour Colab deletes when the session ends."""
     if state.use_drive:
         return [
             Message(
                 "drive_on",
                 "info",
                 "Google Drive is mounted: the model weights, the foldseek binary and everything this run writes "
-                "land in your Drive, so a disconnect costs you nothing but time.",
+                "land in your Drive.",
             )
         ]
     if state.mode != "train" or estimate.minutes is None or estimate.minutes < PERSISTENCE_MINUTES:
@@ -826,9 +842,9 @@ def persistence_messages(state: WizardState, estimate: RuntimeEstimate) -> list[
         Message(
             "no_persistence",
             "stop" if estimate.scaled else "warning",
-            f"About {format_minutes(estimate.minutes)} of training, and nothing is being saved to Google Drive. "
-            "Colab wipes this machine when the session ends: the model weights download again next time and an "
-            "unfinished run is gone. Tick **Save to Google Drive** above before you start.",
+            f"About {format_minutes(estimate.minutes)} of training, and nothing is being saved to Google Drive: "
+            "Colab wipes this machine when the session ends, and an unfinished run is gone. Tick **Save to Google "
+            "Drive** above before you start.",
         )
     ]
 
@@ -841,9 +857,8 @@ def reproducibility_messages(state: WizardState) -> list[Message]:
         Message(
             "single_run",
             "warning",
-            "One split seed x one model seed is a single run, and a single run cannot show reproducibility: the "
-            "report writes its standard deviation as `NaN`, not `0`. Two or three of each is what the registry's "
-            "own protocol uses.",
+            "A single run cannot show reproducibility: the report writes its standard deviation as `NaN`, not "
+            "`0`. The registry's own numbers come from three split seeds x three model seeds.",
         )
     ]
 
@@ -851,8 +866,7 @@ def reproducibility_messages(state: WizardState) -> list[Message]:
 def runtime_messages(runtime: Runtime | None) -> list[Message]:
     """What this particular machine will and will not do.
 
-    Whether the chosen backbone fits the detected card belongs to
-    `backbone_messages`; this one is only about the machine itself.
+    Whether the chosen backbone fits the detected card belongs to `backbone_messages`.
     """
     if runtime is None:
         return []
@@ -862,8 +876,8 @@ def runtime_messages(runtime: Runtime | None) -> list[Message]:
             Message(
                 "no_gpu",
                 "stop",
-                "This runtime has no GPU, so nothing here will train. **Runtime → Change runtime type → T4 GPU**, "
-                "then run this cell again. The one-hot floor and the report still work without one.",
+                "This runtime has no GPU, so nothing here will train: **Runtime → Change runtime type → T4 GPU**, "
+                "then run this cell again. The one-hot floor and the report work without one.",
             )
         )
     if not runtime.in_colab:
@@ -871,7 +885,7 @@ def runtime_messages(runtime: Runtime | None) -> list[Message]:
             Message(
                 "not_colab",
                 "info",
-                "This is not a Colab session, so the Google Drive mount and the free-tier GPU advice do not apply.",
+                "This is not a Colab session: the Drive mount and the free-tier GPU advice do not apply.",
             )
         )
     return out
@@ -880,9 +894,9 @@ def runtime_messages(runtime: Runtime | None) -> list[Message]:
 def test_unlock_messages(unlock_count: int, *, requested: bool = False) -> list[Message]:
     """The one deliberate step: reading the test partition, and counting every read.
 
-    Separate from everything else on purpose. Model and hyperparameter choices are
-    made on validation data; the test partition is touched once, deliberately, so the
-    number that gets reported means what it says.
+    Separate from everything else on purpose: model and hyperparameter choices are made on
+    validation data, and the test partition is touched once, so the number that gets
+    reported means what it says.
     """
     count = max(0, int(unlock_count))
     if requested and count == 0:
@@ -891,7 +905,7 @@ def test_unlock_messages(unlock_count: int, *, requested: bool = False) -> list[
                 "test_first_unlock",
                 "warning",
                 "This reads the test partition for the first time. Do it once, when you have stopped changing "
-                "things: the count goes into `unlock.json` and is printed in the report.",
+                "things: the count goes into `unlock.json` and into the report.",
             )
         ]
     if requested and count > 0:
@@ -915,8 +929,8 @@ def test_unlock_messages(unlock_count: int, *, requested: bool = False) -> list[
         Message(
             "test_locked",
             "info",
-            "The test partition is locked. Every number on this page is validation — which is the point: you can "
-            "change your mind as often as you like up here.",
+            "The test partition is locked, so every number on this page is validation: you can still change "
+            "your mind.",
         )
     ]
 
@@ -930,12 +944,12 @@ def messages_for(
 ) -> list[Message]:
     """Every contextual message this state deserves, worst first, one per key.
 
-    The test-set messages only join in once an unlock has been asked for or has
-    already happened; the unlock step calls `test_unlock_messages` itself.
+    The test-set messages join in only once an unlock has been asked for or has happened;
+    the unlock step calls `test_unlock_messages` itself.
     """
     estimate = estimate_runtime(state)
     if status is None and state.mode == "train" and _backbone_is_usable(state):
-        status = config_status(state.backbone, state.pooling, root=root)
+        status = config_status(state.backbone, root=root)
     collected: list[Message] = []
     collected += runtime_messages(runtime)
     collected += backbone_messages(state, runtime)
@@ -1037,8 +1051,10 @@ def detect_runtime(*, drive_mount_point: str | Path = "/content/drive") -> Runti
 def backbone_fit(runtime: Runtime | None) -> dict[str, str]:
     """Every registered backbone mapped to `ok` / `needs_bigger_gpu` / `needs_gpu` / `unavailable` / `not_offered`.
 
-    `not_offered` is not a verdict about the machine: the adapter exists and would run,
-    but the notebooks do not put that family on the form. `withdrawn_backbones` says which.
+    A LoRA-training verdict: `needs_bigger_gpu` means the registry has no
+    `approx_lora_minutes_t4`, which is about fine-tuning and not about a frozen forward pass.
+    `not_offered` is not a verdict about the machine at all — the adapter exists and would
+    run, but the notebooks do not put that family on the form.
     """
     verdicts: dict[str, str] = {}
     for name, entry in BACKBONES.items():
@@ -1098,15 +1114,15 @@ class DriveMount:
             return f"Google Drive is not mounted: {self.reason} Results stay on this machine."
         return (
             f"Google Drive is mounted at `{self.root}`. Model weights cache in `{self.hf_cache}` and results are "
-            f"written to `{self.output_dir}`, so a disconnect costs you nothing but time."
+            f"written to `{self.output_dir}`."
         )
 
 
 def drive_folder_name(folder: str) -> str:
     """The folder a typed name means, with anything that climbs out of MyDrive dropped.
 
-    A typed `../..` would otherwise put the cache and the results outside the Drive
-    the user thinks they mounted, which is the one place a notebook must not write.
+    A typed `../..` would otherwise put the cache and the results outside the Drive the user
+    thinks they mounted.
     """
     parts = [part for part in folder.strip().split("/") if part.strip() not in ("", ".", "..")]
     return "/".join(parts) or "ColabSeqDisplay"
@@ -1126,8 +1142,8 @@ def drive_paths(mount_point: str | Path, folder: str = "ColabSeqDisplay") -> dic
 def drive_env(paths: Mapping[str, Path]) -> dict[str, str]:
     """Environment that points the HuggingFace and foldseek caches at Drive. Pure.
 
-    `COLABSD_CACHE_DIR` is what `colabsd.structure.default_cache_dir` reads, so the
-    foldseek binary survives a disconnect along with the model weights.
+    `COLABSD_CACHE_DIR` is what `colabsd.structure.default_cache_dir` reads, so the foldseek
+    binary survives a disconnect along with the model weights.
     """
     return {
         "HF_HOME": str(paths["hf_cache"]),
@@ -1137,17 +1153,17 @@ def drive_env(paths: Mapping[str, Path]) -> dict[str, str]:
 
 
 DRIVE_NOTE = (
-    "Colab deletes this machine when the session ends. Mounting Google Drive keeps three things that would "
-    "otherwise be lost: the downloaded model weights, the foldseek binary, and whatever a long fine-tune has "
-    "finished so far. It is off unless you tick it, and it does nothing outside Colab."
+    "Colab deletes this machine when the session ends. Mounting Google Drive keeps the downloaded model weights, "
+    "the foldseek binary and whatever a long fine-tune has finished so far. Off unless you tick it, and it does "
+    "nothing outside Colab."
 )
 
 
 def drive_widgets(*, folder: str = "ColabSeqDisplay") -> dict[str, Any]:
     """The one checkbox that turns persistence on, plus the folder it writes to.
 
-    Keyed by the field names `FIELD_RULES` knows, so `bind_all` and
-    `apply_field_visibility` pick them up with no further wiring.
+    Keyed by the field names `FIELD_RULES` knows, so `bind_all` and `apply_field_visibility`
+    pick them up with no further wiring.
     """
     import ipywidgets
 
@@ -1166,10 +1182,8 @@ def mount_drive(
 ) -> DriveMount:
     """Mount Drive and point the caches and the output directory at it.
 
-    Off by default and silent outside Colab: a `DriveMount` with `mounted=False`
-    and a reason, never an exception. Mounting fixes the three things a Colab
-    session costs you — the wiped machine, the re-downloaded model weights, and
-    the fine-tune that dies with the session.
+    Off by default and silent outside Colab: a `DriveMount` with `mounted=False` and a
+    reason, never an exception.
     """
     if not enable:
         return DriveMount(False, "you did not switch it on.")
@@ -1194,49 +1208,42 @@ def mount_drive(
 def upload_notice(what: str) -> str:
     """What to say *before* `google.colab.files.upload()`, which blocks the kernel.
 
-    While that picker is open the kernel is inside a blocking call, so every widget callback
-    on the page is dead: the panel freezes in whatever state the button left it in, nothing
-    updates, and nothing on screen says why. The only thing that can be done about it is to
-    say so first — which is what this is for, printed before the call, never after.
+    While that picker is open every widget callback on the page is dead and nothing on screen
+    says why. Saying so first is the only remedy, so this is printed before the call.
     """
     return (
-        f"**Waiting for {what}.** The file picker below blocks this notebook while it is open: until you "
-        "choose a file, every control on this page is frozen and no message will change. That is Colab's "
-        "upload, not a crash. **Cancel upload** in the picker releases the page again."
+        f"**Waiting for {what}.** Every control on this page is frozen until you choose a file — that is Colab's "
+        "upload, not a crash. **Cancel upload** in the picker releases the page."
     )
 
 
 def upload_cancelled_notice(what: str) -> str:
-    """What to say when the picker came back empty, so the freeze has a stated end.
-
-    Cancelling is the documented way out of the block `upload_notice` warns about, so the
-    outcome cannot be a bare "no file": it has to say the page is answering again.
+    """What to say when the picker came back empty, so the freeze `upload_notice` warns about
+    has a stated end: not a bare "no file", but that the page is answering again.
     """
     return (
-        f"Nothing was uploaded for {what} — the picker was cancelled or it timed out. The panel is live "
-        "again; press the button again when you have the file."
+        f"Nothing was uploaded for {what} — the picker was cancelled or timed out. The panel is live again; "
+        "press the button again when you have the file."
     )
 
 
 def upload_needs_colab_notice(what: str) -> str:
-    """What to say when there is no browser picker to open, because this is not Colab.
-
-    An `ImportError` on `google.colab` is true and useless. The panel already accepts a typed
-    path beside every upload button, so the answer is to name that route.
+    """What to say when there is no browser picker to open. An `ImportError` on
+    `google.colab` is true and useless; the panel takes a typed path beside every button.
     """
     return f"Uploading needs Colab. Outside it, put {what} in the working folder and name it in the form."
 
 
 def set_display(widget: Any, visible: bool) -> None:
-    """Show or hide one widget — the whole of the ColabPLM interaction, in one line."""
+    """Show or hide one widget."""
     widget.layout.display = None if visible else "none"
 
 
 class Section:
     """A titled group of widgets that shows and hides as a unit.
 
-    The box is built on first use, so a `Section` can be declared and toggled
-    before ipywidgets is touched.
+    The box is built on first use, so a `Section` can be declared and toggled before
+    ipywidgets is touched.
     """
 
     def __init__(
@@ -1274,10 +1281,8 @@ class Section:
             set_display(self._box, self.visible)
 
     def set_title(self, title: str) -> None:
-        """Rename a built section.
-
-        A page whose steps appear and disappear has to number the ones that are there:
-        skipping from 2 to 4 reads as a step the user has failed to find.
+        """Rename a built section: a page whose steps appear and disappear has to renumber
+        the ones that are there, or a jump from 2 to 4 reads as a step the user cannot find.
         """
         self.title = title
         if self._box is not None:
@@ -1352,8 +1357,7 @@ def bind_all(
 def run_guarded(output: Any, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Run `function` with its output and its failure inside an `ipywidgets.Output`.
 
-    A traceback raised inside an observer is invisible in Colab; a printed message
-    that says what to do about it is not.
+    A traceback raised inside an observer is invisible in Colab; a printed one is not.
     """
     with output:
         try:

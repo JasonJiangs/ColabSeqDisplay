@@ -55,7 +55,6 @@ class RunResult:
     Attributes:
         model_name: upstream model key the best-config registry was keyed on.
         adapter_name: backbone registry name the adapter was built from.
-        pooling: pooling strategy, e.g. `cosine_p90_mean`.
         condition_columns: measured conditions, in target-column order.
         params: the seven LoRA hyperparameters actually trained with.
         fixed: the training block (epochs, patience, batch sizes, ...).
@@ -71,7 +70,6 @@ class RunResult:
 
     model_name: str
     adapter_name: str
-    pooling: str
     condition_columns: list[str]
     params: dict[str, Any]
     fixed: dict[str, Any]
@@ -114,7 +112,6 @@ class RunResult:
         payload = {
             "model_name": self.model_name,
             "adapter_name": self.adapter_name,
-            "pooling": self.pooling,
             "condition_columns": list(self.condition_columns),
             "params": self.params,
             "fixed": self.fixed,
@@ -180,7 +177,7 @@ def finetune(
 
     `config` overrides the runtime config that would otherwise be built through
     `colabsd.protein_db`; `resume` reuses a finished run only when its fingerprint --
-    the model, the hyperparameters, the pooled coordinates, the split and a hash of the
+    the model, the hyperparameters, the mutated sites, the split and a hash of the
     sequences and targets themselves -- is identical, so a changed library always
     retrains. Test metrics are never returned: call `unlock_test` for those.
     """
@@ -205,7 +202,6 @@ def finetune(
     runtime = _runtime_config(
         spec=spec,
         best=best,
-        adapter=adapter,
         output_dir=output_dir,
         split_seeds=split_seeds,
         model_seeds=seeds,
@@ -214,8 +210,7 @@ def finetune(
     params = dict(best.params)
     fixed = dict(runtime["fixed"])
     selection_metric = _selection_metric(runtime)
-    pooling = str(fixed["pooling"])
-    pooled_positions = _check_adapter_matches_pooling(adapter, runtime, pooling)
+    pooled_positions = _pooled_positions(adapter, spec, runtime)
     data_digest = _data_digest(sequences, targets)
 
     locked_dir = output_dir / LOCKED_DIRNAME
@@ -237,7 +232,6 @@ def finetune(
                 fixed=fixed,
                 split=split,
                 data=data_digest,
-                pooling=pooling,
                 pooled_positions=pooled_positions,
                 n_sequences=len(sequences),
                 n_targets=int(targets.shape[1]),
@@ -290,7 +284,6 @@ def finetune(
     result = RunResult(
         model_name=str(best.model),
         adapter_name=_adapter_name(adapter, best),
-        pooling=pooling,
         condition_columns=condition_columns,
         params=params,
         fixed=fixed,
@@ -366,7 +359,6 @@ def unlock_test(run_result: RunResult, *, output_dir: str | Path) -> dict[str, A
         "unlock_count": count,
         "unlocked_utc": _utc_now(),
         "model_name": run_result.model_name,
-        "pooling": run_result.pooling,
         "is_provisional": run_result.is_provisional,
         "condition_columns": condition_columns,
         "n_runs": len(rows),
@@ -533,7 +525,6 @@ def _visible_row(
         "split_seed": int(split_seed),
         "model_seed": int(model_seed),
         "model": metrics["model"],
-        "pooling": metrics["pooling"],
         "selection_metric": metrics["selection_metric"],
         "best_epoch": int(metrics["best_epoch"]),
         "best_validation_score": float(metrics["best_validation_score"]),
@@ -612,8 +603,8 @@ def _validate_inputs(
     if wt and lengths and lengths != {len(wt)}:
         raise DataError(
             f"The variant sequences are {sorted(lengths)[0]} residues but spec.wt_sequence is {len(wt)}. "
-            "Pooling positions are wild-type coordinates, so a length mismatch pools the wrong residues: "
-            "rebuild the sequences with load_library(csv, spec)."
+            "The mutated positions are wild-type coordinates, so a length mismatch averages the wrong "
+            "residues: rebuild the sequences with load_library(csv, spec)."
         )
 
 
@@ -680,30 +671,25 @@ def _runtime_config(
     *,
     spec: LibrarySpec,
     best: BestConfig,
-    adapter: Any,
     output_dir: Path,
     split_seeds: list[int],
     model_seeds: list[int],
     override: dict[str, Any] | None,
 ) -> dict[str, Any]:
     fixed_best = dict(getattr(best, "fixed", {}) or {})
-    pooling = str(fixed_best.get("pooling", "mutation_site_mean"))
     if override is not None:
         config = copy.deepcopy(override)
     else:
         config = _config_from_protein_db(
             spec=spec,
             best=best,
-            adapter=adapter,
             output_dir=output_dir,
-            pooling=pooling,
             split_seeds=split_seeds,
             model_seeds=model_seeds,
         )
     config.setdefault("data", {})
     config.setdefault("protein", {})
     fixed = {**dict(config.get("fixed", {})), **fixed_best}
-    fixed["pooling"] = pooling
     if fixed.get("evaluate_test_during_optimization"):
         raise ConfigError(
             "training.evaluate_test_during_optimization must stay false. Remove it from the best-config YAML; "
@@ -730,42 +716,31 @@ def _config_from_protein_db(
     *,
     spec: LibrarySpec,
     best: BestConfig,
-    adapter: Any,
     output_dir: Path,
-    pooling: str,
     split_seeds: list[int],
     model_seeds: list[int],
 ) -> dict[str, Any]:
+    """Write the one-protein record the engine resolves coordinates from, and configure a run against it.
+
+    The record's coordinates are `spec.positions_1based` and nothing else: the model averages the
+    embeddings at the sites the library varies.
+    """
     try:
         from colabsd import protein_db
     except ImportError as exc:  # pragma: no cover - only before protein_db lands
         raise ConfigError(
-            "colabsd.protein_db is unavailable, so the pooling coordinates cannot be resolved. "
-            f"Pass finetune(config=...) with a prepared runtime config instead ({exc})."
+            "colabsd.protein_db is unavailable, so the mutated sites cannot be written where the engine "
+            f"reads them. Pass finetune(config=...) with a prepared runtime config instead ({exc})."
         ) from exc
-    database_path = protein_db.write_protein_record(
-        spec,
-        _region_positions_1based(adapter, pooling),
-        output_dir,
-        protein_id=PROTEIN_ID,
-    )
+    database_path = protein_db.write_protein_record(spec, out_dir=output_dir, protein_id=PROTEIN_ID)
     return protein_db.runtime_config(
         spec,
-        pooling=pooling,
         params=best,
         protein_id=PROTEIN_ID,
         database_path=Path(database_path).resolve(),
         split_seeds=list(split_seeds),
         model_seeds=list(model_seeds),
     )
-
-
-def _region_positions_1based(adapter: Any, pooling: str) -> dict[str, list[int]] | None:
-    """Hand the adapter's discovered pooling coordinates to the synthesized protein record."""
-    positions = getattr(adapter, "pooling_positions_0based", None)
-    if not positions or not pooling.startswith("cosine_"):
-        return None
-    return {pooling: [int(position) + 1 for position in positions]}
 
 
 def _selection_metric(config: dict[str, Any]) -> str:
@@ -775,7 +750,7 @@ def _selection_metric(config: dict[str, Any]) -> str:
         return validation_metric_name(config)
     except ValueError as exc:
         raise ConfigError(
-            f"{exc} Fix evaluation.selection_objective in the best-config YAML for this model and pooling."
+            f"{exc} Fix evaluation.selection_objective in the best-config YAML for this model."
         ) from exc
 
 
@@ -867,46 +842,47 @@ def _data_digest(sequences: list[str], targets: np.ndarray) -> str:
     return digest.hexdigest()[:32]
 
 
-def _check_adapter_matches_pooling(adapter: Any, config: dict[str, Any], pooling: str) -> list[int] | None:
-    """Refuse an adapter that pools something other than what the run is about to be labelled with.
+def _pooled_positions(adapter: Any, spec: LibrarySpec, config: dict[str, Any]) -> list[int]:
+    """The residues this run averages: the library's mutated sites, agreed on by all three parties.
 
-    Upstream pools with `adapter.pooling_positions_0based` but records `config["fixed"]["pooling"]` in
-    every artefact, so a disagreement is invisible: the metrics, the RunResult and the bundle would all
-    claim a pooling the model never used.
+    The engine averages the embeddings the *adapter* selects but records the coordinates it resolves
+    from the *protein record*, and both must be the sites the *spec* says the library varies. A
+    disagreement is invisible otherwise: the metrics, the RunResult and the bundle would all describe
+    residues the model never averaged.
     """
     from colabsd.engine.config_space import pooling_positions_0based
     from colabsd.engine.protein_db import clear_database_cache
 
-    declared = getattr(adapter, "pooling", None)
-    if declared is not None and str(declared) != pooling:
-        raise ConfigError(
-            f"The adapter pools {str(declared)!r} but the best-config for this run says {pooling!r}. Every "
-            "artefact would be labelled with the wrong pooling: build the adapter with "
-            f"create_adapter(name, pooling={pooling!r}, ...), or load the best-config for {str(declared)!r}."
-        )
+    expected = sorted(int(position) for position in spec.positions_0based())
     positions = getattr(adapter, "pooling_positions_0based", None)
-    if positions is None:
-        return None
-    resolved = [int(position) for position in positions]
+    if not positions:
+        raise ConfigError(
+            "The adapter was given no residue positions, so there is nothing for it to average. Build it "
+            "with create_adapter(name, pooling_positions_0based=spec.positions_0based(), ...)."
+        )
+    resolved = sorted(int(position) for position in positions)
+    if resolved != expected:
+        raise ConfigError(
+            f"The adapter averages {len(resolved)} residues (0-based {resolved[:5]}) but the library varies "
+            f"{len(expected)} (0-based {expected[:5]}). Build the adapter with "
+            "pooling_positions_0based=spec.positions_0based(), from the same spec you are training on."
+        )
     clear_database_cache()
     try:
-        expected = pooling_positions_0based(config)
+        recorded = sorted(int(position) for position in pooling_positions_0based(config))
     except (FileNotFoundError, KeyError, ValueError) as exc:
         raise ConfigError(
-            f"Pooling {pooling!r} could not be resolved from the protein record ({exc}). Write it with "
-            "colabsd.protein_db.write_protein_record(spec, region, output_dir) before calling finetune()."
+            f"The mutated sites could not be resolved from the protein record ({exc}). Write it with "
+            "colabsd.protein_db.write_protein_record(spec, out_dir) before calling finetune(config=...)."
         ) from exc
-    wanted = sorted(int(position) for position in expected)
-    if sorted(resolved) != wanted:
-        only_adapter = sorted(set(resolved) - set(wanted))
-        only_record = sorted(set(wanted) - set(resolved))
+    if recorded != expected:
         raise ConfigError(
-            f"The adapter pools {len(resolved)} residues and the {pooling!r} region of the protein record holds "
-            f"{len(wanted)}, and they are not the same residues (adapter-only 0-based {only_adapter[:5]}, "
-            f"record-only {only_record[:5]}). Every artefact would record coordinates the model never used: "
-            "build the adapter and the protein record from the same colabsd.region record."
+            f"The protein record lists {len(recorded)} mutated residues (0-based {recorded[:5]}) but this "
+            f"library varies {len(expected)} (0-based {expected[:5]}). Every artefact would record "
+            "coordinates the model never averaged: rewrite the record with "
+            "colabsd.protein_db.write_protein_record(spec, out_dir) for this spec."
         )
-    return sorted(resolved)
+    return expected
 
 
 def _elapsed(seconds: float) -> str:

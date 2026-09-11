@@ -1,18 +1,22 @@
-"""Resolve pooling coordinates and the validation metric from a run configuration.
+"""Resolve the pooled residue positions and the validation metric from a run configuration.
 
 Vendored from **SequenceDisplay-Workflow-Optimization** (`seqdisplay_opt`), the
 research package this pipeline was published from; original module
-`seqdisplay_opt/config/optuna_space.py`. Only the three resolution helpers are
-kept -- the Optuna search space (its YAML loader, its validator and
-`suggest_lora_params`) stays upstream, because `colabsd` runs one configuration
-rather than searching for one. See `ATTRIBUTION.md`.
+`seqdisplay_opt/config/optuna_space.py`. Only the resolution helpers are kept -- the
+Optuna search space (its YAML loader, its validator and `suggest_lora_params`) stays
+upstream, because `colabsd` runs one configuration rather than searching for one.
+
+One deliberate departure: upstream resolved the protein region named by
+`config["fixed"]["pooling"]`. This pipeline always pools the mutated sites, so the
+positions come from the protein record alone and the pooling name is never read.
+See `ATTRIBUTION.md`.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from colabsd.engine.protein_db import DEFAULT_PROTEIN_ID, resolve_pooling_positions_0based
+from colabsd.engine.protein_db import mutated_positions_0based
 
 OBJECTIVE_METRICS = {
     "mean_validation_r2": "R2",
@@ -32,16 +36,14 @@ def validation_metric_name(config: dict[str, Any]) -> str:
 
 
 def pooling_positions_0based(config: dict[str, Any]) -> list[int]:
-    """Resolve pooling positions from the configured protein database."""
-    fixed = config["fixed"]
-    protein = config.get("protein", {})
-    return resolve_pooling_positions_0based(
-        str(fixed["pooling"]),
-        protein_id=str(protein.get("id", DEFAULT_PROTEIN_ID)),
-        database_path=protein.get("database"),
-    )
+    """Resolve the pooled residue positions from the configured protein database."""
+    protein = config.get("protein") or {}
+    protein_id = str(protein.get("id") or "")
+    if not protein_id:
+        raise ValueError("config['protein']['id'] must name the protein the database was written for")
+    return mutated_positions_0based(protein_id, protein.get("database"))
 
 
 def pooling_positions_1based(config: dict[str, Any]) -> list[int]:
-    """Resolve pooling positions as one-based protein coordinates."""
+    """Resolve the pooled residue positions as one-based protein coordinates."""
     return [position + 1 for position in pooling_positions_0based(config)]

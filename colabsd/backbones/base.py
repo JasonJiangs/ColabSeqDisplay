@@ -5,12 +5,18 @@ protocol structurally (`model_name`, `embed_dim`, `load_model`, `pooled_forward`
 The science lives in `colabsd.engine`: pooling comes from `colabsd.engine.pooling.pool`
 and LoRA injection from `colabsd.engine.lora`.
 
+`pooling_positions_0based` is the one thing an adapter has to be told beyond its
+name: the residues to average, as 1-based protein coordinates minus one. It comes
+from the library spec's mutated sites, and every adapter pools the same way, so
+there is no strategy to name or dispatch on.
+
 `torch`, `transformers` and the engine modules are imported inside methods so that
 importing this module costs nothing in a notebook cell.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from colabsd.backbones.registry import BACKBONES, BackboneEntry
@@ -36,8 +42,7 @@ class HFAdapterBase:
         self,
         model_name: str,
         *,
-        pooling: str,
-        pooling_positions_0based: list[int] | None = None,
+        pooling_positions_0based: Sequence[int],
         wt_3di: str | None = None,
         dtype: str = "float32",
         hf_id: str | None = None,
@@ -54,27 +59,25 @@ class HFAdapterBase:
         self.model_name = model_name
         self.hf_id = hf_id or (self.entry.hf_id if self.entry else "")
         self.dtype = dtype
-        self.pooling = pooling
-        self.pooling_positions_0based = (
-            None if pooling_positions_0based is None else [int(position) for position in pooling_positions_0based]
-        )
+        self.pooling_positions_0based = [int(position) for position in pooling_positions_0based]
         self.wt_3di = "".join(wt_3di.split()).lower() if wt_3di else None
         self._tokenizer: Any = None
 
-        self._require_known_pooling(pooling)
+        if not self.pooling_positions_0based:
+            raise BackboneError(
+                f"'{model_name}' was given an empty pooling_positions_0based, so there would be nothing to "
+                "average. Pass the library's mutated sites as 1-based protein coordinates minus one, e.g. "
+                "pooling_positions_0based=spec.positions_0based()."
+            )
         self.embed_dim = self._resolve_embed_dim()
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(model_name={self.model_name!r}, pooling={self.pooling!r}, hf_id={self.hf_id!r})"
+        return (
+            f"{type(self).__name__}(model_name={self.model_name!r}, "
+            f"n_pooled_positions={len(self.pooling_positions_0based)}, hf_id={self.hf_id!r})"
+        )
 
     # -- construction helpers -------------------------------------------------
-
-    @staticmethod
-    def _require_known_pooling(pooling: str) -> None:
-        from colabsd.engine.pooling import POOLING_REGISTRY
-
-        if pooling not in POOLING_REGISTRY:
-            raise BackboneError(f"Unknown pooling '{pooling}'. Pick one of: {', '.join(sorted(POOLING_REGISTRY))}.")
 
     def _resolve_embed_dim(self) -> int:
         if self.entry is not None:
@@ -267,29 +270,16 @@ class HFAdapterBase:
 
         reps = self.residue_representations(model, sequences, device)
         try:
-            return pool(self.pooling, reps, positions_0based=self.pooling_positions_0based)
-        except (FileNotFoundError, KeyError, ValueError) as exc:
+            return pool(reps, self.pooling_positions_0based)
+        except ValueError as exc:
             raise BackboneError(self._pooling_failure(int(reps.shape[1]), exc)) from exc
 
     def _pooling_failure(self, n_residues: int, exc: Exception) -> str:
-        if self.pooling_positions_0based is None:
-            return (
-                f"Pooling '{self.pooling}' was given no explicit positions, so upstream tried to resolve its "
-                f"region from a proteins.yaml and failed: {exc!r}. Pass pooling_positions_0based= (1-based "
-                "protein coordinates minus one), or write a protein record first with "
-                "colabsd.protein_db.write_protein_record."
-            )
-        if not self.pooling_positions_0based:
-            return (
-                f"Pooling '{self.pooling}' was given an empty pooling_positions_0based list, so there is nothing "
-                f"to average: {exc!r}. Pass the region's positions (1-based protein coordinates minus one), or "
-                "pass None to resolve them from a protein record."
-            )
         out_of_range = sorted(
             position for position in self.pooling_positions_0based if position < 0 or position >= n_residues
         )
         return (
-            f"Pooling '{self.pooling}' could not be applied to a {n_residues}-residue sequence: {exc!r}. "
+            f"'{self.model_name}' could not pool a {n_residues}-residue sequence: {exc!r}. "
             f"pooling_positions_0based must be 1-based protein coordinates minus one, all within 0..{n_residues - 1}"
             + (f"; these are outside that range: {out_of_range[:10]}." if out_of_range else ".")
         )

@@ -1,9 +1,12 @@
-"""Synthesize the `proteins.yaml` the engine resolves pooling coordinates from.
+"""Synthesize the `proteins.yaml` the engine resolves pooled positions from.
 
 `colabsd.engine.config_space.pooling_positions_1based(config)` reads a protein-
-metadata database keyed by protein id. A Colab user has a WT sequence and a
-region JSON, not a database, so we write one for them in the run directory and
+metadata database keyed by protein id. A Colab user has a wild-type sequence and a
+`LibrarySpec`, not a database, so we write one for them in the run directory and
 point the runtime config at it. The engine itself is never patched.
+
+The record holds the wild type's length and the positions the library mutates,
+because those positions are what pooling averages.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from colabsd.engine.pooling import POOLING_NAME
 from colabsd.engine.protein_db import clear_database_cache
 from colabsd.errors import ConfigError, DataError
 
@@ -21,130 +25,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 DATABASE_FILENAME = "proteins.yaml"
 DEFAULT_PROTEIN_ID = "user_protein"
-MUTATION_SITE_REGION = "mutation_sites"
-COSINE_REGIONS: tuple[str, ...] = ("cosine_p90", "cosine_p95")
-TAIL_REGION_LENGTH = 150
-_REGION_EXTRA_KEYS = {"source_model", "region_source_model", "score", "score_definition", "percentile"}
-
-RegionPositions = Sequence[int] | Mapping[str, Any] | Sequence[Mapping[str, Any]] | None
-
-
-def _region_name(key: Any) -> str:
-    name = str(key).strip().lower()
-    if name.endswith("_mean"):
-        name = name[: -len("_mean")]
-    if name.isdigit():
-        name = f"cosine_p{name}"
-    elif name.startswith("p") and name[1:].isdigit():
-        name = f"cosine_{name}"
-    elif name.startswith("percentile"):
-        digits = "".join(character for character in name if character.isdigit())
-        name = f"cosine_p{digits}"
-    if name not in COSINE_REGIONS:
-        raise ConfigError(
-            f"Unknown region key {key!r}. Region positions must be keyed by one of "
-            f"{', '.join(COSINE_REGIONS)} (or 90 / 95), because upstream only pools those percentiles."
-        )
-    return name
-
-
-def _positions_of(record: Mapping[str, Any]) -> list[int] | None:
-    for key in ("positions_1based", "selected_positions_1based"):
-        value = record.get(key)
-        if value is not None:
-            return [int(position) for position in value]
-    return None
-
-
-def _region_body(
-    positions: Sequence[int],
-    extras: Mapping[str, Any] | None = None,
-    *,
-    label: str = "region",
-) -> dict[str, Any]:
-    try:
-        values = [int(position) for position in positions]
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"Region '{label}' must list 1-based integer positions: {exc}.") from exc
-    if not values:
-        raise ConfigError(
-            f"Region '{label}' lists no positions. Upstream cannot pool an empty region: re-run region "
-            "discovery for this wild-type sequence, or choose a pooling that does not need it."
-        )
-    body: dict[str, Any] = {"mode": "positions"}
-    for key, value in (extras or {}).items():
-        if key in _REGION_EXTRA_KEYS and value is not None:
-            body["source_model" if key == "region_source_model" else key] = value
-    body["positions_1based"] = values
-    return body
-
-
-def _check_region_length(record: Mapping[str, Any], name: str, expected_length: int | None) -> None:
-    declared = record.get("seq_length")
-    if expected_length is None or declared is None:
-        return
-    if int(declared) != int(expected_length):
-        raise ConfigError(
-            f"Region '{name}' was discovered for a {int(declared)}-residue sequence but this wild type is "
-            f"{int(expected_length)} residues. Its 1-based positions do not describe this protein: re-run "
-            "colabsd.region.discover_region() on this wild-type sequence."
-        )
-
-
-def _region_from_record(
-    record: Mapping[str, Any],
-    *,
-    name: str | None = None,
-    expected_length: int | None = None,
-) -> tuple[str, dict[str, Any]]:
-    positions = _positions_of(record)
-    if positions is None:
-        raise ConfigError(
-            "A region record must carry 'positions_1based' (or 'selected_positions_1based'); "
-            f"got keys {sorted(record)}."
-        )
-    declared = record.get("region_name") or record.get("pooling") or record.get("percentile")
-    resolved = _region_name(declared) if declared is not None else None
-    if name is not None and resolved is not None and resolved != name:
-        raise ConfigError(
-            f"A region filed under {name!r} declares itself {resolved!r}. Region positions are percentile "
-            "specific: file each record under the percentile it was discovered at."
-        )
-    final = name or resolved or COSINE_REGIONS[0]
-    _check_region_length(record, final, expected_length)
-    return final, _region_body(positions, record, label=final)
-
-
-def normalize_regions(
-    region_positions_1based: RegionPositions,
-    *,
-    expected_length: int | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Turn the many shapes a caller may hold into `{region_name: region_body}`."""
-    if region_positions_1based is None:
-        return {}
-    if isinstance(region_positions_1based, Mapping):
-        if _positions_of(region_positions_1based) is not None:
-            name, body = _region_from_record(region_positions_1based, expected_length=expected_length)
-            return {name: body}
-        regions = {}
-        for key, value in region_positions_1based.items():
-            name = _region_name(key)
-            if isinstance(value, Mapping):
-                _, body = _region_from_record(value, name=name, expected_length=expected_length)
-            else:
-                body = _region_body(value, label=name)
-            regions[name] = body
-        return regions
-    items = list(region_positions_1based)
-    if not items:
-        return {}
-    if all(isinstance(item, Mapping) for item in items):
-        return dict(_region_from_record(item, expected_length=expected_length) for item in items)
-    return {COSINE_REGIONS[0]: _region_body(items, label=COSINE_REGIONS[0])}
 
 
 def _validated_spec(spec: LibrarySpec) -> tuple[str, list[int]]:
+    """Return the spec's wild-type sequence and its mutated positions, both checked."""
     validate = getattr(spec, "validate", None)
     if callable(validate):
         try:
@@ -152,54 +36,38 @@ def _validated_spec(spec: LibrarySpec) -> tuple[str, list[int]]:
         except ValueError as exc:
             raise DataError(f"The library spec is not usable: {exc}") from exc
     sequence = str(spec.wt_sequence)
-    positions = [int(position) for position in spec.positions_1based]
+    try:
+        positions = [int(position) for position in spec.positions_1based]
+    except (TypeError, ValueError) as exc:
+        raise DataError(f"spec.positions_1based must be 1-based integers: {exc}.") from exc
     if not sequence:
         raise DataError("spec.wt_sequence is empty; load the WT sequence before writing a protein record.")
     if not positions:
-        raise DataError("spec.positions_1based is empty; mutation-site pooling needs at least one position.")
-    return sequence, positions
+        raise DataError("spec.positions_1based is empty; pooling needs at least one mutated position.")
+    if len(set(positions)) != len(positions):
+        raise DataError("spec.positions_1based repeats a position; every pooled residue must appear once.")
+    outside = [position for position in positions if position < 1 or position > len(sequence)]
+    if outside:
+        raise DataError(
+            f"spec.positions_1based has {outside[:5]} outside 1..{len(sequence)}. Positions are 1-based "
+            "coordinates in the WT sequence: check that the sequence is the full-length protein."
+        )
+    return sequence, sorted(positions)
 
 
-def build_protein_record(
-    spec: LibrarySpec,
-    region_positions_1based: RegionPositions = None,
-    *,
-    protein_id: str = DEFAULT_PROTEIN_ID,
-) -> dict[str, Any]:
-    """Build the one protein record upstream's database loader expects."""
-    sequence, mutation_positions = _validated_spec(spec)
-    length = len(sequence)
-    regions: dict[str, Any] = {"full": {"mode": "full"}}
-    if length >= TAIL_REGION_LENGTH:
-        regions["last_150"] = {"mode": "tail", "length": TAIL_REGION_LENGTH}
-    regions[MUTATION_SITE_REGION] = _region_body(mutation_positions, label=MUTATION_SITE_REGION)
-    regions.update(normalize_regions(region_positions_1based, expected_length=length))
-
-    for name, body in regions.items():
-        positions = body.get("positions_1based")
-        if positions is None:
-            continue
-        if len(set(positions)) != len(positions):
-            raise ConfigError(f"Region '{name}' repeats a position; every pooled residue must appear once.")
-        outside = [position for position in positions if position < 1 or position > length]
-        if outside:
-            raise ConfigError(
-                f"Region '{name}' has positions {outside[:5]} outside 1..{length}. "
-                "Region positions are 1-based coordinates in the WT sequence: regenerate the region for this WT."
-            )
-        body["positions_1based"] = sorted(positions)
-
+def build_protein_record(spec: LibrarySpec, *, protein_id: str = DEFAULT_PROTEIN_ID) -> dict[str, Any]:
+    """Build the one protein record the engine's database loader expects."""
+    sequence, positions = _validated_spec(spec)
     return {
         "name": protein_id,
-        "sequence_length": length,
+        "sequence_length": len(sequence),
         "generated_by": "colabsd",
-        "regions": regions,
+        "mutated_positions_1based": positions,
     }
 
 
 def write_protein_record(
     spec: LibrarySpec,
-    region_positions_1based: RegionPositions = None,
     out_dir: str | Path = ".",
     *,
     protein_id: str = DEFAULT_PROTEIN_ID,
@@ -207,7 +75,7 @@ def write_protein_record(
     """Write a one-protein `proteins.yaml` and return its absolute path."""
     import yaml
 
-    record = build_protein_record(spec, region_positions_1based, protein_id=protein_id)
+    record = build_protein_record(spec, protein_id=protein_id)
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
     path = (directory / DATABASE_FILENAME).resolve()
@@ -216,7 +84,7 @@ def write_protein_record(
     except yaml.YAMLError as exc:
         raise ConfigError(
             f"The protein record for {protein_id!r} cannot be written as YAML: {exc}. "
-            "Region metadata must be plain Python numbers and strings, not numpy scalars or arrays."
+            "The spec's positions must be plain Python integers, not numpy scalars or arrays."
         ) from exc
     path.write_text(payload)
     clear_database_cache()
@@ -227,7 +95,7 @@ def _config_blocks(params: BestConfig | Mapping[str, Any] | None) -> tuple[str, 
     if params is None:
         raise ConfigError(
             "runtime_config needs the LoRA hyperparameters; pass the BestConfig from "
-            "colabsd.bestconfig.load_best_config(model, pooling)."
+            "colabsd.bestconfig.load_best_config()."
         )
     if hasattr(params, "fixed") and hasattr(params, "params"):
         return str(params.model), dict(params.params), dict(params.fixed), dict(params.evaluation)
@@ -268,7 +136,6 @@ def _seed_list(explicit: Sequence[int] | None, fallback: Any, label: str, defaul
 def runtime_config(
     spec: LibrarySpec,
     *,
-    pooling: str,
     params: BestConfig | Mapping[str, Any] | None = None,
     protein_id: str = DEFAULT_PROTEIN_ID,
     database_path: str | Path,
@@ -281,17 +148,21 @@ def runtime_config(
     import yaml
 
     from colabsd.engine.config_space import pooling_positions_1based
-    from colabsd.engine.protein_db import POOLING_REGIONS
     from colabsd.engine.train_config import load_lora_best_config
 
-    if pooling not in POOLING_REGIONS:
-        raise ConfigError(f"Unknown pooling {pooling!r}; the engine supports: {', '.join(sorted(POOLING_REGIONS))}.")
     model, lora_params, fixed, evaluation = _config_blocks(params)
-    training = {**fixed, "pooling": pooling}
+    training = dict(fixed)
+    training.setdefault("pooling", POOLING_NAME)
+    if str(training["pooling"]) != POOLING_NAME:
+        raise ConfigError(
+            f"These hyperparameters were tuned for pooling {str(training['pooling'])!r}, but colabsd averages "
+            f"the embeddings at the mutated sites and nothing else ({POOLING_NAME!r}). The run would be "
+            f"recorded under a pooling it did not use: load the {POOLING_NAME!r} entry for this model."
+        )
     if "micro_batch_size" not in training:
         raise ConfigError(
             "training.micro_batch_size must be set explicitly: pass the BestConfig from "
-            "colabsd.bestconfig.load_best_config(model, pooling), or add a training block that sets it. "
+            "colabsd.bestconfig.load_best_config(), or add a training block that sets it. "
             "colabsd.engine.train_config would otherwise resolve it to 'auto', and the run would be "
             "recorded with a micro-batch size nobody chose (see config/best/README.md)."
         )
@@ -327,34 +198,28 @@ def runtime_config(
             raise ConfigError(f"These hyperparameters are not a valid LoRA configuration: {exc}") from exc
 
     clear_database_cache()
-    _check_record_matches_spec(spec, protein_id, raw["protein"]["database"], pooling)
+    _check_record_matches_spec(spec, protein_id, raw["protein"]["database"])
+    # Resolve the coordinates through the path training itself uses, so an unusable record
+    # fails here rather than after the backbone has been downloaded.
     try:
-        positions = pooling_positions_1based(config)
+        pooling_positions_1based(config)
     except (FileNotFoundError, KeyError, ValueError) as exc:
         raise ConfigError(
-            f"Pooling {pooling!r} could not be resolved from {raw['protein']['database']}: {exc}. "
-            "Write the protein record first with colabsd.protein_db.write_protein_record(), and make sure the "
-            "region you picked was discovered for this WT sequence."
+            f"The pooled positions could not be resolved from {raw['protein']['database']}: {exc}. "
+            "Write the protein record first with colabsd.protein_db.write_protein_record(spec, out_dir)."
         ) from exc
-    if not positions:
-        raise ConfigError(f"Pooling {pooling!r} resolved to no residue positions for protein {protein_id!r}.")
     return config
 
 
-def _check_record_matches_spec(
-    spec: LibrarySpec,
-    protein_id: str,
-    database_path: str | Path,
-    pooling: str,
-) -> None:
-    from colabsd.engine.protein_db import POOLING_REGIONS, load_protein_record
+def _check_record_matches_spec(spec: LibrarySpec, protein_id: str, database_path: str | Path) -> None:
+    from colabsd.engine.protein_db import load_protein_record
 
     try:
         record = load_protein_record(protein_id, database_path)
     except (FileNotFoundError, KeyError, ValueError) as exc:
         raise ConfigError(
             f"Protein record {protein_id!r} is not usable in {database_path}: {exc}. "
-            "Call colabsd.protein_db.write_protein_record(spec, region, out_dir) first."
+            "Call colabsd.protein_db.write_protein_record(spec, out_dir) first."
         ) from exc
     declared = int(record["sequence_length"])
     actual = len(str(spec.wt_sequence))
@@ -363,14 +228,11 @@ def _check_record_matches_spec(
             f"Protein record {protein_id!r} was written for a {declared}-residue sequence but the WT is {actual} "
             "residues. Rewrite the protein record for this WT sequence."
         )
-    if POOLING_REGIONS.get(pooling) != MUTATION_SITE_REGION:
-        return
-    region = record["regions"].get(MUTATION_SITE_REGION) or {}
-    recorded = [int(position) for position in region.get("positions_1based", [])]
+    recorded = sorted(int(position) for position in record["mutated_positions_1based"])
     expected = sorted(int(position) for position in spec.positions_1based)
-    if recorded and recorded != expected:
+    if recorded != expected:
         raise ConfigError(
             f"Protein record {protein_id!r} pools mutation sites {recorded[:8]} but this library varies "
-            f"{expected[:8]}. mutation_site_mean would average the wrong residues: rewrite the protein record "
-            "for this spec with colabsd.protein_db.write_protein_record()."
+            f"{expected[:8]}. The run would average the wrong residues: rewrite the protein record for this "
+            "spec with colabsd.protein_db.write_protein_record()."
         )

@@ -21,6 +21,7 @@ and `validate_qkvo_coverage` passes for every layer.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 from colabsd.backbones.base import HFAdapterBase
@@ -39,15 +40,13 @@ class SaProtAdapter(HFAdapterBase):
         self,
         model_name: str,
         *,
-        pooling: str,
-        pooling_positions_0based: list[int] | None = None,
+        pooling_positions_0based: Sequence[int],
         wt_3di: str | None = None,
         dtype: str = "float32",
         hf_id: str | None = None,
     ) -> None:
         super().__init__(
             model_name,
-            pooling=pooling,
             pooling_positions_0based=pooling_positions_0based,
             wt_3di=wt_3di,
             dtype=dtype,

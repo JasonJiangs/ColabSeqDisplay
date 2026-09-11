@@ -1,35 +1,29 @@
 """The deliberate test-set step: the fourth cell of the main notebook.
 
 This is the one place where ColabSeqDisplay departs from the ColabPLM layout on purpose.
-The wizard in cell 2 is the whole training interface, but unlocking the test set is not part
-of it: it is a separate cell, with its own confirmation, that you run once when you have
-stopped changing things.
+The wizard in cell 2 is the whole training interface; unlocking the test set is a separate
+cell, with its own confirmation, run once when you have stopped changing things.
 
-Why separate. Every choice made in the wizard — the backbone, the pooling, the
-hyperparameters, how many seeds to average — is made on validation data. The test
-partition is written to disk and left alone while that happens. Reading it is therefore not
-a step in a workflow; it is a decision, taken once, at the end. Every read increments a
-counter in `unlock.json`, and that counter is printed in the report, because a test set read
-repeatedly while things are still being tuned is no longer a test set, and a reader of the
-report deserves to know which one they are looking at.
+Why separate. Every choice made in the wizard — the backbone, the hyperparameters, how many
+seeds to average — is made on validation data, and the test partition is written to disk and
+left alone while that happens. Reading it is therefore not a step in a workflow; it is a
+decision, taken once, at the end. Every read increments a counter in `unlock.json` and that
+counter is printed in the report, because a test set read repeatedly while things are still
+being tuned is no longer a test set, and a reader of the report deserves to know which one
+they are looking at.
 
-Nothing here prevents a second unlock. It makes it visible: the panel says how many times
-this run directory has already been unlocked before you can unlock it again, the
-confirmation resets after every unlock so the next one has to be given deliberately, and the
-final report carries the count beside the numbers it qualifies.
+Nothing here prevents a second unlock; it makes one visible. The panel says how many times
+this run directory has already been unlocked before you can unlock it again, the confirmation
+resets after every unlock, and the report carries the count beside the numbers it qualifies.
 
-What it writes. The same `performance_report.zip` the export cell above writes — the report
-CSV, the figure, and the JSON that records what they show — rewritten through
-`colabsd.ui.exports` so that it now carries the test numbers and the unlock count. The
-validation archive is obtainable without ever running this cell; that is the point of it.
-This cell only changes what is inside the archive, and the archive says which it is.
+What it writes. The same `performance_report.zip` the export cell above writes, rewritten
+through `colabsd.ui.exports` so that it now carries the test numbers and the unlock count.
+The validation archive is obtainable without ever running this cell.
 
 The decision layer is pure — `status_notices`, `blocking`, `condition_rows`, `report_html`,
-`floor_line` — and `UnlockPanel` only wires it to two widgets. Presentation is
-`colabsd.ui.theme` and `colabsd.ui.core.Message`, the vocabulary the other three interfaces
-use, so this cell does not look like a different program. The sentence that says what a test
-number is worth after N reads lives in `colabsd.ui.exports`, so the panel, the archive's JSON
-and its README all say it the same way.
+`floor_line` — and `UnlockPanel` only wires it to two widgets. The sentence that says what a
+test number is worth after N reads lives in `colabsd.ui.exports`, so the panel, the archive's
+JSON and its README all say it the same way.
 """
 
 from __future__ import annotations
@@ -46,10 +40,9 @@ from colabsd.ui.exports import number, unlock_verdict
 
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 
-#: Only used when `colabsd.train` cannot be imported at all. It is a fallback, not a
-#: mirror: the dropdown is filled from `colabsd.train.METRICS` itself whenever that import
-#: works, so what the form offers is what a run records, by construction rather than by
-#: someone remembering to edit two lists. `tests/test_ui_side.py` holds them equal.
+#: Used only when `colabsd.train` cannot be imported at all. The dropdown is otherwise filled
+#: from `colabsd.train.METRICS` itself, so the form offers what a run records;
+#: `tests/test_ui_side.py` holds the two equal.
 FALLBACK_METRICS: tuple[str, ...] = ("R2", "Pearson", "Spearman", "P@10", "P@50", "NDCG@10", "NDCG@50")
 
 
@@ -113,8 +106,7 @@ class FinalReport:
     archive: Path | None = None
 
 
-#: What a training wizard might have called each thing it hands over. Aliases, so this cell
-#: keeps working if the wizard names its result `run` rather than `run_result`.
+#: What a training wizard might have called each thing it hands over.
 SOURCE_ALIASES: dict[str, tuple[str, ...]] = {
     "run_result": ("run_result", "run", "result"),
     "output_dir": ("output_dir", "run_dir", "out_dir"),
@@ -135,9 +127,9 @@ def resolve_inputs(
 ) -> UnlockInputs:
     """Collect the inputs from explicit arguments, falling back to attributes of *source*.
 
-    `source` is duck-typed on purpose: anything carrying a `run_result` (or `run`, or
-    `result`) and an `output_dir` (or `run_dir`) works, which is how the training wizard
-    hands its result to this cell without either side importing the other.
+    `source` is duck-typed: anything carrying a `run_result` (or `run`, or `result`) and an
+    `output_dir` (or `run_dir`) works, which is how the training wizard hands its result to
+    this cell without either side importing the other.
     """
 
     def pick(explicit: Any, name: str) -> Any:
@@ -173,10 +165,10 @@ def missing_inputs(inputs: UnlockInputs) -> list[str]:
 
 
 def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) -> list[Message]:
-    """The messages this panel shows for the current state, most consequential first.
+    """The messages this panel shows, most consequential first.
 
-    The "already unlocked" warning comes before anything else, so it is read before the
-    second unlock happens rather than after.
+    The "already unlocked" warning comes first, so it is read before the second unlock rather
+    than after.
     """
     out: list[Message] = []
     if unlock_count == 1:
@@ -185,8 +177,8 @@ def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) 
                 "already_unlocked_once",
                 "warning",
                 "**This run directory has already been unlocked once.** The number you got then is the "
-                "held-out one. If you have changed the pooling, the backbone or the hyperparameters since, a "
-                "second read is a validation number wearing a test label — and the report will say so.",
+                "held-out one. If you have changed anything since, a second read is a validation number "
+                "wearing a test label, and the report will say so.",
             )
         )
     elif unlock_count > 1:
@@ -194,9 +186,8 @@ def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) 
             Message(
                 "already_unlocked_repeatedly",
                 "warning",
-                f"**This run directory has already been unlocked {unlock_count} times.** Each read after the "
-                "first informs the choices you make next, so what comes back is no longer held out. Unlocking "
-                "again is allowed and will be counted; the count travels in the report and in any bundle you "
+                f"**This run directory has already been unlocked {unlock_count} times.** What comes back is no "
+                "longer held out. Unlocking again is allowed and counted, in the report and in any bundle you "
                 "export afterwards.",
             )
         )
@@ -205,7 +196,7 @@ def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) 
             Message(
                 "never_unlocked",
                 "info",
-                "This run directory has never been unlocked. The test partition has been on disk, untouched, "
+                "This run directory has never been unlocked: the test partition has been on disk, untouched, "
                 "since training finished.",
             )
         )
@@ -217,7 +208,7 @@ def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) 
                 "missing_inputs",
                 "stop",
                 f"Nothing to unlock yet: no {' and no '.join(missing)} in this session. Train a model in the "
-                "wizard above first — the test partition only exists once something has been trained against it.",
+                "wizard above first.",
             )
         )
     elif not confirmed:
@@ -225,9 +216,7 @@ def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) 
             Message(
                 "not_confirmed",
                 "stop",
-                "Tick the confirmation below to unlock. It is deliberately not a default: everything above this "
-                "cell is validation, and the test partition is read once, on purpose, so the reported number "
-                "means what it says.",
+                "Tick the confirmation below to unlock. It is deliberately not a default.",
             )
         )
     return out
@@ -270,9 +259,9 @@ def floor_line(floor: dict | None, macro_mean: float, metric: str) -> str:
     """The one-hot floor, and how far above it the language model actually is."""
     if not floor:
         return (
-            f"<b>One-hot floor:</b> not available for {metric} — either the one-hot baseline has not been run, "
-            "or it recorded no such metric. Without it there is nothing here to say whether a language model "
-            "was worth it."
+            f"<b>One-hot floor:</b> not available for {metric}, so nothing here says whether a language model "
+            "was worth it. Run the one-hot baseline in the wizard above; <code>report.csv</code> in the "
+            "archive carries the floor for every metric it recorded."
         )
     head = (
         f"<b>One-hot floor:</b> {floor['head']} on the {floor['partition']} partition scores "
@@ -293,12 +282,12 @@ def floor_line(floor: dict | None, macro_mean: float, metric: str) -> str:
 def why_separate_html() -> str:
     """Why this is its own cell, said plainly, above the confirmation."""
     return theme.heading_html("Unlock the test set") + theme.note_html(
-        "Everything above this cell is **validation**. The backbone, the pooling, the hyperparameters and the "
-        "number of seeds were all chosen by looking at validation numbers, and the test partition was written "
-        "to disk and left alone while that happened.\n\n"
-        "That is why unlocking is a separate step you take on purpose, and not part of the wizard: the test "
-        "partition is touched once, deliberately, at the end, so the number you report means what it says. "
-        "Every read is counted in `unlock.json` and printed in the report — including the second one."
+        "Everything above this cell is **validation**: the backbone, the hyperparameters and the number of "
+        "seeds were all chosen by looking at validation numbers, and the test partition was left on disk "
+        "while that happened.\n\n"
+        "So it is touched once, deliberately, here rather than inside the wizard, and the number you report "
+        "means what it says. Every read is counted in `unlock.json` and printed in the report — including "
+        "the second one."
     )
 
 
@@ -316,9 +305,8 @@ def report_html(
 ) -> str:
     """The final report: test numbers, the one-hot floor and the unlock count, together.
 
-    The three belong on one screen. A test number without the floor does not say whether a
-    language model earned its keep, and either without the unlock count does not say how
-    much the number should be believed.
+    A test number without the floor does not say whether a language model earned its keep,
+    and either without the count does not say how much to believe it.
     """
     # One unlock is the number this design is for; any other count is coloured like a warning.
     count_color = theme.SEVERITY_COLOR["stop"] if unlock_count != 1 else "inherit"
@@ -333,8 +321,8 @@ def report_html(
     if not rows:
         body = (
             "<tr><td colspan='3' style='padding:3px 0'>The unlocked run recorded no per-condition "
-            f"<b>{metric}</b> numbers. Pick another metric above and unlock again, or read "
-            "<code>report.csv</code>.</td></tr>"
+            f"<b>{metric}</b> numbers. <code>report.csv</code> in the archive carries every metric that "
+            "was recorded.</td></tr>"
         )
     files = ""
     if paths:
@@ -346,8 +334,8 @@ def report_html(
     provisional = ""
     if is_provisional:
         provisional = theme.message_html(
-            "These numbers came from **PROVISIONAL** hyperparameters: a lower bound on what this pair can do, "
-            "not a benchmark result.",
+            "These numbers came from **PROVISIONAL** hyperparameters: a lower bound on what this backbone "
+            "can do, not a benchmark result.",
             "warning",
         )
     return (
@@ -535,9 +523,8 @@ class UnlockPanel:
     def on_unlock(self, _button: Any = None) -> FinalReport | None:
         """Read the test set once, then write and render the final report.
 
-        One click reads the test set at most once: `colabsd.train.unlock_test` is called a
-        single time and the confirmation is reset afterwards, so the next unlock needs a
-        fresh, deliberate tick.
+        One click reads the test set at most once: `colabsd.train.unlock_test` is called once
+        and the confirmation is reset afterwards, so the next unlock needs a fresh tick.
         """
         refusals = blocking(self.notices())
         if refusals:
@@ -578,23 +565,21 @@ class UnlockPanel:
         self._say(f"unlock #{count} at {payload.get('unlocked_utc', 'unknown time')}")
         self._say(f"test {metric}, averaged over conditions: {macro_mean:.4f} ± {macro_sd:.4f}")
         if export is not None:
-            # Two downloads and no more: the archive is what to keep — it says which
-            # partition and how many reads — and the figure is what to look at now.
+            # Two downloads and no more: the archive to keep, the figure to look at now.
             self._say(f"performance archive: {export.path} — {export.facts.describe()}")
             self.runners.download(export.path)
             figure = export.report_paths.get("report.png")
             if figure is not None:
                 self.runners.download(Path(figure))
-        # A second unlock stays possible, but it has to be confirmed again on purpose.
-        self.confirm.value = False
+        self.confirm.value = False  # a second unlock has to be confirmed again
         self.refresh()
         return self.report
 
     def _export_runners(self) -> exports.ExportRunners:
         """This panel's injected side effects, handed to `colabsd.ui.exports` unchanged.
 
-        The export module writes the archive, but it writes it through whatever this panel
-        was given — so a test that fakes the report writer fakes it here too.
+        The export module writes the archive through whatever this panel was given, so a test
+        that fakes the report writer fakes it here too.
         """
         return exports.ExportRunners(
             build_report=self.runners.build_report,
@@ -607,7 +592,7 @@ class UnlockPanel:
 
         The same file name the export cell above writes with validation numbers. Which
         partition it describes is `colabsd.report`'s decision, recorded in `report.json` and
-        copied into the archive's own manifest — this panel does not get a second opinion.
+        copied into the manifest; this panel does not get a second opinion.
         """
         if self.inputs.output_dir is None:
             return None

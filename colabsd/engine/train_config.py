@@ -20,8 +20,8 @@ two HPC workers cannot share a study, and expose two ``argparse`` command lines.
 ColabSeqDisplay runs *one* already-chosen configuration out of ``config/best/``,
 so none of that is reachable from a notebook and none of it is here.
 
-Changed while copying, both deliberate and both covered by the side-by-side
-equivalence test in ``tests/test_engine_train_config.py``:
+Changed while copying, all deliberate and covered by the side-by-side equivalence test
+in ``tests/test_engine_train_config.py``:
 
 1. **``micro_batch_size: auto`` no longer raises in the loader.** Upstream
    defaults ``training.micro_batch_size`` to the string ``"auto"`` and then calls
@@ -35,6 +35,14 @@ equivalence test in ``tests/test_engine_train_config.py``:
    ``_configure_model`` is :func:`configure_model`, and the state-dict and
    split-evaluation helpers lost their underscores: they are this package's own
    API now, not another package's internals.
+3. **The two defaults that name upstream's own study are gone.** Upstream defaults
+   ``training.pooling`` to the strategy its study selected and ``protein:`` to the
+   protein and database packaged in its checkout. colabsd pools one way and ships no
+   protein database, so the pooling defaults to
+   :data:`colabsd.engine.pooling.POOLING_NAME` and the protein block defaults to empty:
+   a config that omits it is told which field is missing instead of being resolved
+   against a protein nobody loaded. Every shipped ``config/best/`` entry sets the
+   pooling explicitly and none sets ``protein:``, so nothing on disk parses differently.
 """
 
 from __future__ import annotations
@@ -59,6 +67,7 @@ from colabsd.engine.config_space import pooling_positions_1based, validation_met
 from colabsd.engine.heads import MLPHead
 from colabsd.engine.lora import LORA_TARGET_MODULES, inject_lora, lora_parameters
 from colabsd.engine.metrics import evaluate_predictions, summarize_metrics, validation_log_row
+from colabsd.engine.pooling import POOLING_NAME
 from colabsd.engine.training import batch_indices, train_epoch
 
 # Upstream's ceiling on a derived micro-batch: with `micro_batch_size: auto` the
@@ -152,7 +161,7 @@ def load_lora_best_config(path: Path) -> tuple[str, dict[str, Any], dict[str, An
     fixed_defaults = {
         "tuning_method": "lora",
         "head": "mlp",
-        "pooling": "cosine_p90_mean",
+        "pooling": POOLING_NAME,
         "max_epochs": 20,
         "early_stopping_patience": 3,
         "max_grad_norm": 1.0,
@@ -191,13 +200,11 @@ def load_lora_best_config(path: Path) -> tuple[str, dict[str, Any], dict[str, An
             "re_evaluation_split_seeds": split_seeds,
             "re_evaluation_seeds": model_seeds,
         },
-        # Upstream's fallback names its own bundled 5NNK database. It is kept
-        # verbatim so a config that omits `protein:` parses identically; colabsd
-        # always passes one, written by colabsd.protein_db.write_protein_record.
-        "protein": raw.get(
-            "protein",
-            {"id": "slugcas9", "database": "data/protein/proteins.yaml"},
-        ),
+        # No fallback. Upstream defaults this to its own bundled protein and database;
+        # colabsd ships neither, so an omitted block stays empty and
+        # `colabsd.engine.config_space` says which field is missing rather than silently
+        # resolving the pooled residues of somebody else's protein.
+        "protein": raw.get("protein", {}),
         "fixed": fixed,
         "data": raw.get("data", {}),
     }

@@ -19,9 +19,10 @@ ESMDance pools its 50-dim `res_pred` output, not its 480-dim trunk. The values
 here are cross-checked against upstream's `config/models.yaml` in the tests.
 
 `approx_lora_minutes_t4` is an order-of-magnitude wall-clock estimate for one
-split seed x one model seed of LoRA fine-tuning on the bundled SlugCas9 example
-(16.4k variants, 1054 residues) on a Colab T4. `None` means the backbone does
-not fit a T4 and needs an L4/A100 or a local GPU.
+split seed x one model seed of LoRA fine-tuning on a Colab T4, sized against the
+library the tuning study used (16.4k variants of 1054 residues). `None` means the
+backbone does not fit a T4 and needs an L4/A100 or a local GPU. The bundled MG8
+example is ~486x smaller in tokens, so a run on it costs a small fraction of these.
 """
 
 from __future__ import annotations
@@ -204,11 +205,11 @@ _FAMILY_ADAPTERS: dict[str, tuple[str, str]] = {
 
 # --- what the notebooks offer ------------------------------------------------
 
-#: The families the notebooks list. The panel asks two questions — which backbone,
-#: which pooling — and every later step is derived from the answers, so the first
-#: question stays a real comparison (one sequence-only family, one structure-aware
-#: one) rather than a menu of fourteen. This says nothing about what the package can
-#: run: `create_adapter` builds every entry that has an adapter, offered or not.
+#: The families the notebooks list. Which backbone is the one modelling question the
+#: panel asks, and every later step is derived from the answer, so it stays a real
+#: comparison (one sequence-only family, one structure-aware one) rather than a menu
+#: of fourteen. This says nothing about what the package can run: `create_adapter`
+#: builds every entry that has an adapter, offered or not.
 #: Putting a family back on screen is one line — move its name out of
 #: `WITHHELD_FAMILY_REASONS` and into this tuple.
 OFFERED_FAMILIES: tuple[str, ...] = ("ESM2", "SaProt")
@@ -245,7 +246,7 @@ THREE_DI_FAMILIES: frozenset[str] = frozenset({"SaProt"})
 
 #: What `hyperparameter_state` can answer. "placeholder" is `config/best/`'s own
 #: `_meta.status: provisional` — a median of the tuned entries, standing in until a
-#: study is run for that pair.
+#: study is run for that backbone.
 HYPERPARAMETER_STATES: tuple[str, ...] = ("tuned", "placeholder", "missing")
 
 
@@ -316,16 +317,35 @@ def withheld_reason(name: str) -> str | None:
         ) from None
 
 
+#: What `withheld_note` adds about `config/best/` per `hyperparameter_state`. A withheld
+#: family with no entry gets no clause: the note says nothing rather than promising a file.
+_CONFIG_CLAUSE: dict[str, str] = {
+    "tuned": " `config/best/` holds tuned hyperparameters for it.",
+    "placeholder": " `config/best/` holds a placeholder entry for it, not tuned values.",
+    "missing": "",
+}
+
+
 def withheld_note(name: str) -> str:
-    """One paragraph for a reader who went looking for a backbone the panel does not list."""
+    """One paragraph for a reader who went looking for a backbone the panel does not list.
+
+    The `config/best/` clause is *asked for* per backbone, never asserted for the class:
+    having an adapter says nothing about having an entry, and today every withheld entry
+    that has one is a placeholder rather than the tuned values the old blanket sentence
+    promised. An unreadable registry costs the clause, not the note.
+    """
     reason = withheld_reason(name)
     if reason is None:
         return f"`{name}` is one of the backbones the notebooks offer."
     lines = [f"`{name}` is in this package but the notebooks do not offer it: {reason}."]
     if has_adapter(name):
+        try:
+            config = _CONFIG_CLAUSE.get(hyperparameter_state(name), "")
+        except Exception:
+            config = ""
         lines.append(
-            f"Its adapter is still here and still tested — `create_adapter({name!r}, pooling=...)` builds it "
-            "from Python, and `config/best/` still carries its hyperparameters."
+            f"Its adapter is still here and still tested — `create_adapter({name!r})` builds it from "
+            f"Python.{config}"
         )
     else:
         lines.append("It has no adapter in this package, so there is nothing here to run it with.")
@@ -344,11 +364,11 @@ def needs_wt_3di(name: str) -> bool:
     return get_entry(name).family in THREE_DI_FAMILIES
 
 
-def hyperparameter_state(name: str, pooling: str, root: str | Path | None = None) -> str:
-    """Whether `config/best/` holds `"tuned"` values for this pair, a `"placeholder"`, or `"missing"`.
+def hyperparameter_state(name: str, root: str | Path | None = None) -> str:
+    """Whether `config/best/` holds `"tuned"` values for *name*, a `"placeholder"`, or `"missing"`.
 
     `colabsd.bestconfig` owns the answer; this is the join, so no panel has to re-derive
-    it from a literal list of pairs. A placeholder is a real, runnable configuration —
+    it from a literal list of backbones. A placeholder is a real, runnable configuration —
     the median of the tuned entries — but no study selected it, so nothing it produces
     is a result.
     """
@@ -356,31 +376,30 @@ def hyperparameter_state(name: str, pooling: str, root: str | Path | None = None
 
     get_entry(name)  # an unknown backbone is a backbone error, not a missing-file report
     try:
-        best = bestconfig.load_best_config(name, pooling, root)
+        best = bestconfig.load_best_config(name, root)
     except bestconfig.BestConfigNotFound:
         return "missing"
     return "placeholder" if best.is_provisional else "tuned"
 
 
-def is_tuned(name: str, pooling: str, root: str | Path | None = None) -> bool:
-    """True only when `config/best/` carries tuned hyperparameters for this pair."""
-    return hyperparameter_state(name, pooling, root) == "tuned"
+def is_tuned(name: str, root: str | Path | None = None) -> bool:
+    """True only when `config/best/` carries tuned hyperparameters for *name*."""
+    return hyperparameter_state(name, root) == "tuned"
 
 
-def tuned_pairs(root: str | Path | None = None, *, offered_only: bool = True) -> list[tuple[str, str]]:
-    """The (backbone, pooling) pairs with tuned hyperparameters, sorted.
+def tuned_backbones(root: str | Path | None = None, *, offered_only: bool = True) -> list[str]:
+    """The backbones with tuned hyperparameters, sorted.
 
     Restricted to offered backbones by default, which is the list a notebook should
-    quote; pass `offered_only=False` for every tuned pair the registry holds.
+    quote; pass `offered_only=False` for every tuned entry the registry holds.
     """
     from colabsd import bestconfig
 
-    pairs = [
-        (model, pooling)
-        for model, pooling in bestconfig.available_pairs(root)
-        if model in BACKBONES and (not offered_only or is_offered(model)) and is_tuned(model, pooling, root)
-    ]
-    return sorted(pairs)
+    return sorted(
+        model
+        for model in bestconfig.available_models(root)
+        if model in BACKBONES and (not offered_only or is_offered(model)) and is_tuned(model, root)
+    )
 
 
 def _adapter_class(module: ModuleType, class_name: str) -> type:

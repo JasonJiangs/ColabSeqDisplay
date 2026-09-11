@@ -8,21 +8,13 @@ it write the same files in the same shape from one place.
   exactly as `colabsd.report.build_report` writes them, plus a `performance.json` and a
   `README.txt` that say what those numbers are.
 
-**Why the archive exists.** `build_report` has always been able to publish a *validation*
-report while the test partition is still locked — that is what its `shown_partition` is for
-— but the only call to it sat inside the unlock handler. A user who followed this tool's own
-discipline and never unlocked therefore ended up with no report at all. The validation
-archive is now the ordinary first export, obtainable with the test set untouched; after an
-unlock the same file is rewritten, carrying the test numbers and the count.
-
-**Why the archive describes itself.** A CSV of numbers with no provenance is a trap: months
-later nobody can tell whether 0.56 was validation or test, whether the test set had been read
-once or five times, which backbone and pooling produced it, or whether the hyperparameters
-behind it were tuned or a placeholder. `performance.json` records all four, `README.txt`
-says the same in prose for a reader who will not open JSON, and every member carries a
-sha256 so a truncated download is caught rather than believed. The provenance block is
-`colabsd.bundle.provenance_block`, the one the model bundle stamps, so the two downloads
-describe the same run in the same words.
+The archive is the ordinary first export and needs no unlock: `build_report` publishes
+validation numbers while the test partition is locked, and after an unlock the same file is
+rewritten with the test numbers and the count. Either way it describes itself —
+`performance.json` in JSON, `README.txt` in prose for a reader who will not open JSON — and
+each report file it carries is checksummed, so a truncated download is caught rather than
+believed. The provenance block is `colabsd.bundle.provenance_block`, the one the model
+bundle stamps, so the two downloads describe the same run in the same words.
 
 The decision layer is pure — `performance_facts`, `manifest_payload`, `facts_from_manifest`,
 `readme_text`, `notices`, `partition_verdict`, `unlock_verdict` — and only `export_bundle`,
@@ -60,7 +52,7 @@ README_NAME = "README.txt"
 #: `colabsd.report.ReportPaths` attribute -> the name it is filed under inside the archive.
 REPORT_MEMBERS: dict[str, str] = {"csv": "report.csv", "png": "report.png", "json": "report.json"}
 
-#: What each member is for, in the README and in the manifest, so no one has to guess.
+#: What each member is for, in the README and in the manifest.
 MEMBER_PURPOSE: dict[str, str] = {
     "report.csv": "every tracked metric for every condition, mean +/- sd across the repeated runs",
     "report.png": "the figure: the spread across runs, the one-hot floor, and the unlock count",
@@ -94,8 +86,8 @@ def unlock_verdict(unlock_count: int) -> str:
         return "The test partition has not been read in this run directory."
     if unlock_count == 1:
         return (
-            "Read once, deliberately, after the choices were made. This number means what a held-out number "
-            "is supposed to mean."
+            "Read once, after the choices were made. This number means what a held-out number is supposed "
+            "to mean."
         )
     return (
         f"This is read number {unlock_count} of the same test partition. Choices made after the first read "
@@ -109,14 +101,12 @@ def partition_verdict(partition: str, unlock_count: int) -> str:
         return unlock_verdict(unlock_count)
     if unlock_count <= 0:
         return (
-            "These are validation numbers, and the test partition has never been read. That is the right state "
-            "to be in while you are still choosing a backbone, a pooling or a set of hyperparameters: nothing "
-            "here has spent the held-out set."
+            "These are validation numbers, and the test partition has never been read. Nothing here has spent "
+            "the held-out set."
         )
     return (
         f"These are validation numbers, but the test partition of this run directory has already been read "
-        f"{unlock_count}x. The held-out set has been spent; a later test report from here is an optimistic "
-        "estimate rather than a held-out one."
+        f"{unlock_count}x. A later test report from here is an optimistic estimate rather than a held-out one."
     )
 
 
@@ -130,9 +120,9 @@ class PerformanceFacts:
     """Everything a reader of the archive needs in order to trust — or distrust — the numbers.
 
     Four questions have to be answerable from the archive alone: which partition, how often
-    the test set was read, which backbone and pooling, and whether the hyperparameters were
-    tuned or a placeholder. Every field below exists to answer one of them, or to say who
-    wrote the answer.
+    the test set was read, which backbone, and whether the hyperparameters were tuned or a
+    placeholder. Every field below exists to answer one of them, or to say who wrote the
+    answer.
     """
 
     partition: str = "validation"
@@ -144,7 +134,6 @@ class PerformanceFacts:
     one_hot_floor: dict[str, Any] | None = None
     model_name: str = "this model"
     adapter_name: str = ""
-    pooling: str = ""
     is_provisional: bool = False
     hyperparameters: dict[str, Any] = field(default_factory=dict)
     training: dict[str, Any] = field(default_factory=dict)
@@ -184,10 +173,7 @@ class PerformanceFacts:
         """Where the one-hot floor sits, and how far above it this model is."""
         floor = self.one_hot_floor or {}
         if not floor:
-            return (
-                f"no one-hot floor for {self.metric} — without it there is nothing here to say whether a "
-                "language model was worth it"
-            )
+            return f"no one-hot floor for {self.metric} — nothing here says whether a language model was worth it"
         head = f"{floor.get('head', '?')} on {floor.get('partition', self.partition)}: {number(floor.get('mean'))}"
         mean, floor_mean = self.headline.get("mean"), floor.get("mean")
         if mean is None or floor_mean is None or not math.isfinite(float(mean)):
@@ -198,7 +184,7 @@ class PerformanceFacts:
     def describe(self) -> str:
         """One line: what these numbers are, and what produced them."""
         return (
-            f"{self.metric} on the {self.partition} partition · {self.model_name} · {self.pooling} · "
+            f"{self.metric} on the {self.partition} partition · {self.model_name} · "
             f"{self.hyperparameter_status} hyperparameters · test unlocked {self.unlock_count}x · "
             f"written {self.created_utc or 'unknown'}"
         )
@@ -266,11 +252,10 @@ def performance_facts(
 ) -> PerformanceFacts:
     """Read the facts out of a `report.json` summary and the run that produced it.
 
-    The partition and the unlock count come from the report rather than from anywhere here:
-    `colabsd.report` already decides which partition it is allowed to show and already reads
-    the persisted counter, and a second copy of either rule is a second chance to disagree.
-    The one addition is a `RunResult` that remembers *more* unlocks than the report found —
-    the honest number is the larger one.
+    The partition and the unlock count come from the report, not from a second copy of either
+    rule here: `colabsd.report` decides which partition it may show and reads the persisted
+    counter. The one addition is a `RunResult` that remembers *more* unlocks than the report
+    found — the honest number is the larger one.
     """
     from colabsd.bundle import utc_now
 
@@ -294,7 +279,6 @@ def performance_facts(
         one_hot_floor=_mapping(report_summary.get("one_hot_floor")) or None,
         model_name=model_name,
         adapter_name=str(_attr(run_result, "adapter_name") or model_name),
-        pooling=str(_attr(run_result, "pooling") or _attr(best, "pooling") or "not recorded"),
         is_provisional=bool(provisional),
         hyperparameters=_mapping(_attr(run_result, "params") or _attr(best, "params")),
         training=_mapping(_attr(run_result, "fixed") or _attr(best, "fixed")),
@@ -356,11 +340,10 @@ def manifest_payload(facts: PerformanceFacts, files: Mapping[str, Mapping[str, A
             "n_runs": facts.headline.get("n"),
         },
         "one_hot_floor": facts.one_hot_floor,
-        # 3. Which backbone and pooling produced them?
+        # 3. Which backbone produced them?
         "model": {
             "model_name": facts.model_name,
             "adapter_name": facts.adapter_name,
-            "pooling": facts.pooling,
         },
         # 4. Were the hyperparameters tuned, or a placeholder? (`provenance` says the same;
         # both are read off one field, so they cannot drift apart.)
@@ -407,7 +390,6 @@ def facts_from_manifest(manifest: Mapping[str, Any]) -> PerformanceFacts:
         one_hot_floor=_mapping(manifest.get("one_hot_floor")) or None,
         model_name=str(model.get("model_name") or "this model"),
         adapter_name=str(model.get("adapter_name") or ""),
-        pooling=str(model.get("pooling") or ""),
         is_provisional=bool(hyperparameters.get("is_provisional", provenance.get("is_provisional", False))),
         hyperparameters=_mapping(hyperparameters.get("params")),
         training=_mapping(hyperparameters.get("training")),
@@ -427,10 +409,13 @@ def facts_from_manifest(manifest: Mapping[str, Any]) -> PerformanceFacts:
 
 def readme_text(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]]) -> str:
     """The same four answers as `performance.json`, for a reader who will not open JSON."""
-    seeds = f"split seeds {list(facts.split_seeds) or 'not recorded'}, model seeds {list(facts.model_seeds) or '?'}"
+    seeds = (
+        f"split seeds {list(facts.split_seeds) or 'not recorded'}, "
+        f"model seeds {list(facts.model_seeds) or 'not recorded'}"
+    )
     provisional = (
-        "\nThese hyperparameters are a PROVISIONAL placeholder, not a tuned entry: the numbers below are a\n"
-        "lower bound on what this backbone and pooling can do, not a benchmark result.\n"
+        "\nThese hyperparameters are a PROVISIONAL placeholder: the numbers above are a lower bound on\n"
+        "what this backbone can do, not a benchmark result.\n"
         if facts.is_provisional
         else ""
     )
@@ -448,13 +433,12 @@ def readme_text(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]])
         f"  one-hot floor      {facts.floor_line()}",
         f"  conditions         {', '.join(facts.conditions) or 'not recorded'}",
         f"  repeated runs      {facts.n_runs}  ({seeds})",
-        f"  library size       {facts.n_sequences or 'not recorded'} sequences",
+        f"  library size       {str(facts.n_sequences) + ' sequences' if facts.n_sequences else 'not recorded'}",
         "",
         _wrap(partition_verdict(facts.partition, facts.unlock_count)),
         "",
         "WHAT PRODUCED THEM",
         f"  backbone           {facts.model_name}  (adapter {facts.adapter_name or 'not recorded'})",
-        f"  pooling            {facts.pooling or 'not recorded'}",
         f"  hyperparameters    {facts.hyperparameter_status}",
         f"  registry entry     {facts.best_config_meta.get('status', 'not recorded')}",
         f"  selected on        {facts.selection_metric or 'not recorded'} (validation)",
@@ -497,8 +481,8 @@ def notices(facts: PerformanceFacts) -> list[Message]:
                 Message(
                     "archive_test_read_repeatedly",
                     "warning",
-                    f"This archive carries **test** numbers from read number {facts.unlock_count} of the same "
-                    "partition. The count travels in `performance.json`, and anyone you send it to will see it.",
+                    f"**Test** numbers from read number {facts.unlock_count} of the same partition: an "
+                    "optimistic estimate, not a held-out one. `performance.json` carries the count with them.",
                 )
             )
         else:
@@ -506,8 +490,8 @@ def notices(facts: PerformanceFacts) -> list[Message]:
                 Message(
                     "archive_test_read_once",
                     "info",
-                    "This archive carries the **test** numbers, read once. `performance.json` records the "
-                    "partition and the count, so the file says which it is without you having to remember.",
+                    "**Test** numbers, read once — what a held-out number is supposed to mean. "
+                    "`performance.json` records the partition and the count.",
                 )
             )
     elif facts.test_untouched:
@@ -515,8 +499,8 @@ def notices(facts: PerformanceFacts) -> list[Message]:
             Message(
                 "archive_validation_only",
                 "info",
-                "This archive carries **validation** numbers and the test partition has never been read — the "
-                "state to be in while you are still deciding anything. Nothing here spent the held-out set.",
+                "**Validation** numbers, and the test partition has never been read. Nothing here spent the "
+                "held-out set.",
             )
         )
     else:
@@ -524,8 +508,8 @@ def notices(facts: PerformanceFacts) -> list[Message]:
             Message(
                 "archive_validation_after_unlock",
                 "warning",
-                f"This archive carries **validation** numbers, but the test partition of this run directory has "
-                f"already been read {facts.unlock_count}x. The archive says so.",
+                f"**Validation** numbers, but the test partition of this run directory has already been read "
+                f"{facts.unlock_count}x. The archive says so.",
             )
         )
     if facts.is_provisional:
@@ -533,8 +517,8 @@ def notices(facts: PerformanceFacts) -> list[Message]:
             Message(
                 "archive_provisional",
                 "warning",
-                "The hyperparameters behind these numbers are a **PROVISIONAL** placeholder, so this is a lower "
-                "bound on what this backbone and pooling can do. The archive is stamped `PROVISIONAL`.",
+                "These hyperparameters are a **PROVISIONAL** placeholder: a lower bound on what this backbone "
+                "can do. The archive is stamped `PROVISIONAL`.",
             )
         )
     if not facts.one_hot_floor:
@@ -542,8 +526,8 @@ def notices(facts: PerformanceFacts) -> list[Message]:
             Message(
                 "archive_no_floor",
                 "warning",
-                f"No one-hot floor was recorded for {facts.metric}, so nothing in this archive says whether a "
-                "language model beat 20·k one-hot features. Run the one-hot baseline and export again.",
+                f"No one-hot floor was recorded for {facts.metric}, so nothing here says whether a language "
+                "model beat 20·k one-hot features. Run the one-hot baseline and export again.",
             )
         )
     return found
@@ -554,7 +538,6 @@ def summary_html(export: PerformanceExport) -> str:
     files = ", ".join(f"`{name}`" for name in sorted(export.report_paths))
     return theme.note_html(
         f"Written **{export.path.name}** — {export.facts.describe()}\n\n"
-        f"{partition_verdict(export.facts.partition, export.facts.unlock_count)}\n\n"
         f"Inside it, beside `{MANIFEST_NAME}` and `{README_NAME}`: {files}."
     ) + render_messages(notices(export.facts))
 
@@ -613,7 +596,7 @@ def write_performance_archive(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        # The README first: whatever opens this, a human reads that file.
+        # The README first: it is the member a human opens.
         archive.writestr(README_NAME, readme_text(facts, files))
         archive.writestr(MANIFEST_NAME, json.dumps(manifest_payload(facts, files), indent=2))
         for name, source in members.items():
@@ -653,7 +636,7 @@ def read_performance_archive(path: str | Path) -> PerformanceArchive:
         if MANIFEST_NAME not in names:
             raise ExportError(
                 f"{path} has no {MANIFEST_NAME}, so nothing in it says which partition its numbers describe. "
-                "It was not written by colabsd.ui.exports; re-export it from the notebook that trained the model."
+                "Re-export it from the notebook that trained the model."
             )
         manifest = json.loads(archive.read(MANIFEST_NAME))
         version = int(manifest.get("schema_version", 0))
@@ -678,8 +661,8 @@ def read_performance_archive(path: str | Path) -> PerformanceArchive:
             expected = str(_mapping(record).get("sha256") or "")
             if expected and sha256_hex(blob) != expected:
                 raise ExportError(
-                    f"{name} in {path} does not match its manifest checksum, so the numbers in it are not the "
-                    "ones that were exported. The archive is corrupt; re-download or re-export it."
+                    f"{name} in {path} does not match its manifest checksum: the numbers in it are not the ones "
+                    "that were exported. The archive is corrupt; re-download or re-export it."
                 )
             blobs[name] = blob
         readme = archive.read(README_NAME).decode("utf-8") if README_NAME in names else ""
@@ -737,12 +720,12 @@ def _offer_download(path: Path) -> None:
 
 @dataclass(frozen=True)
 class ExportRunners:
-    """Everything here that touches a disk, a browser or the network of imports.
+    """Everything here that touches a disk, a browser or a heavy import.
 
     The defaults are the real implementations, each importing lazily so that importing this
-    module stays free; a test — or a notebook cell that already has its own backend — passes
-    its own. Dataclass fields are set on the instance, so these stay plain functions rather
-    than becoming bound methods.
+    module stays free; a test — or a notebook cell with its own backend — passes its own.
+    Dataclass fields are set on the instance, so these stay plain functions rather than
+    becoming bound methods.
     """
 
     build_report: Callable[..., Any] = _build_report
@@ -760,10 +743,10 @@ def default_runners() -> ExportRunners:
 def honest_unlock_count(run_result: Any, *, output_dir: Any = None, runners: ExportRunners | None = None) -> int:
     """The larger of what the run remembers and what `unlock.json` records.
 
-    A `RunResult` sitting in a notebook variable can only ever undercount: it predates any
-    unlock taken after it was built. An unreadable counter raises rather than reading as
-    zero — claiming "never unlocked" over a partition that has in fact been read is the one
-    lie these exports exist to prevent.
+    A `RunResult` sitting in a notebook variable can only undercount: it predates any unlock
+    taken after it was built. An unreadable counter raises rather than reading as zero —
+    claiming "never unlocked" over a partition that has been read is the one lie these
+    exports exist to prevent.
     """
     runners = runners or default_runners()
     counts = [int(_attr(run_result, "unlock_count") or 0)]
@@ -815,14 +798,12 @@ def export_performance(
 ) -> PerformanceExport:
     """Build the report and pack it into a self-describing archive. Reads no locked data.
 
-    This is the ordinary first export, and it works with the test partition untouched:
-    `colabsd.report.build_report` publishes validation numbers while the test set is locked
-    and says so in `report.json`, and that is what the archive then declares. Called again
-    after `colabsd.train.unlock_test`, the same file name is rewritten with the test numbers
-    and the count — `partition` is left to the report, which knows what it is allowed to show.
-
-    `run_result` may be None when there is nothing but a one-hot baseline to report; what the
-    report can be built from is `colabsd.report.build_report`'s rule, not a second one here.
+    Works with the test partition untouched: `build_report` publishes validation numbers while
+    the test set is locked and says so in `report.json`, which is what the archive declares.
+    Called again after `colabsd.train.unlock_test`, the same file name is rewritten with the
+    test numbers and the count. `partition` is left to the report, which knows what it may
+    show, and `run_result` may be None — what a report can be built from is `build_report`'s
+    rule, not a second one here.
     """
     runners = runners or default_runners()
     work = Path(work_dir)
@@ -869,7 +850,6 @@ def export_bundle(
     spec: Any,
     best: Any,
     path: str | Path,
-    region: Mapping[str, Any] | None = None,
     notes: str | None = None,
     runners: ExportRunners | None = None,
     download: bool = True,
@@ -888,7 +868,6 @@ def export_bundle(
             run_result=run_result,
             spec=spec,
             best=best,
-            region=dict(region) if region else None,
             notes=notes,
             unlock_count=unlocks,
         )
