@@ -2,10 +2,10 @@
 
 Fine-tune a protein language model on your own sequence-display variant library, in a browser,
 without writing code. Bring a CSV — one row per variant, one column per mutated site, one column
-per measured condition — plus the wild-type sequence. Get back a trained model, a report
-comparing it against a one-hot baseline, a test partition that stays locked until you
-deliberately open it, and two `.zip` files: the model, and the performance analysis that says
-which partition its numbers came from.
+per measured condition — plus the wild-type sequence. Get back a trained model, a report of what
+it scored per condition and how far the repeated runs spread, a test partition that stays locked
+until you deliberately open it, and two `.zip` files: the model, and the performance analysis that
+says which partition its numbers came from.
 
 **Version 0.1.0 · MIT licence · [tutorial](TUTORIAL.md) · [status](#status)**
 
@@ -58,15 +58,22 @@ and the step is not on the page at all. How the model reads a sequence is not a 
 the residue embeddings at your mutated sites and averages them, which needs nothing computed first
 and nothing redone for a new protein.
 
-**Hyperparameters are looked up, not tuned** — the seven LoRA values for a pair come from
-`config/best/`, with no way to change them. **The test set is locked and unlocks are counted:**
+**Modelling hyperparameters are looked up, not tuned** — the seven LoRA values for a pair come
+from `config/best/`, with no way to change them. **The budget is yours**: three boxes, prefilled
+from the same file and editable — epochs at most, early-stopping patience, and how many sequences
+sit on the GPU at once. That last one is what to lower after an out-of-memory error; gradient
+accumulation keeps the effective batch where the study put it, so lowering it changes what fits on
+the card and not what is learned. What you change is recorded, and marked as yours, in both files
+you take away. **The test set is locked and unlocks are counted:**
 the panel reports validation only; the notebook's second cell opens the test partition, increments
 a counter, and stamps that count into every report, archive and bundle written afterwards.
 
 ## What you take away
 
 **`model_bundle.zip` — the model.** LoRA weights, the head, your library specification — which is
-also the residues the model averages — the hyperparameters and the provenance. No backbone weights
+also the residues the model averages — the hyperparameters, the `training_budget` the run was
+actually given (`chosen_by_user` names anything you set, `looked_up` what the entry said) and the
+provenance. No backbone weights
 (re-fetched by name). The only file Predict needs.
 
 **`performance_report.zip` — the numbers, and what they are.** `report.csv`, `report.png` and
@@ -74,9 +81,8 @@ also the residues the model averages — the hyperparameters and the provenance.
 and `README.txt` for a person, generated from one object so they cannot disagree. Both name the
 partition (`partition`, `describes_test_partition`, a badge in `report.png`), the unlock count with
 a sentence saying what it is worth (`unlock.count`, `unlock.source`, `unlock.verdict`), the
-hyperparameter status spelled `tuned` or `PROVISIONAL`, the backbone and adapter, the
-one-hot floor, the conditions, the number of runs and the seeds. Every member carries a sha256,
-verified on read-back.
+hyperparameter status spelled `tuned` or `PROVISIONAL`, the backbone and adapter, the same
+`training_budget` block as the bundle, the conditions, the number of runs and the seeds. Every member carries a sha256, verified on read-back.
 
 **This archive is obtainable without unlocking the test partition** — `build_report` publishes
 validation numbers while the test partition is untouched. Its only blockers are *nothing has been
@@ -149,7 +155,9 @@ placeholder; the four tuned files outside this table are `ESMC-300M`, `ProtT5-XL
 
 **Fixed training settings**, identical in every file: 20 maximum epochs, early stopping with
 patience 3, MSE loss, targets z-scored on the training split, gradient accumulation derived from
-the effective batch size, no test evaluation during optimisation.
+the effective batch size, no test evaluation during optimisation. The first two, and the
+micro-batch that accumulation is made of, are what the panel prefills into its three editable
+boxes; the rest are fixed for everyone.
 
 ### Seeds and splits
 
@@ -165,12 +173,11 @@ evaluation:
 
 `split_seeds` choose the partition of rows, `model_seeds` the initialisation of the LoRA adapters
 and the head; training takes the first `n_split_seeds` and `n_model_seeds` of each, so the default
-single run is always split seed 1 with model seed 11, and the one-hot floor is fitted on the same
-split objects with the same model seeds. Splits are **8:1:1** — 99 training / 12 validation /
-13 test rows per seed for the bundled example — cached under `colabsd_work/splits/n<rows>/`,
-and a cached split that does not cover exactly the rows of the library now loaded is refused rather
-than reused. Test rows move to `run/locked_test/` as each run finishes and are read only by the
-unlock cell.
+single run is always split seed 1 with model seed 11. Splits are **8:1:1** — 99 training / 12
+validation / 13 test rows per seed for the bundled example — cached under
+`colabsd_work/splits/n<rows>/`, and a cached split that does not cover exactly the rows of the
+library now loaded is refused rather than reused. Test rows move to `run/locked_test/` as each run
+finishes and are read only by the unlock cell.
 
 ## Requirements
 
@@ -182,19 +189,18 @@ Outside Colab, `pip install .`.
 
 **GPU.** A free Colab T4 (16 GB) fits every offered backbone except `SaProt-1.3B`.
 `colabsd.structure` puts the ESMFold ceiling on a free T4 at **700 residues**, well above the
-287-residue example. Without a GPU the notebooks still load and check a library, run the one-hot
-baseline, draw the report, write both archives, and score from an existing bundle; ESMFold and
-fine-tuning each check for a GPU first.
+287-residue example. Without a GPU the notebooks still load and check a library, draw the report,
+write both archives, and score from an existing bundle; ESMFold and fine-tuning each check for a
+GPU first.
 
 ## Status
 
 | item | status |
 |---|---|
 | Library loading and sequence construction; split creation, caching and the stale-cache refusal; test-set locking, the unlock counter and its stamping into report, archive and bundle; report tables and figure, both exports and their read-back, bundle reload, variant scoring | run end to end on the bundled 124-variant MG8 PETase example |
-| The one-hot floor (ridge and MLP) over the full example library | run end to end, CPU only |
 | Backbone loading, pooled-vector width, LoRA injection coverage | load checked against the published checkpoints for all seven offered backbones, and for four of the six withheld ones that have an adapter |
 | `ProtT5-XL` and `Ankh-large` (withheld) | **tokenizers only** — their ~1.2B-parameter weights have never been downloaded or run |
-| LoRA fine-tuning end to end | **`ESM2-8M` only** — every other training path is untested here. That run was on the seqdisplay-opt study's 16,424-variant SlugCas9 5NNK library, which is not bundled here, and it used that study's region read-out, which this package no longer computes (full library, placeholder hyperparameters, one split seed × one model seed): the fine-tuned model reached test Spearman 0.5392 against a one-hot MLP floor of 0.5571 |
+| LoRA fine-tuning end to end | **`ESM2-8M` only** — every other training path is untested here. That run was on the seqdisplay-opt study's 16,424-variant SlugCas9 5NNK library, which is not bundled here, and it used that study's region read-out, which this package no longer computes (full library, placeholder hyperparameters, one split seed × one model seed): the fine-tuned model reached test Spearman 0.5392 |
 | How well any backbone predicts activity | **not measured here.** Every benchmark number on this page is the seqdisplay-opt study's, on SlugCas9 5NNK; the one run this repository has made is an illustration. The bundled MG8 example shows the workflow runs — its 13 test variants measure nothing |
 | Any Colab runtime timing | **not measured** — every minute quoted here is an estimate, scaled from one timed forward pass: ESM2-650M over the study library's 16,424 sequences of 1054 residues in float16, 319 s, on a B200 |
 | Benchmark ρ in the [configuration table](#configurations) | produced by the seqdisplay-opt study on NVIDIA B200-class GPUs, nine runs per model over three splits × three seeds. A single default Colab run reports `nan` for the standard deviation |

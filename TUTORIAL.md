@@ -46,9 +46,9 @@ to upload and nothing to prepare before training. Leave every field alone: the b
 The whole of Part 1 fits in one session: that is what this example is for, and 13 test variants are
 not a benchmark.
 
-Everything is seconds: the setup cell (a minute or two, most of it installing), the one-hot floor
-in step 7, and **step 6, training — an estimated 1 min on a T4 for the default backbone**. Step 6
-counts runs off as they finish and reports the measured elapsed minutes at the end; that number is
+Everything is seconds except the setup cell (a minute or two, most of it installing) and **step 6,
+training — an estimated 1 min on a T4 for the default backbone**. Step 6 says which batch of which
+epoch it is on while it trains, and reports the measured elapsed minutes at the end; that number is
 yours.
 
 ### Step 1 — check the four lines it prints
@@ -83,43 +83,54 @@ free-T4 ceiling is 700 residues.
 
 ### Steps 3 to 6 — hyperparameters, runs, storage, train
 
-**Step 3 has no fields.** It displays the seven LoRA values looked up from `config/best/`, the
-fixed training block and the provenance — for every backbone the notebook offers, today, a red
-`PROVISIONAL` banner reading `ESM2-35M · PROVISIONAL — hyperparameters are a placeholder,
-performance unknown` (see [Reading the PROVISIONAL warning](#reading-the-provisional-warning)).
+**Step 3 displays the seven LoRA values looked up from `config/best/`**, the fixed training block
+and the provenance — for every backbone the notebook offers, today, a red `PROVISIONAL` banner
+reading `ESM2-35M · PROVISIONAL — hyperparameters are a placeholder, performance unknown` (see
+[Reading the PROVISIONAL warning](#reading-the-provisional-warning)). None of those is editable.
+
+**Three boxes under that table are yours**, prefilled from the same entry: *Epochs, at most* (20),
+*Give up after this many epochs with no gain* (3), and *Sequences on the GPU at once (memory)* (8).
+The third is the one to lower if training dies with CUDA out of memory — it is how much has to fit
+on the card, while `effective_batch_size` (16, in the table, not editable) is what the optimiser
+averages over and gradient accumulation holds it there either way. A box you move says `changed ·
+20 looked up` beside itself, the row above it reads `20 → 40`, and the estimate in step 4 re-prices
+the run. A budget that could not train is refused before the button: no epochs, a patience longer
+than the run, a micro-batch that does not divide the effective batch or is bigger than your
+training split. Anything you change travels into the bundle manifest, `performance.json` and
+`report.json` as `training_budget`, with `chosen_by_user` naming the fields that were yours.
 
 **Step 4** asks how many runs — one run is one split seed × one model seed, capped at 3 of each.
 Leave both at 1 for a first pass; 3 × 3 is nine times the wait and what you want for a number you
 intend to report. **Step 5** is storage: **do not change the working directory between exporting
 and unlocking**, or you end up with two archives instead of one updated file.
 
-**Step 6 trains.** The counter under the button advances once per **finished run**, not per epoch,
-so on a single run it goes from `0/1 starting` to `1/1` with little else on screen in between. That
-is normal — on a bigger library it is normal for an hour. Keep the tab open: closing it disconnects
-the runtime, and a disconnected runtime stops training. If it is interrupted, press again — a
-finished run is reused only when its fingerprint (model, hyperparameters, mutated sites, split, and
-a hash of your data) is identical.
+**Step 6 trains,** and the line under the button says what it is doing while it does it: `0/1 runs
+finished · run 1/1 · epoch 3/20 · batch 412/1643 · loss 0.183 · 2m14s`. It is rewritten a few times
+a second at most — a large library runs a thousand micro-batches to the epoch, and a redraw for
+every one of them would slow the run it is reporting on. The fraction on the left counts **finished
+runs**, so it holds still for the whole of a single run; everything after it belongs to the run in
+flight, and when an epoch closes the batch count gives way to that epoch's validation score
+(`epoch 3/20 · val 0.7412 · loss 0.171`). One quiet stretch is expected, before the first batch
+line: `0/1 runs finished · starting`, while the backbone is downloaded and loaded — minutes for a
+650M checkpoint on a fresh runtime. Keep the tab open: closing it disconnects the runtime, and a
+disconnected runtime stops training. If it is interrupted, press again — a finished run is reused
+only when its fingerprint (model, hyperparameters, the three budget boxes, mutated sites, split,
+and a hash of your data) is identical.
 
 ### Step 7 — what came back
 
-The language model and the one-hot floor side by side, per condition and averaged over conditions,
-on validation. Test artefacts move to `run/locked_test/` as each run finishes; nothing you can read
-here carries test information.
+What the fine-tuned model scored on validation: the macro average over conditions, then a table of
+Spearman, R2 and NDCG@50 per condition. Test artefacts move to `run/locked_test/` as each run
+finishes; nothing you can read here carries test information.
 
 **`± nan` is deliberate**, not a bug: one run cannot show reproducibility, so the standard
 deviation is undefined rather than zero. Raise the seed counts in step 4 before quoting a ±.
 
-**The floor is the line that makes a pLM result mean something.** Ridge regression and a small MLP
-on the 20 × *k* one-hot encoding of the mutated residues — a 124 × 380 feature matrix for the
-example — fitted on exactly the splits the pLM used; the better of the two is the floor, and it
-needs no GPU. On split seed 1 with model seed 11 the ridge head reaches validation Spearman
-**0.5037** and the MLP **0.7350**, so the MLP is the floor. The splits are seeded, so the ridge
-number reproduces exactly; the MLP moves with a different torch build, and on 12 validation rows a
-rank correlation moves a long way for a small change — read the example's numbers as a shape, not a
-target. A 650M-parameter model that ties a ridge regression on one-hot residues has told you the
-landscape is additive, not that the model is good. If the language model does not clear the floor
-the panel says so plainly — a result, not an error, and what happened in the one end-to-end
-fine-tune this repository has run; see [Status](README.md#status).
+**Read this example's numbers as a shape, not a target.** Its validation partition is 12 rows, and
+a rank correlation over 12 rows moves a long way for a small change — fixing the seeds fixes the
+split and the initialisation, not GPU arithmetic. Twelve rows also drop `NDCG@50` from the table,
+with a note saying why: every variant falls inside a cut of 50, so the column cannot mean what its
+name promises. `report.csv` in the performance archive carries it anyway.
 
 ### Step 8 — the two exports
 
@@ -127,8 +138,9 @@ Both buttons refuse for the same two reasons and no others: **nothing has been t
 session**, or **the settings have changed since this model was trained**.
 
 **`model_bundle.zip`** is written, loaded straight back, and described from the file rather than
-from the form — `ESM2-35M · 19 mutated sites · PROVISIONAL hyperparameters · 1 conditions · test
-unlocked 0x · written <timestamp>`. It holds **the single best-validation run**, not an ensemble,
+from the form — `ESM2-35M · 19 mutated sites · PROVISIONAL hyperparameters · 20 epochs,
+micro-batch 8 (as looked up) · 1 conditions · test unlocked 0x · written <timestamp>`, where the
+budget clause reads `(budget set by hand)` if you moved any of the three boxes. It holds **the single best-validation run**, not an ensemble,
 so with 3 × 3 seeds the ± in your report describes a family of runs and the bundle is one member of
 it; and it needs the training checkpoint on disk, so export before you clear `colabsd_work/`.
 
@@ -136,10 +148,10 @@ it; and it needs the training checkpoint on disk, so export before you clear `co
 
 | member | what it holds |
 |---|---|
-| `report.csv` | one row per source × partition × condition: `n_runs`, then `_mean` and `_sd` for R2, Pearson, Spearman, P@10, P@50, NDCG@10, NDCG@50 — plus a `mean` row across conditions |
-| `report.png` | the chosen metric per condition and per source, error bars ±1 sd across runs, the one-hot floor as a dashed line, and a badge naming the partition and the unlock count |
-| `report.json` | `unlock_count`, `unlock_source`, `one_hot_floor`, `shown_partition`, `reported_partitions`, `n_runs`, `sources` |
-| `performance.json` | the manifest: partition, unlock count and verdict, model, hyperparameter status, floor, conditions, runs, seeds, `colabsd` version, your notes |
+| `report.csv` | one row per partition × condition, `source` naming the model: `n_runs`, then `_mean` and `_sd` for R2, Pearson, Spearman, P@10, P@50, NDCG@10, NDCG@50 — plus a `mean` row across conditions |
+| `report.png` | the chosen metric per condition, every tracked metric averaged over them, error bars ±1 sd across runs, a title naming the partition and a badge giving the unlock count |
+| `report.json` | `unlock_count`, `unlock_source`, `shown_partition`, `reported_partitions`, `n_runs`, `sources` |
+| `performance.json` | the manifest: partition, unlock count and verdict, model, hyperparameter status, the `training_budget` the run was given and which of it you set, conditions, runs, seeds, `colabsd` version, your notes |
 | `README.txt` | the same answers in prose, for whoever opens the zip and will not read JSON |
 
 Every member carries a sha256 and reading the archive back verifies it. Report files land in
@@ -179,13 +191,13 @@ handing back the older result's test numbers under the newer configuration's nam
 
 **Unlock once, when you have stopped changing things.** The panel then gives the test Spearman and
 a boxed final report — model, unlock count with a sentence saying what it is worth, per-condition
-table, macro average, one-hot floor, files written — rewrites `performance_report.zip` in place
-with the test numbers and the count, and offers the archive and `report.png` as downloads.
+table, macro average, files written — rewrites `performance_report.zip` in place with the test
+numbers and the count, and offers the archive and `report.png` as downloads.
 
-**Read the figure in this order:** did the pLM beat the one-hot floor, on the same partition, in
-the `mean` group — if not, nothing else matters yet; is the spread across conditions sensible (the
-bundled example has one condition, so its `mean` group is that condition; with several, one far
-below the others when your assay says otherwise is usually a data problem); how many runs; and what
+**Read the figure in this order:** the `mean` group, which is the number you would quote; then
+whether the spread across conditions is sensible (the bundled example has one condition, so its
+`mean` group is that condition; with several, one far below the others when your assay says
+otherwise is usually a data problem); then how many runs the error bars are drawn from; and what
 the unlock badge says.
 
 | unlock count | what a reader should conclude |
@@ -245,7 +257,7 @@ fitted to your data.
 
 1. Load your CSV, check the `wild-type residues` line, and stop if it surprises you.
 2. `ESM2-8M` — no 3Di, no step 3 at all, and the cheapest run the panel offers. This checks that
-   your data flows through training, the floor and the report. Do not unlock the test set.
+   your data flows through training and the report. Do not unlock the test set.
 3. Write the performance archive from that run anyway. It costs nothing.
 4. The real run: the backbone you mean to use, 3 split seeds × 3 model seeds, **Save to Google
    Drive** ticked if the estimate is long, the performance archive again, then one unlock at the
@@ -302,7 +314,7 @@ Every failure raises an error whose message says what to do. The ones worth know
 | **the panel freezes and nothing responds** | A `files.upload()` picker is open somewhere on the page; Colab's upload blocks the kernel. **Cancel upload** releases it. |
 | a backbone you used before is missing from the dropdown | Only ESM2 and SaProt are offered. The note under the dropdown names the seven that are not and why; their adapters are still in the package, and a bundle built from one still loads and scores in Predict. |
 | `does not fit a free T4 … Switch to an L4 or A100` | `SaProt-1.3B` is the only offered backbone that does not fit a free T4. Pick a smaller one, or an L4/A100 runtime with `dtype = float16`. |
-| CUDA out of memory part-way through training | The backbone does not fit alongside your sequence length. In order of effect: a smaller backbone, then `dtype = float16` (`micro_batch_size` comes from the config and is not a form field). After an OOM the failed run's tensors usually still hold GPU memory, so **Runtime ▸ Restart** is the reliable retry. |
+| CUDA out of memory part-way through training | The message says which box to lower: *Sequences on the GPU at once (memory)* in step 3, prefilled at 8. Halve it — gradient accumulation keeps the effective batch at 16, so this costs speed and not score. If it is already 1, the backbone does not fit this card: pick a smaller one, or an L4/A100 with `dtype = float16`. After an OOM the failed run's tensors usually still hold GPU memory, so **Runtime ▸ Restart** is the reliable retry. |
 | `<file> has N residues but the WT sequence has M`, or `wt_3di is N characters but the wild-type sequence is M residues` | The 3Di string does not cover the same chain as your wild type. Usually chain selection: put the right id in *Chain to read*. Otherwise a structure with missing or extra residues — an AlphaFold or ESMFold model of the exact wild-type sequence always matches. |
 | `<file> contains 2 chains: A (N residues), B (M residues). Pass chain="A"` | Foldseek produced one 3Di string per chain. Name your protein's chain in *Chain to read*. `has no chain 'X'` means the id you gave is not in the file. |
 | `<file> is a different protein from the WT: N of M residues disagree` | The chain you selected is not the protein your library mutates. Pick the right chain, or fold the wild-type sequence itself. A handful of disagreements is reported, not refused — read that line, it names the positions. |
@@ -363,9 +375,9 @@ manifest; none of it has to be reconstructed afterwards.
 | the tool, its version and its licence | `colabsd <version>` on the first line of the setup cell, and `colabsd_version` in `performance.json`; version, licence and archive DOI in `CITATION.cff` (see [Code availability](README.md#code-availability)) |
 | the backbone, and the mutated sites its embeddings are averaged over | step 2's summary, the `model` block of `performance.json`, and the bundle's description line |
 | whether the hyperparameters were tuned or a placeholder | step 3's banner; `hyperparameters.status` in `performance.json` and the same flag in the bundle manifest |
+| epochs, patience and the two batch sizes the run was given, and which of them you set | step 3's boxes; `training_budget` in `performance.json`, `report.json` and the bundle manifest, and the table under *WHAT THE RUN WAS GIVEN* in `README.txt` |
 | split seeds, model seeds and how many runs | step 4's plan line, `n_runs` in `report.csv`, and the `run` block of `performance.json` |
 | the split ratio and sizes | 8 : 1 : 1; step 4 prints the counts for your library |
-| the one-hot floor you compared against | `one_hot_floor` in `report.json` and `performance.json`, drawn as the dashed line in `report.png` |
 | whether the number is validation or test, and how many times the test set was read | `partition` and `unlock.count` in `performance.json`, with `unlock.verdict`; plus the badge in `report.png` and `unlock.json` itself |
 | that the numbers came from a Colab GPU of a given type | the GPU line printed by the setup cell |
 
