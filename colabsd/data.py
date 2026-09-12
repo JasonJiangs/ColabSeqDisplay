@@ -7,8 +7,8 @@ same residue offsets in every variant.
 
 This module is also where the package decides what an ambiguous variant table is: a CSV
 header that names the same column twice is refused rather than silently mangled by pandas,
-and a `min_count` with nothing to filter on says so out loud. `colabsd.baseline` and
-`colabsd.predict` inherit both rules through `require_unique_columns`.
+and a `min_count` with nothing to filter on says so out loud. `colabsd.predict` inherits the
+first rule through `require_unique_columns`.
 """
 
 from __future__ import annotations
@@ -45,6 +45,16 @@ THREE_TO_ONE: dict[str, str] = {
     "Val": "V",
 }
 ONE_LETTER_CODES: frozenset[str] = frozenset(THREE_TO_ONE.values())
+
+
+def one_to_three_letter() -> dict[str, str]:
+    """Invert `THREE_TO_ONE`, the one residue table this package owns.
+
+    `colabsd.ui.predict_workflow` draws example variants in whichever notation the bundle's
+    `LibrarySpec` declares, so it needs this table read the other way round. Building it here
+    rather than writing a second table out by hand keeps one list of twenty residues.
+    """
+    return {one: three for three, one in THREE_TO_ONE.items()}
 
 
 class LibraryError(DataError, ValueError):

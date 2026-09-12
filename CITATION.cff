@@ -25,8 +25,7 @@ abstract: >-
   language model on a sequence-display variant library and predict activity for new
   variants. Hyperparameters are looked up for the chosen backbone from a committed
   registry rather than tuned in the notebook, the test partition is locked until it is
-  deliberately unlocked, and the workflow reports a one-hot baseline beside the
-  fine-tuned result.
+  deliberately unlocked, and every report records how many times it was unlocked.
 type: software
 version: 0.1.0
 

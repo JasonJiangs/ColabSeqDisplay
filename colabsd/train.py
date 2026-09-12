@@ -29,12 +29,14 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from colabsd.bestconfig import BudgetOverrides, BudgetSettings, resolve_budget
 from colabsd.errors import ColabSDError, ConfigError, DataError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pandas as pd
 
     from colabsd.bestconfig import BestConfig
+    from colabsd.engine.train_config import BatchProgress, EpochProgress
     from colabsd.spec import LibrarySpec
 
 PROTEIN_ID = "user_protein"
@@ -44,6 +46,13 @@ RUNS_DIRNAME = "runs"
 METRICS = ("R2", "Pearson", "Spearman", "P@10", "P@50", "NDCG@10", "NDCG@50")
 SKIPPED_FINGERPRINT = "interrupted"
 LOCKED_WARNING = "Locked test partition. Read it through colabsd.train.unlock_test, which records every unlock."
+
+# The engine reports every micro-batch, and an epoch on a real backbone runs to thousands of
+# them, each a few milliseconds apart. One widget write per batch would flood the notebook's
+# comm channel and slow down the very run it is describing, so a batch line that lands within
+# this many seconds of the last one sent is dropped. Four updates a second already read as
+# continuous motion to someone watching the panel.
+PROGRESS_MIN_INTERVAL_S = 0.25
 
 ProgressFn = Callable[[int, int, str], None]
 
@@ -58,6 +67,9 @@ class RunResult:
         condition_columns: measured conditions, in target-column order.
         params: the seven LoRA hyperparameters actually trained with.
         fixed: the training block (epochs, patience, batch sizes, ...).
+        budget: the epochs, patience and batch sizes the run actually used, alongside
+            what the lookup declared and which of them the user set for themselves.
+            `finetune` always fills it in; it is `None` only on a hand-built `RunResult`.
         is_provisional: True when the hyperparameters are a placeholder.
         runs: one dict per (split seed, model seed), validation metrics only.
         aggregate: tidy frame with columns
@@ -90,6 +102,7 @@ class RunResult:
     test_runs: list[dict[str, Any]] | None = None
     test_aggregate: pd.DataFrame | None = None
     minutes: float = 0.0
+    budget: BudgetSettings | None = None
     warnings: list[str] = field(default_factory=list)
     adapter_dtype: str | None = None
     adapter_hf_id: str | None = None
@@ -115,6 +128,7 @@ class RunResult:
             "condition_columns": list(self.condition_columns),
             "params": self.params,
             "fixed": self.fixed,
+            "budget": self.budget.to_dict() if self.budget is not None else None,
             "is_provisional": self.is_provisional,
             "selection_metric": self.selection_metric,
             "split_seeds": list(self.split_seeds),
@@ -169,11 +183,18 @@ def finetune(
     splits: dict[int, dict[str, list[int]]],
     output_dir: str | Path,
     model_seeds: Sequence[int] | None = None,
+    budget: BudgetOverrides | dict[str, Any] | None = None,
     progress: ProgressFn | None = None,
     config: dict[str, Any] | None = None,
     resume: bool = True,
 ) -> RunResult:
     """Train `splits x model_seeds` LoRA runs and report validation only.
+
+    `budget` is how long the user is willing to train and what fits on their card:
+    `max_epochs`, `early_stopping_patience`, `effective_batch_size` and `micro_batch_size`,
+    as a `colabsd.bestconfig.BudgetOverrides` or the same fields as a mapping. Anything left
+    out keeps the looked-up value, and no other hyperparameter can be set this way. The result
+    carries `budget`, which says what ran and which of it was the user's.
 
     `config` overrides the runtime config that would otherwise be built through
     `colabsd.protein_db`; `resume` reuses a finished run only when its fingerprint --
@@ -199,15 +220,21 @@ def finetune(
             "colabsd.data.make_splits(n, seeds, out_dir) unchanged."
         ) from exc
     split_seeds = sorted(splits)
-    runtime = _runtime_config(
+    # Every split is checked before the first one trains: a user who mistyped a batch size
+    # should hear about it now, not three runs into an hour of GPU time.
+    cleaned_splits = {seed: _clean_split(splits[seed], len(sequences), seed) for seed in split_seeds}
+    smallest_train = min(len(split["train_idx"]) for split in cleaned_splits.values())
+    runtime, settings = _runtime_config(
         spec=spec,
         best=best,
         output_dir=output_dir,
         split_seeds=split_seeds,
         model_seeds=seeds,
         override=config,
+        budget=budget,
+        n_train=smallest_train,
     )
-    params = dict(best.params)
+    params = {**dict(best.params), "effective_batch_size": settings.effective_batch_size}
     fixed = dict(runtime["fixed"])
     selection_metric = _selection_metric(runtime)
     pooled_positions = _pooled_positions(adapter, spec, runtime)
@@ -222,7 +249,7 @@ def finetune(
     run_dirs: list[Path] = []
     started = time.time()
     for split_seed in split_seeds:
-        split = _clean_split(splits[split_seed], len(sequences), split_seed)
+        split = cleaned_splits[split_seed]
         for model_seed in seeds:
             name = f"split{split_seed}_seed{model_seed}"
             run_dir = runs_root / name
@@ -243,6 +270,7 @@ def finetune(
                 run_dir.mkdir(parents=True, exist_ok=True)
                 _lock_interrupted_artifacts(run_dir, locked_dir / name, condition_columns)
                 t0 = time.time()
+                on_epoch, on_batch = _run_reporters(progress, len(rows), total, t0)
                 metrics = train_eval_config(
                     adapter=adapter,
                     sequences=sequences,
@@ -254,7 +282,8 @@ def finetune(
                     seed=model_seed,
                     output_dir=run_dir,
                     source_trial=None,
-                    on_epoch=_epoch_reporter(progress, len(rows), total, name, t0),
+                    on_epoch=on_epoch,
+                    on_batch=on_batch,
                 )
                 minutes = (time.time() - t0) / 60.0
                 _lock_test_artifacts(
@@ -287,6 +316,7 @@ def finetune(
         condition_columns=condition_columns,
         params=params,
         fixed=fixed,
+        budget=settings,
         is_provisional=bool(getattr(best, "is_provisional", False)),
         selection_metric=selection_metric,
         split_seeds=split_seeds,
@@ -302,7 +332,7 @@ def finetune(
         created_utc=_utc_now(),
         unlock_count=read_unlock_count(output_dir),
         minutes=(time.time() - started) / 60.0,
-        warnings=_provisional_warning(best),
+        warnings=_provisional_warning(best) + _budget_warning(settings),
         adapter_dtype=_text_attr(adapter, "dtype"),
         adapter_hf_id=_text_attr(adapter, "hf_id"),
     )
@@ -667,6 +697,17 @@ def _provisional_warning(best: BestConfig) -> list[str]:
     return []
 
 
+def _budget_warning(settings: BudgetSettings) -> list[str]:
+    """Say, in the report and in `run_result.json`, that this run is not the looked-up budget."""
+    if settings.is_looked_up:
+        return []
+    return [
+        "Training budget set by hand, not looked up: "
+        + "; ".join(settings.describe_changes())
+        + ". Every other hyperparameter is the looked-up configuration."
+    ]
+
+
 def _runtime_config(
     *,
     spec: LibrarySpec,
@@ -675,21 +716,32 @@ def _runtime_config(
     split_seeds: list[int],
     model_seeds: list[int],
     override: dict[str, Any] | None,
-) -> dict[str, Any]:
+    budget: BudgetOverrides | dict[str, Any] | None = None,
+    n_train: int | None = None,
+) -> tuple[dict[str, Any], BudgetSettings]:
+    """Build the runtime config and the budget it runs under; the budget wins over both blocks."""
     fixed_best = dict(getattr(best, "fixed", {}) or {})
+    params_best = dict(getattr(best, "params", {}) or {})
     if override is not None:
         config = copy.deepcopy(override)
+        # A caller-supplied config may set what the entry leaves out, so the budget is
+        # resolved against the same merge the run will use.
+        settings = resolve_budget(params_best, {**dict(config.get("fixed", {})), **fixed_best}, budget, n_train=n_train)
     else:
+        settings = resolve_budget(params_best, fixed_best, budget, n_train=n_train)
         config = _config_from_protein_db(
             spec=spec,
             best=best,
             output_dir=output_dir,
             split_seeds=split_seeds,
             model_seeds=model_seeds,
+            budget=settings,
         )
     config.setdefault("data", {})
     config.setdefault("protein", {})
-    fixed = {**dict(config.get("fixed", {})), **fixed_best}
+    # The looked-up training block is merged in last of the two, then the budget over both:
+    # what the user set has to survive, and what they left alone is the lookup's.
+    fixed = {**dict(config.get("fixed", {})), **fixed_best, **settings.as_fixed()}
     if fixed.get("evaluate_test_during_optimization"):
         raise ConfigError(
             "training.evaluate_test_during_optimization must stay false. Remove it from the best-config YAML; "
@@ -709,7 +761,7 @@ def _runtime_config(
         }
     )
     config["study"] = study
-    return config
+    return config, settings
 
 
 def _config_from_protein_db(
@@ -719,11 +771,13 @@ def _config_from_protein_db(
     output_dir: Path,
     split_seeds: list[int],
     model_seeds: list[int],
+    budget: BudgetSettings,
 ) -> dict[str, Any]:
     """Write the one-protein record the engine resolves coordinates from, and configure a run against it.
 
     The record's coordinates are `spec.positions_1based` and nothing else: the model averages the
-    embeddings at the sites the library varies.
+    embeddings at the sites the library varies. The blocks handed on carry the budget this run
+    will use, so upstream's loader validates the epochs and batch sizes that will actually train.
     """
     try:
         from colabsd import protein_db
@@ -735,7 +789,12 @@ def _config_from_protein_db(
     database_path = protein_db.write_protein_record(spec, out_dir=output_dir, protein_id=PROTEIN_ID)
     return protein_db.runtime_config(
         spec,
-        params=best,
+        params={
+            "model": str(best.model),
+            "parameters": {**dict(best.params), "effective_batch_size": budget.effective_batch_size},
+            "training": {**dict(getattr(best, "fixed", {}) or {}), **budget.as_fixed()},
+            "evaluation": dict(getattr(best, "evaluation", {}) or {}),
+        },
         protein_id=PROTEIN_ID,
         database_path=Path(database_path).resolve(),
         split_seeds=list(split_seeds),
@@ -769,8 +828,8 @@ def summarize_across_runs(values: Iterable[float]) -> dict[str, float]:
     """Mean, sample sd and count over the finite values of one metric across repeated runs.
 
     The sd of a single run is **undefined**, not zero: reporting 0.0 would claim a
-    reproducibility that one run cannot show. `colabsd.train`, `colabsd.baseline` and
-    `colabsd.report` all aggregate through this one function so their tables agree.
+    reproducibility that one run cannot show. `colabsd.train` and `colabsd.report` both
+    aggregate through this one function so their tables agree.
     """
     finite = [float(value) for value in values if np.isfinite(value)]
     if not finite:
@@ -891,30 +950,44 @@ def _elapsed(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
 
 
-def _epoch_reporter(
+def _run_reporters(
     progress: ProgressFn | None,
     done: int,
     total: int,
-    name: str,
     started: float,
-) -> Callable[[int, int, float], None] | None:
-    """Forward each finished epoch to `progress` as a line the panel can display.
+) -> tuple[EpochProgress | None, BatchProgress | None]:
+    """Build the `(on_epoch, on_batch)` pair that turns one run's training into panel lines.
 
-    `done` stays the number of *completed runs*, so the run counter does not advance until
-    the run really finishes; the epoch and the validation score go in the label.
+    Batch lines read `run 1/2 · epoch 3/20 · batch 412/1643 · loss 0.183 · 2m14s`; an epoch
+    closes on `run 1/2 · epoch 3/20 · val 0.7412 · loss 0.171 · 2m31s`, carrying the score the
+    epoch is kept or discarded on in place of the batch count. `done` stays the number of
+    *completed runs*, so the run counter does not advance until the run really finishes:
+    which run is under way, and everything inside it, goes in the label.
+
+    Batch lines are throttled to one per `PROGRESS_MIN_INTERVAL_S`, except the last batch of an
+    epoch, which is always sent. A count that freezes at `batch 1600/1643` is what makes a
+    working run look hung, which is the whole reason these lines exist.
     """
     if progress is None:
-        return None
+        return None, None
 
-    def report(epoch: int, max_epochs: int, score: float) -> None:
-        _notify(
-            progress,
-            done,
-            total,
-            f"{name} · epoch {epoch + 1}/{max_epochs} · val {score:.4f} · {_elapsed(time.time() - started)}",
-        )
+    where = f"run {done + 1}/{total}"
+    sent_at = 0.0
 
-    return report
+    def emit(detail: str) -> None:
+        nonlocal sent_at
+        sent_at = time.time()
+        _notify(progress, done, total, f"{where} · {detail} · {_elapsed(sent_at - started)}")
+
+    def report_epoch(epoch: int, max_epochs: int, score: float, loss: float) -> None:
+        emit(f"epoch {epoch + 1}/{max_epochs} · val {score:.4f} · loss {loss:.3f}")
+
+    def report_batch(epoch: int, max_epochs: int, step: int, n_batches: int, loss: float) -> None:
+        if step < n_batches and time.time() - sent_at < PROGRESS_MIN_INTERVAL_S:
+            return
+        emit(f"epoch {epoch + 1}/{max_epochs} · batch {step}/{n_batches} · loss {loss:.3f}")
+
+    return report_epoch, report_batch
 
 def _notify(progress: ProgressFn | None, done: int, total: int, label: str) -> None:
     if progress is not None:

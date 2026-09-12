@@ -2,15 +2,23 @@
 
 Vendored from the research project **SequenceDisplay-Workflow-Optimization**
 (`seqdisplay_opt/finetuning/training.py`). ``train_epoch`` is the loop that
-produced the tuned configurations in ``config/best/``, including its exact
-sample-weighted gradient accumulation, so it is copied verbatim; only the
-``SequenceAdapter`` import is repointed at the vendored protocol. See
-``ATTRIBUTION.md``.
+produced the tuned configurations in ``config/best/``, so its exact
+sample-weighted gradient accumulation is copied unchanged. Two things differ
+from upstream, both recorded in ``ATTRIBUTION.md``: the ``SequenceAdapter``
+import is repointed at the vendored protocol, and the loop takes an optional
+``on_batch`` callback.
+
+The callback exists because an epoch here runs to thousands of micro-batches and
+a notebook user watching one has nothing to look at until it ends. It is called
+after a micro-batch's arithmetic is finished, its return value is ignored, and
+nothing in the loop reads anything it might touch, so a caller that passes one
+trains exactly what a caller that does not trains. It fires for every batch;
+deciding how often that reaches a widget is the caller's job.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import torch
@@ -19,6 +27,10 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
 from colabsd.engine.adapters import SequenceAdapter
+
+#: ``on_batch(step, n_batches, running_loss)`` -- the 1-based micro-batch just finished,
+#: how many the epoch holds, and the mean squared error over every target seen so far.
+BatchCallback = Callable[[int, int, float], None]
 
 
 def batch_indices(
@@ -57,8 +69,14 @@ def train_epoch(
     device: torch.device,
     max_grad_norm: float,
     shuffle: bool = True,
+    on_batch: BatchCallback | None = None,
 ) -> float:
-    """Train one epoch using exact sample-weighted gradient accumulation."""
+    """Train one epoch using exact sample-weighted gradient accumulation.
+
+    Returns the epoch's mean squared error over every target. When *on_batch* is given it
+    is called once per finished micro-batch with that same running mean, so the caller can
+    report progress from inside the epoch; see :data:`BatchCallback`.
+    """
     if accumulation_steps < 1:
         raise ValueError("accumulation_steps must be at least 1")
 
@@ -107,6 +125,9 @@ def train_epoch(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             window_numel = 0
+
+        if on_batch is not None:
+            on_batch(step, n_batches, total_loss / total_numel)
 
     if total_numel == 0:
         raise ValueError("train_indices must contain at least one sample")

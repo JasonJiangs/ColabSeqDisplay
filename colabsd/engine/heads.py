@@ -1,11 +1,10 @@
-"""Pluggable regression heads: the registry, the shared AdamW loop, ridge and the MLP.
+"""The MLP regression head, the shared AdamW loop it trains in, and the device guard.
 
 Vendored from the *SequenceDisplay Workflow Optimization* research package
 (``seqdisplay-opt``), which owns this science. Original modules:
 
-* ``seqdisplay_opt/models/heads.py`` — ``HEAD_REGISTRY``, ``register_head``, ``BaseHead``,
-  ``TorchHeadBase``, ``MLPHead``, ``RidgeHead`` and the target-standardization helper.
-* ``seqdisplay_opt/models/factory.py`` — ``create_head``.
+* ``seqdisplay_opt/models/heads.py`` — ``BaseHead``, ``TorchHeadBase``, ``MLPHead`` and the
+  target-standardization helper.
 * ``seqdisplay_opt/utils/device.py`` — ``select_safe_device``, a transitive dependency of
   the torch training loop.
 
@@ -13,16 +12,15 @@ Copied so that ColabSeqDisplay installs without the research checkout.
 ``tests/test_engine_heads.py`` fits both copies on real data and asserts identical
 predictions for the same seed whenever that checkout is present.
 
-Left behind on purpose: the heads ColabSeqDisplay never reaches. Upstream registers eleven
-(``linear``, ``cnn``, ``random_forest``, ``hgb``, ``knn``, ``xgboost``, ``elastic_net``,
-``gpr``, ``pca_gpr`` besides these two); the notebooks run ``mlp`` for every fine-tuning
-and best-config path and ``ridge`` + ``mlp`` for the one-hot floor, so only those two are
-here. Dropping the rest also drops upstream's hard ``xgboost`` dependency.
-
-Changed while copying: ``RidgeHead`` read its alpha-grid size from the ``PLM_RIDGE_N_ALPHAS``
-environment variable, an HPC sweep knob no notebook sets. The grid is now the explicit
-module constant ``RIDGE_N_ALPHAS``, whose value is upstream's default, so the numbers are
-unchanged.
+Left behind on purpose: the heads ColabSeqDisplay never reaches, and the machinery for
+choosing between them. Upstream registers eleven (``ridge``, ``linear``, ``cnn``,
+``random_forest``, ``hgb``, ``knn``, ``xgboost``, ``elastic_net``, ``gpr``, ``pca_gpr``
+besides this one) and looks them up by name through a ``HEAD_REGISTRY`` and a
+``create_head`` factory. Every path here builds ``MLPHead`` directly — the LoRA fine-tune in
+``colabsd.engine.train_config.configure_model`` and inference in ``colabsd.predict`` — and
+``head: mlp`` is the only value ``load_lora_best_config`` accepts, so neither the registry
+nor the factory is copied. Dropping the other ten also drops upstream's hard ``xgboost``
+and ``sklearn`` head dependencies.
 """
 
 from __future__ import annotations
@@ -34,7 +32,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.linear_model import Ridge
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -42,9 +39,6 @@ from colabsd.engine.metrics import evaluate_predictions, mean_metric
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from colabsd.engine.schema import TrainingConfig
-
-# Upstream's default alpha grid: 17 points of np.logspace(-4, 4).
-RIDGE_N_ALPHAS = 17
 
 # A head reads only `lr`, `weight_decay`, `batch_size`, `max_epochs` and `patience` off the
 # config, so anything carrying those five numbers works in place of a `TrainingConfig`.
@@ -64,29 +58,6 @@ def select_safe_device() -> torch.device:
             "or hide CUDA devices to run explicitly on CPU."
         )
     return torch.device("cuda")
-
-
-# Registry
-
-HEAD_REGISTRY: dict[str, type[BaseHead]] = {}
-
-
-def register_head(name: str):
-    """Class decorator that adds a ``BaseHead`` subclass to ``HEAD_REGISTRY``."""
-
-    def decorator(cls: type[BaseHead]) -> type[BaseHead]:
-        HEAD_REGISTRY[name] = cls
-        return cls
-
-    return decorator
-
-
-def create_head(name: str) -> BaseHead:
-    """Create a registered regression head."""
-    if name not in HEAD_REGISTRY:
-        known = sorted(HEAD_REGISTRY)
-        raise ValueError(f"Unknown head '{name}'. Available: {known}")
-    return HEAD_REGISTRY[name]()
 
 
 # Base interface
@@ -251,7 +222,6 @@ class TorchHeadBase(BaseHead, ABC):
 # Head architectures
 
 
-@register_head("mlp")
 class MLPHead(TorchHeadBase):
     """Default bottleneck MLP used for frozen and LoRA workflows."""
 
@@ -270,21 +240,3 @@ class MLPHead(TorchHeadBase):
             nn.Dropout(0.1),
             nn.Linear(32, n_outputs),
         )
-
-
-@register_head("ridge")
-class RidgeHead(BaseHead):
-    """Ridge regression with alpha selected on validation mean Spearman."""
-
-    def run(self, x_train, y_train, x_val, y_val, x_test, seed, cfg):
-        alphas = np.logspace(-4, 4, RIDGE_N_ALPHAS)
-        best_score, best_model = -np.inf, None
-        log: list[dict] = []
-        for alpha in alphas:
-            model = Ridge(alpha=float(alpha), solver="lsqr")
-            model.fit(x_train, y_train)
-            score = mean_metric(evaluate_predictions(y_val, model.predict(x_val).astype(np.float32)), "Spearman")
-            log.append({"alpha": float(alpha), "val_mean_Spearman": score})
-            if score > best_score:
-                best_score, best_model = score, model
-        return best_model.predict(x_test).astype(np.float32), best_model, log

@@ -12,8 +12,8 @@ hyperparameter in `config/best/` come from a separate research project:
 
 `ColabSeqDisplay` is the notebook layer over that work: it loads backbones from
 HuggingFace, builds variant sequences from a user's CSV, looks up a pre-tuned
-configuration, orchestrates a run, reports it against a one-hot floor, and packs the
-result into a `.zip`. It performs no method development. If you
+configuration, orchestrates a run, reports it against a locked test partition, and packs
+the result into a `.zip`. It performs no method development. If you
 publish a result produced with this tool, the method you are using is theirs — see
 [Citation](#citation).
 
@@ -40,14 +40,13 @@ authoritative for the details.
 | `colabsd/engine/training.py` | `seqdisplay_opt/finetuning/training.py` | `train_epoch` — the loop that produced every tuned configuration, including its sample-weighted gradient accumulation — plus `batch_indices` and `as_float_tensor` |
 | `colabsd/engine/adapters.py` | `seqdisplay_opt/finetuning/adapters.py` | The `SequenceAdapter` `Protocol` only. Upstream's concrete adapters load `fair-esm` checkpoints from a local model catalogue; `colabsd/backbones/` replaces them |
 | `colabsd/engine/train_config.py` | `seqdisplay_opt/finetuning/lora_reevaluate.py`, `seqdisplay_opt/finetuning/lora_optuna.py` | `train_eval_config`, `load_lora_best_config`, `SourceTrial`, `LabelScaler`, the model-configuration, state-dict, prediction and split-evaluation helpers |
-| `colabsd/engine/heads.py` | `seqdisplay_opt/models/heads.py`, `models/factory.py`, `utils/device.py` | `HEAD_REGISTRY`, `register_head`, `BaseHead`, `TorchHeadBase`, `MLPHead`, `RidgeHead`, `create_head`, `select_safe_device` |
+| `colabsd/engine/heads.py` | `seqdisplay_opt/models/heads.py`, `utils/device.py` | `BaseHead`, `TorchHeadBase`, `MLPHead` and the target-standardization helper, plus `select_safe_device`. Upstream's `HEAD_REGISTRY`, `register_head` and `create_head` factory are not here: `head: mlp` is the only value a best-config accepts |
 | `colabsd/engine/metrics.py` | `seqdisplay_opt/metrics/evaluation.py`, `seqdisplay_opt/finetuning/validation.py` | `evaluate_predictions`, `precision_k`, `ndcg_k`, `mean_metric`, `TRACKED_METRICS`, `summarize_metrics`, `validation_log_row` |
 | `colabsd/engine/pooling.py` | `seqdisplay_opt/pooling/{reducers,regions}.py` | `mean_reduce` and `select_positions`, verbatim. Upstream's strategy base class, registry, factory and five named poolings are not here: this pipeline pools one way, so `pool` composes the two reducers directly |
 | `colabsd/engine/splits.py` | `seqdisplay_opt/data/splits.py`, `seqdisplay_opt/utils/torch_io.py` | `create_split`, `create_all_splits`, `load_split`, `create_nested_selection_split`; `load_torch` inlined as the private `_load_torch` |
 | `colabsd/engine/protein_db.py` | `seqdisplay_opt/data/protein_database.py` | The record loader: `load_database` and `load_protein_record`. Upstream's `POOLING_REGIONS` table and its named-region resolvers are not here — a record lists the sites the library mutates, and there is no region to name |
 | `colabsd/engine/config_space.py` | `seqdisplay_opt/config/optuna_space.py` | Three resolution helpers and `OBJECTIVE_METRICS`. The Optuna search space itself stayed upstream |
 | `colabsd/engine/schema.py` | `seqdisplay_opt/config/schema.py` | `TrainingConfig` |
-| `colabsd/engine/one_hot.py` | `seqdisplay_opt/baselines/one_hot.py` | The `AA3` vocabulary, `AA3_TO_INDEX`, and the per-site one-hot encoder |
 | `colabsd/engine/loader.py` | `seqdisplay_opt/data/loader.py` | The FASTA reader, `load_single_fasta`, `load_foldseek_sequence` |
 | `colabsd/engine/formats.py` | `seqdisplay_opt/models/backbones/{saprot,prott5,ankh,seqdance}.py` | Per-family input formatting only: the Foldseek vocabularies, SaProt AA/3Di interleaving, the ProtT5 and Ankh sequence formats, and the SeqDance model definition |
 | `colabsd/engine/sequences.py` | `seqdisplay_opt/data/sequences.py` | `require_uniform_sequence_length` |
@@ -58,9 +57,9 @@ Only what the notebooks reach was copied. Not here, and still upstream's: the Op
 machinery (study databases, trial pruning, the `fcntl` locking that lets two HPC workers
 share a study), every `argparse` command line and console-script entry point, the
 `fair-esm` and local-catalogue checkpoint loaders, the cached-embedding selection CLI, the
-one-hot baseline's run harness and predictor registry, nine of upstream's eleven
-regression heads — dropping those also drops a hard `xgboost` dependency — and the whole
-pooling-strategy layer: the registry, the factory, the five named poolings and the
+whole `seqdisplay_opt.baselines` package, and ten of upstream's eleven regression heads
+together with the registry and factory that choose between them — dropping those also
+drops hard `xgboost` and `sklearn` dependencies — and the whole pooling-strategy layer: the registry, the factory, the five named poolings and the
 protein-region tables they resolve through.
 
 ## What we changed while copying, and why
@@ -87,24 +86,18 @@ covered by a test.
    `_read_fasta_records` → `read_fasta_records`, and the `lru_cache`d protein database is
    reached through `load_database()` and cleared through `clear_database_cache()` instead
    of `_load_database.cache_clear`. Bodies are unchanged.
-3. **`encode_five_site_one_hot` → `encode_site_one_hot`.** The upstream body already
-   looped over its `columns` argument; only the name promised five sites. The five-site
-   result is identical.
-4. **The default target names are explicit.** `evaluate_predictions` names the first four
+3. **The default target names are explicit.** `evaluate_predictions` names the first four
    unnamed targets after SlugCas9's four PAMs through a module-private table, which
    surprises anyone whose conditions are not PAMs. Same names, same order, now the public
    `DEFAULT_TARGET_NAMES` and `default_target_names()`.
-5. **`RidgeHead`'s alpha grid is a constant, not an environment variable.** Upstream reads
-   `PLM_RIDGE_N_ALPHAS`, an HPC sweep knob no notebook sets; it is now
-   `RIDGE_N_ALPHAS = 17`, upstream's own default, so the fitted models are unchanged.
-6. **The protein database has no packaged fallback.** Upstream falls back to a
+4. **The protein database has no packaged fallback.** Upstream falls back to a
    `proteins.yaml` shipped in its repository — SlugCas9's record. `colabsd` ships no such
    file and synthesizes one per run, so `database_path` is required rather than silently
    pooling a different protein, and a relative path resolves against the working directory
    rather than against upstream's checkout root.
-7. **Imports are lazy where they were eager**, so that importing `colabsd.engine.pooling`
+5. **Imports are lazy where they were eager**, so that importing `colabsd.engine.pooling`
    or `colabsd.engine.formats` does not pull in `torch`. No behaviour depends on it.
-8. **There is one pooling, so nothing dispatches on a name.** Upstream registers five
+6. **There is one pooling, so nothing dispatches on a name.** Upstream registers five
    `PoolingStrategy` classes and `pool(name, ...)` looks one up, each resolving a named
    region of a protein through `POOLING_REGIONS`. This pipeline averages the embeddings at
    the residues the library mutates and offers no alternative, so `pool(token_embs,
@@ -113,7 +106,16 @@ covered by a test.
    `config_space.pooling_positions_0based` reads those positions rather than the pooling's
    name. `mutation_site_mean` survives as a *label* — the `config/best/` filename suffix
    and the string every artefact records — not as a choice.
-9. **`load_lora_best_config` defaults nothing to upstream's own study.** Its
+7. **The training loop can report where it is.** `train_epoch` takes an optional
+   `on_batch(step, n_batches, running_loss)` callback and `train_eval_config` takes
+   `on_epoch` and `on_batch`, all defaulting to `None`. An epoch on a real backbone is
+   thousands of micro-batches, and a notebook user watching one had nothing to look at
+   until it ended: a working run and a hung run looked identical. The callback fires after
+   a micro-batch's arithmetic is finished, its return value is ignored, and nothing in the
+   loop reads anything it might touch, so a caller that passes one trains exactly what a
+   caller that does not trains. Throttling what reaches a widget is the caller's job, in
+   `colabsd.train`.
+8. **`load_lora_best_config` defaults nothing to upstream's own study.** Its
    `training.pooling` default is `POOLING_NAME` and its `protein:` default is empty, where
    upstream's are the strategy its study selected and the protein record packaged in its
    checkout. All 28 shipped entries set the pooling explicitly and none declares a protein,
@@ -180,7 +182,7 @@ figures in `README.md`, in `config/best/README.md`, in each `_meta` block and in
 notebook's own dropdown — 0.5478 to 0.5636 on SlugCas9 5NNK — are upstream's
 re-evaluation results, not measurements made here. Exactly one training run has ever gone
 through `colabsd`'s own path end to end, and it is labelled as an illustration where it
-appears. The one-hot floor numbers, and the single timed forward pass
+appears. That run's numbers, and the single timed forward pass
 `colabsd.ui.core.TIMED_PASS` records, are this repository's own.
 
 ## Licence
@@ -203,8 +205,7 @@ project: the HuggingFace backbone adapters and registry (`colabsd/backbones/`), 
 library specification and CSV handling (`colabsd/spec.py`, `colabsd/data.py`),
 wild-type 3Di construction (`colabsd/structure.py`),
 best-config lookup (`colabsd/bestconfig.py`), the run orchestration and locked-test
-protocol (`colabsd/train.py`), the one-hot floor's harness (`colabsd/baseline.py`),
-reporting (`colabsd/report.py`), the model bundle (`colabsd/bundle.py`), scoring
+protocol (`colabsd/train.py`), reporting (`colabsd/report.py`), the model bundle (`colabsd/bundle.py`), scoring
 (`colabsd/predict.py`), the notebook wizards (`colabsd/ui/`), the notebook generator, the
 tests and the documentation.
 

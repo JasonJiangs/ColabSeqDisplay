@@ -20,8 +20,12 @@ What it writes. The same `performance_report.zip` the export cell above writes, 
 through `colabsd.ui.exports` so that it now carries the test numbers and the unlock count.
 The validation archive is obtainable without ever running this cell.
 
-The decision layer is pure — `status_notices`, `blocking`, `condition_rows`, `report_html`,
-`floor_line` — and `UnlockPanel` only wires it to two widgets. The sentence that says what a
+The final report also prints the budget the run was given — its epochs, its patience and both
+batch sizes — with the fields the user set marked as theirs, because a test number nobody can
+reproduce is half a result. It is the archive's own record, in `colabsd.bundle`'s words.
+
+The decision layer is pure — `status_notices`, `blocking`, `condition_rows`, `macro_summary`,
+`report_html` — and `UnlockPanel` only wires it to two widgets. The sentence that says what a
 test number is worth after N reads lives in `colabsd.ui.exports`, so the panel, the archive's
 JSON and its README all say it the same way.
 """
@@ -30,7 +34,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -65,9 +69,12 @@ class UnlockInputs:
 
     run_result: Any = None
     output_dir: Path | None = None
-    baseline: dict | None = None
     spec: Any = None
     work_dir: Path | None = None
+    #: The registry entry the run was configured from. Not needed to unlock anything: it is
+    #: carried so the archive this cell rewrites can say which of the budget the user set, and
+    #: an unlock without it still writes every number, minus that one piece of provenance.
+    best: Any = None
 
     @property
     def ready(self) -> bool:
@@ -97,22 +104,26 @@ class FinalReport:
     rows: tuple[ConditionRow, ...]
     macro_mean: float
     macro_sd: float
-    floor: dict | None
     is_provisional: bool
     model_label: str
     paths: dict[str, Path]
     html: str
     #: The performance archive rewritten by this unlock, the one file worth keeping.
     archive: Path | None = None
+    #: What the run was given: epochs, patience and both batch sizes, with the fields the user
+    #: set marked as theirs. Empty when the run recorded none.
+    budget: dict[str, Any] = field(default_factory=dict)
 
 
 #: What a training wizard might have called each thing it hands over.
 SOURCE_ALIASES: dict[str, tuple[str, ...]] = {
     "run_result": ("run_result", "run", "result"),
     "output_dir": ("output_dir", "run_dir", "out_dir"),
-    "baseline": ("baseline", "one_hot_baseline"),
     "spec": ("spec", "library_spec"),
     "work_dir": ("work_dir", "working_dir"),
+    # `trained_best` first: a wizard freezes the entry the run was actually configured from
+    # under that name, while `best` follows its dropdown and may already name another backbone.
+    "best": ("trained_best", "best", "best_config"),
 }
 
 
@@ -121,9 +132,9 @@ def resolve_inputs(
     *,
     run_result: Any = None,
     output_dir: Path | str | None = None,
-    baseline: dict | None = None,
     spec: Any = None,
     work_dir: Path | str | None = None,
+    best: Any = None,
 ) -> UnlockInputs:
     """Collect the inputs from explicit arguments, falling back to attributes of *source*.
 
@@ -148,9 +159,9 @@ def resolve_inputs(
     return UnlockInputs(
         run_result=pick(run_result, "run_result"),
         output_dir=None if directory is None else Path(directory),
-        baseline=pick(baseline, "baseline"),
         spec=pick(spec, "spec"),
         work_dir=None if working is None else Path(working),
+        best=pick(best, "best"),
     )
 
 
@@ -255,26 +266,6 @@ def macro_summary(payload: dict, metric: str) -> tuple[float, float]:
     return float(entry.get("mean", float("nan"))), float(entry.get("sd", float("nan")))
 
 
-def floor_line(floor: dict | None, macro_mean: float, metric: str) -> str:
-    """The one-hot floor, and how far above it the language model actually is."""
-    if not floor:
-        return (
-            f"<b>One-hot floor:</b> not available for {metric}, so nothing here says whether a language model "
-            "was worth it. Run the one-hot baseline in the wizard above; <code>report.csv</code> in the "
-            "archive carries the floor for every metric it recorded."
-        )
-    head = (
-        f"<b>One-hot floor:</b> {floor['head']} on the {floor['partition']} partition scores "
-        f"{float(floor['mean']):.4f} ± {float(floor['sd']):.4f} {metric}."
-    )
-    if macro_mean != macro_mean:
-        return f"{head} There is no {metric} for the language model to compare against it."
-    margin = macro_mean - float(floor["mean"])
-    below = f"<b style='color:{theme.SEVERITY_COLOR['stop']}'>below</b>"
-    verdict = "above" if margin >= 0 else below
-    return f"{head} The language model is {abs(margin):.4f} {verdict} it."
-
-
 # ----------------------------------------------------------------------------------------
 # HTML rendering.
 # ----------------------------------------------------------------------------------------
@@ -298,15 +289,16 @@ def report_html(
     rows: Sequence[ConditionRow],
     macro_mean: float,
     macro_sd: float,
-    floor: dict | None,
     is_provisional: bool,
     model_label: str,
     paths: dict[str, Path] | None = None,
+    budget: Any = None,
 ) -> str:
-    """The final report: test numbers, the one-hot floor and the unlock count, together.
+    """The final report: the test numbers and the unlock count, together.
 
-    A test number without the floor does not say whether a language model earned its keep,
-    and either without the count does not say how much to believe it.
+    A test number without the count does not say how much to believe it, so the two are one
+    block and never two. The budget the run was given goes in the same block for the same
+    reason: it is what somebody would need in order to get this number again.
     """
     # One unlock is the number this design is for; any other count is coloured like a warning.
     count_color = theme.SEVERITY_COLOR["stop"] if unlock_count != 1 else "inherit"
@@ -331,6 +323,10 @@ def report_html(
             + ", ".join(f"<code>{Path(path).name}</code>" for path in paths.values())
             + "</div>"
         )
+    settings = (
+        "<div style='margin-top:8px;color:#555'>trained with: "
+        f"{exports.budget_line(budget)}</div>"
+    )
     provisional = ""
     if is_provisional:
         provisional = theme.message_html(
@@ -349,8 +345,7 @@ def report_html(
         f"<th style='padding-right:14px'>test {metric}</th><th>runs</th></tr>{body}</table>"
         f"<div style='margin-top:8px'><b>Test {metric}, averaged over conditions:</b> "
         f"{number(macro_mean)} ± {number(macro_sd)}</div>"
-        f"<div style='margin-top:4px'>{floor_line(floor, macro_mean, metric)}</div>"
-        f"{provisional}{files}</div>"
+        f"{settings}{provisional}{files}</div>"
     )
 
 
@@ -362,10 +357,10 @@ def render_report(report: FinalReport) -> str:
         rows=report.rows,
         macro_mean=report.macro_mean,
         macro_sd=report.macro_sd,
-        floor=report.floor,
         is_provisional=report.is_provisional,
         model_label=report.model_label,
         paths=report.paths,
+        budget=report.budget,
     )
 
 
@@ -381,14 +376,12 @@ class UnlockRunners:
     unlock_test: Callable[..., dict]
     read_unlock_count: Callable[[Any], int]
     build_report: Callable[..., Any]
-    baseline_floor: Callable[..., dict | None]
     download: Callable[[Path], None]
     show_table: Callable[[Any], None]
 
 
 def default_runners() -> UnlockRunners:
     """The real implementations, imported on call so importing this module stays cheap."""
-    from colabsd.baseline import baseline_floor
     from colabsd.report import build_report
     from colabsd.train import read_unlock_count, unlock_test
 
@@ -408,7 +401,6 @@ def default_runners() -> UnlockRunners:
         unlock_test=unlock_test,
         read_unlock_count=read_unlock_count,
         build_report=build_report,
-        baseline_floor=baseline_floor,
         download=download,
         show_table=show_table,
     )
@@ -545,19 +537,22 @@ class UnlockPanel:
         macro_mean, macro_sd = macro_summary(payload, metric)
         export = self._export_performance(metric)
         paths = {} if export is None else export.written()
-        shown_partition = "test" if export is None else export.facts.partition
         assembled = FinalReport(
             unlock_count=int(payload.get("unlock_count", self.unlock_count)),
             metric=metric,
             rows=tuple(condition_rows(payload, metric)),
             macro_mean=macro_mean,
             macro_sd=macro_sd,
-            floor=self._floor(metric, shown_partition),
             is_provisional=bool(payload.get("is_provisional", False)),
             model_label=str(payload.get("model_name", "this model")),
             paths=paths,
             html="",
             archive=None if export is None else export.path,
+            # The archive's own reading of the budget, so the panel and the file agree; nothing
+            # found is nothing shown, rather than the entry the run was looked up from.
+            budget=exports.budget_of(
+                None if export is None else export.facts.budget, self.inputs.run_result, self.inputs.best
+            ),
         )
         self.report = replace(assembled, html=render_report(assembled))
         count = self.report.unlock_count
@@ -590,9 +585,11 @@ class UnlockPanel:
     def _export_performance(self, metric: str) -> exports.PerformanceExport | None:
         """Rewrite the performance archive, now that there are test numbers to put in it.
 
-        The same file name the export cell above writes with validation numbers. Which
-        partition it describes is `colabsd.report`'s decision, recorded in `report.json` and
-        copied into the manifest; this panel does not get a second opinion.
+        The same file name the export cell above writes with validation numbers, and the same
+        call: the registry entry goes with it, because the archive has to say which of the
+        budget was the user's and the entry is what it was looked up from. Which partition the
+        archive describes is `colabsd.report`'s decision, recorded in `report.json` and copied
+        into the manifest; this panel does not get a second opinion on that.
         """
         if self.inputs.output_dir is None:
             return None
@@ -600,9 +597,8 @@ class UnlockPanel:
         try:
             return exports.export_performance(
                 run_result=self.inputs.run_result,
-                baseline=self.inputs.baseline,
                 spec=self.inputs.spec,
-                best=None,
+                best=self.inputs.best,
                 work_dir=work_dir,
                 report_dir=work_dir / "report",
                 metric=metric,
@@ -612,20 +608,6 @@ class UnlockPanel:
         except Exception as exc:
             self._say(f"the report could not be written: {exc}")
             return None
-
-    def _floor(self, metric: str, partition: str) -> dict | None:
-        """The one-hot floor on the partition the report is showing."""
-        if not self.inputs.baseline:
-            return None
-        try:
-            floor = self.runners.baseline_floor(self.inputs.baseline, metric=metric, partition=partition)
-            if floor is None and partition != "validation":
-                floor = self.runners.baseline_floor(self.inputs.baseline, metric=metric, partition="validation")
-            return floor
-        except Exception as exc:
-            self._say(f"the one-hot floor could not be read: {exc}")
-            return None
-
 
 def plain_text(text: str) -> str:
     """A message's markdown, flattened for a plain-text log line."""
@@ -638,9 +620,9 @@ def launch(
     *,
     run_result: Any = None,
     output_dir: Path | str | None = None,
-    baseline: dict | None = None,
     spec: Any = None,
     work_dir: Path | str | None = None,
+    best: Any = None,
     metric: str = DEFAULT_METRIC,
     runners: UnlockRunners | None = None,
 ) -> UnlockPanel:
@@ -649,8 +631,8 @@ def launch(
         source,
         run_result=run_result,
         output_dir=output_dir,
-        baseline=baseline,
         spec=spec,
         work_dir=work_dir,
+        best=best,
     )
     return UnlockPanel(inputs=inputs, metric=metric, runners=runners).display()

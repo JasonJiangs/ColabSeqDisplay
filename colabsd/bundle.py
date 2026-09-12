@@ -20,15 +20,23 @@ derives the scoring coordinates from that one copy. Schema 1 bundles instead nam
 pooling; this version cannot honour that name, so `load_bundle` refuses them rather
 than quietly averaging different residues.
 
-`save_bundle` takes two keyword arguments beyond the contract, both optional:
-`label_scaler` (the train-split z-score statistics upstream fits) and
-`unlock_count`. Without a label scaler `colabsd.predict` returns z-scored
-predictions and says so in the manifest.
+`save_bundle` takes three keyword arguments beyond the contract, all optional:
+`label_scaler` (the train-split z-score statistics upstream fits), `unlock_count`,
+and `trained_with` -- the run's own record of the hyperparameters and budget it
+used, which is what the manifest publishes when it is given. Without a label
+scaler `colabsd.predict` returns z-scored predictions and says so in the manifest.
+
+The training budget -- epochs, early-stopping patience, and the two batch sizes --
+is a user's to set, so a manifest that reported the looked-up numbers for a run
+that used different ones would be a lie. `training_budget` therefore records
+`colabsd.bestconfig.BudgetSettings.to_dict()`: what ran, what the registry entry
+said, and which fields the user set. A run that never handed one over records
+nothing rather than the lookup; `budget_line` says "not recorded" in as many words.
 
 The provenance block is built by `provenance_block`, and `colabsd.ui.exports`
 stamps the same block into the performance archive a session downloads beside the
-bundle. The two therefore say "tuned" or "PROVISIONAL", and count the test-set
-reads, in one vocabulary rather than two that can drift apart.
+bundle. The two therefore say "tuned" or "PROVISIONAL", count the test-set reads,
+and describe the budget in one vocabulary rather than several that can drift apart.
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ import hashlib
 import io
 import json
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,10 +57,17 @@ from colabsd.errors import BundleError
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
-    from colabsd.bestconfig import BestConfig
+    from colabsd.bestconfig import BestConfig, BudgetSettings
     from colabsd.spec import LibrarySpec
 
-SCHEMA_VERSION = 2
+#: Schema 3 added `training_budget`. Schema 2 bundles still load -- their weights and the
+#: residues they average are unchanged -- and report their budget as not recorded, because
+#: there is nothing in them that says what it was. See `_require_readable_schema` for the one
+#: schema this version refuses.
+SCHEMA_VERSION = 3
+#: The first schema that fixed the pooling to the library's mutated sites. Anything older named
+#: a pooling instead, and this version cannot honour that name.
+MUTATION_SITE_SCHEMA = 2
 MANIFEST_NAME = "manifest.json"
 LORA_NAME = "lora.pt"
 HEAD_NAME = "head.pt"
@@ -112,6 +128,174 @@ def provenance_block(
     }
 
 
+# ------------------------------------------------------------------------------------------
+# The training budget, in the one vocabulary every artefact writes it in.
+# ------------------------------------------------------------------------------------------
+
+#: The manifest key the budget is recorded under, the same in the bundle manifest, the
+#: performance archive's `performance.json` and `report.json`.
+BUDGET_KEY = "training_budget"
+
+#: What a run, a wizard or an export may be carrying its resolved budget as. `budget_of` looks
+#: for each in turn so that a caller can hand over whatever it has.
+BUDGET_ATTRIBUTES: tuple[str, ...] = ("budget", "budget_settings", BUDGET_KEY)
+
+#: What every artefact says when nothing recorded what the run was given. It is not a default:
+#: a bundle written before `training_budget` existed has no record, and saying so is the only
+#: honest thing to print over it.
+BUDGET_NOT_RECORDED = "training budget not recorded"
+
+
+def _count(value: Any) -> int | None:
+    """*value* as a count of one or more, or None -- a word, a fraction and a zero are not one."""
+    if isinstance(value, (bool, str, bytes)):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == value and number > 0 else None
+
+
+def budget_payload(source: Any) -> dict[str, Any]:
+    """The budget record every artefact writes, out of whatever a caller carries it as.
+
+    Accepts a `colabsd.bestconfig.BudgetSettings`, the mapping its `to_dict()` produced (an
+    artefact read back off disk), or something that is neither -- which records as `{}`. That
+    empty record is the point: "not recorded" is a fact a reader can act on, and writing the
+    looked-up numbers for a run that may not have used them is exactly the lie this block
+    exists to prevent.
+    """
+    from colabsd.bestconfig import BUDGET_FIELDS
+
+    to_dict = getattr(source, "to_dict", None)
+    if callable(to_dict) and all(hasattr(source, field) for field in BUDGET_FIELDS):
+        source = to_dict()
+    if not isinstance(source, Mapping):
+        return {}
+    used = {field: _count(source.get(field)) for field in BUDGET_FIELDS}
+    if any(value is None for value in used.values()):
+        return {}
+    record: dict[str, Any] = dict(used)
+    accumulation = _count(source.get("gradient_accumulation"))
+    effective, micro = used["effective_batch_size"], used["micro_batch_size"]
+    # How many micro-batches make up one optimiser step. Kept as recorded when the source has
+    # it, because that is what the run actually did; derived only when it is absent.
+    record["gradient_accumulation"] = accumulation or max(1, -(-effective // micro))
+    record["chosen_by_user"] = [
+        str(name) for name in source.get("chosen_by_user") or () if str(name) in BUDGET_FIELDS
+    ]
+    looked_up = source.get("looked_up") or {}
+    record["looked_up"] = {
+        str(name): _count(value)
+        for name, value in (looked_up.items() if isinstance(looked_up, Mapping) else ())
+        if str(name) in BUDGET_FIELDS and _count(value) is not None
+    }
+    return record
+
+
+def _carried(source: Any, name: str) -> Any:
+    if source is None:
+        return None
+    if isinstance(source, Mapping):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def budget_of(*sources: Any) -> dict[str, Any]:
+    """The first budget recorded among *sources*, most authoritative first.
+
+    Each source is tried both as a budget itself and as something carrying one under any of
+    `BUDGET_ATTRIBUTES` -- so a caller hands over what it has, in the order it trusts it: an
+    explicit record, then the `RunResult` the artefact describes, then the wizard or
+    `BestConfig` the run was configured from. Nothing found records nothing.
+    """
+    for source in sources:
+        record = budget_payload(source)
+        if record:
+            return record
+        for name in BUDGET_ATTRIBUTES:
+            record = budget_payload(_carried(source, name))
+            if record:
+                return record
+    return {}
+
+
+def budget_settings(record: Any) -> BudgetSettings | None:
+    """A recorded budget back as a `colabsd.bestconfig.BudgetSettings`, or None if unrecorded."""
+    from colabsd.bestconfig import BUDGET_FIELDS, BudgetSettings
+
+    payload = budget_payload(record)
+    if not payload:
+        return None
+    return BudgetSettings(
+        **{field: int(payload[field]) for field in BUDGET_FIELDS},
+        gradient_accumulation=int(payload["gradient_accumulation"]),
+        chosen=tuple(payload["chosen_by_user"]),
+        looked_up=dict(payload["looked_up"]),
+    )
+
+
+def budget_was_set_by_hand(record: Any) -> bool:
+    """True when a user set any of it, so the run no longer matches the entry it came from."""
+    return bool(budget_payload(record).get("chosen_by_user"))
+
+
+def budget_changes_line(record: Any) -> str:
+    """Which budget fields the user set, and what each one was before -- or "as looked up"."""
+    settings = budget_settings(record)
+    if settings is None:
+        return BUDGET_NOT_RECORDED
+    if settings.is_looked_up:
+        return "as looked up"
+    against_lookup = settings.changes()
+    parts = [
+        *settings.describe_changes(),
+        # A field the user set that the registry entry never declared: there is nothing to
+        # compare it against, and saying "-> 30" without a "from" would invent the from.
+        *(
+            f"{name} {int(getattr(settings, name))} (set by hand)"
+            for name in settings.chosen
+            if name not in against_lookup
+        ),
+    ]
+    return "set by hand: " + ", ".join(parts)
+
+
+def budget_line(record: Any) -> str:
+    """The full budget in one line: what the run was given, and which of it is the user's.
+
+    The two batch sizes are named for the job each does, because that is the one thing a
+    reader gets wrong: the micro-batch is what has to fit on the card, the effective batch is
+    what shapes the optimisation.
+    """
+    settings = budget_settings(record)
+    if settings is None:
+        return BUDGET_NOT_RECORDED
+    return " · ".join(
+        [
+            _plural(settings.max_epochs, "epoch"),
+            f"patience {settings.early_stopping_patience}",
+            f"effective batch {settings.effective_batch_size} (optimisation)",
+            f"micro-batch {settings.micro_batch_size} on the GPU (memory)",
+            f"{_plural(settings.gradient_accumulation, 'micro-batch', 'micro-batches')} per optimiser step",
+        ]
+    ) + f" — {budget_changes_line(settings)}"
+
+
+def budget_headline(record: Any) -> str:
+    """The compact form, for a line that already carries five other facts."""
+    settings = budget_settings(record)
+    if settings is None:
+        return BUDGET_NOT_RECORDED
+    tail = "as looked up" if settings.is_looked_up else "budget set by hand"
+    return f"{_plural(settings.max_epochs, 'epoch')}, micro-batch {settings.micro_batch_size} ({tail})"
+
+
+def _plural(count: int, noun: str, plural: str | None = None) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {plural or noun + 's'}"
+
+
 @dataclass(frozen=True)
 class Bundle:
     """A loaded bundle. `manifest` is the raw JSON; the rest is unpacked for use."""
@@ -158,14 +342,28 @@ class Bundle:
     def unlock_count(self) -> int:
         return int(self.manifest.get("provenance", {}).get("unlock_count", 0))
 
+    @property
+    def training_budget(self) -> dict[str, Any]:
+        """What this run was given -- epochs, patience, both batch sizes -- and whose choice it was.
+
+        Empty for a bundle written before this schema: those still load, and nothing in them
+        records a budget, so nothing here invents one.
+        """
+        return budget_payload(self.manifest.get(BUDGET_KEY))
+
+    @property
+    def budget_was_set_by_hand(self) -> bool:
+        """True when the user set part of the budget, so this run is not the looked-up one."""
+        return budget_was_set_by_hand(self.training_budget)
+
     def describe(self) -> str:
         """One human-readable line for a notebook."""
         provenance = self.manifest.get("provenance", {})
         status = f"{hyperparameter_status(self.is_provisional)} hyperparameters"
         return (
             f"{self.model_name} · {len(self.pooling_positions_0based)} mutated sites · {status} · "
-            f"{len(self.condition_columns)} conditions · test unlocked {self.unlock_count}x · "
-            f"written {provenance.get('created_utc', 'unknown')}"
+            f"{budget_headline(self.training_budget)} · {len(self.condition_columns)} conditions · "
+            f"test unlocked {self.unlock_count}x · written {provenance.get('created_utc', 'unknown')}"
         )
 
 
@@ -183,8 +381,18 @@ def save_bundle(
     notes: str | None = None,
     adapter_dtype: str | None = None,
     adapter_hf_id: str | None = None,
+    trained_with: Any = None,
+    budget: Any = None,
 ) -> Path:
-    """Write a `.zip` bundle and return its path."""
+    """Write a `.zip` bundle and return its path.
+
+    `best` is the registry entry the run was configured from. `trained_with` is the run's own
+    record of what it then did -- a `colabsd.train.RunResult`, or anything carrying `params`
+    and `fixed` -- and wins wherever it has something to say, because a manifest has to publish
+    the hyperparameters that ran rather than the ones that were looked up. `budget` is the
+    resolved `colabsd.bestconfig.BudgetSettings`; without one, `trained_with` and `best` are
+    searched for a budget they carry, and a run that recorded none records none.
+    """
     import torch
 
     path = Path(path)
@@ -218,8 +426,9 @@ def save_bundle(
         "adapter_dtype": None if adapter_dtype is None else str(adapter_dtype),
         "adapter_hf_id": None if adapter_hf_id is None else str(adapter_hf_id),
         "spec": _spec_payload(spec),
-        "hyperparameters": dict(getattr(best, "params", {}) or {}),
-        "training": dict(getattr(best, "fixed", {}) or {}),
+        "hyperparameters": _block(trained_with, best, "params"),
+        "training": _block(trained_with, best, "fixed"),
+        BUDGET_KEY: budget_of(budget, trained_with, best),
         "evaluation": dict(getattr(best, "evaluation", {}) or {}),
         "metrics": metrics,
         "label_scaler": _label_scaler_payload(label_scaler),
@@ -244,6 +453,15 @@ def save_bundle(
         archive.writestr(LORA_NAME, lora_blob)
         archive.writestr(HEAD_NAME, head_blob)
     return path
+
+
+def _block(trained_with: Any, best: Any, name: str) -> dict[str, Any]:
+    """One hyperparameter block, as the run recorded it -- falling back to the entry it came from."""
+    for source in (trained_with, best):
+        found = _carried(source, name)
+        if isinstance(found, Mapping) and found:
+            return {str(key): value for key, value in found.items()}
+    return {}
 
 
 def load_bundle(path: str | Path) -> Bundle:
@@ -294,10 +512,16 @@ def load_bundle(path: str | Path) -> Bundle:
 def _require_readable_schema(manifest: dict[str, Any], path: Path) -> None:
     """Refuse a bundle this version cannot describe, rather than reinterpreting it.
 
-    Schema 1 recorded a pooling by name and froze whatever coordinates that name resolved
-    to. This version always averages the mutated sites, so it cannot tell which residues a
-    schema-1 bundle was actually fitted on -- and averaging the wrong ones is a silently
-    wrong prediction table, not an error anyone would notice.
+    One schema is refused, and only one. Schema 1 recorded a pooling by name and froze whatever
+    coordinates that name resolved to. This version always averages the mutated sites, so it
+    cannot tell which residues a schema-1 bundle was actually fitted on -- and averaging the
+    wrong ones is a silently wrong prediction table, not an error anyone would notice.
+
+    A schema-2 bundle is a different case and is not refused. Its weights, its spec and the
+    residues it averages are exactly what this version writes; the only thing missing is the
+    `training_budget` block, which describes the run rather than changing what the bundle does.
+    Refusing a usable model over absent provenance would throw away someone's only copy of it,
+    so it loads and `Bundle.training_budget` says, in as many words, that it was not recorded.
     """
     version = int(manifest.get("schema_version", 0))
     if version > SCHEMA_VERSION:
@@ -306,7 +530,7 @@ def _require_readable_schema(manifest: dict[str, Any], path: Path) -> None:
             "Upgrade colabsd (pip install -U colabseqdisplay)."
         )
     recorded = manifest.get("pooling")
-    if version == SCHEMA_VERSION and recorded is None:
+    if version >= MUTATION_SITE_SCHEMA and recorded is None:
         return
     wrote = str(manifest.get("provenance", {}).get("colabsd_version") or "an earlier colabsd")
     chose = f", and it chose {str(recorded)!r}" if recorded is not None else ""
@@ -327,6 +551,7 @@ def save_bundle_from_run(
     checkpoint: str | Path | None = None,
     notes: str | None = None,
     unlock_count: int | None = None,
+    budget: Any = None,
 ) -> Path:
     """Bundle the best-validation run of a `colabsd.train.RunResult`.
 
@@ -334,6 +559,10 @@ def save_bundle_from_run(
     in a notebook variable can only ever *undercount*, because it predates any unlock taken
     after it was built, so the larger of the two numbers is the honest one and that is what
     the manifest records. `colabsd.report` reads the counter the same way.
+
+    The run is also what the manifest's hyperparameters, training block and budget are taken
+    from: `best` is where the run was looked up, `run_result` is what it then trained with, and
+    the two differ the moment a user sets a budget of their own.
     """
     import torch
 
@@ -373,6 +602,8 @@ def save_bundle_from_run(
         notes=notes,
         adapter_dtype=getattr(run_result, "adapter_dtype", None),
         adapter_hf_id=getattr(run_result, "adapter_hf_id", None),
+        trained_with=run_result,
+        budget=budget,
     )
 
 

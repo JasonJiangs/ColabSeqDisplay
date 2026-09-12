@@ -71,6 +71,7 @@ L4_MEMORY_GB: float = 26.0
 #: Fallback for `esmfold_safe_length()`; pinned against `colabsd.structure` in the tests.
 ESMFOLD_FALLBACK_LENGTH: int = 700
 
+
 GPU_TIERS: tuple[str, ...] = ("none", "t4", "l4", "a100", "other")
 
 SECTION_ORDER: tuple[str, ...] = (
@@ -124,6 +125,17 @@ class WizardState:
 
     n_split_seeds: int = 1
     n_model_seeds: int = 1
+
+    # The training budget: prefilled from the registry entry for the chosen backbone, and the
+    # user's from then on. `budget_lookup` is what they were prefilled *from* -- the four
+    # numbers `colabsd.bestconfig` reads out of that entry -- so "is this still the looked-up
+    # value?" has an answer after the user has typed over it, and an empty one means no entry
+    # has been read yet. What the three mean, and what refuses an impossible combination of
+    # them, is `colabsd.ui.main_workflow`: only the training panel offers them.
+    max_epochs: int = 0
+    early_stopping_patience: int = 0
+    micro_batch_size: int = 0
+    budget_lookup: dict[str, int] = field(default_factory=dict)
 
     show_advanced: bool = False
 
@@ -412,6 +424,8 @@ class RuntimeEstimate:
     minutes: float | None
     reference_variants: int
     n_variants: int
+    max_epochs: int = 0
+    lookup_max_epochs: int = 0
 
     @property
     def known(self) -> bool:
@@ -431,14 +445,22 @@ class RuntimeEstimate:
     def runs_phrase(self) -> str:
         return "1 run" if self.n_runs == 1 else f"{self.n_runs} runs"
 
+    @property
+    def epochs_changed(self) -> bool:
+        """True when the epoch ceiling on the form is not the one the minutes were measured at."""
+        return bool(self.max_epochs and self.lookup_max_epochs and self.max_epochs != self.lookup_max_epochs)
+
     def describe(self) -> str:
         if self.per_run_minutes is None:
             return f"{self.runs_phrase}; the registry has no T4 estimate for this backbone."
         scaled = "" if self.n_variants <= 0 else f", scaled to your {self.n_variants:,d} variants"
+        epochs = ""
+        if self.epochs_changed:
+            epochs = f" and to your {self.max_epochs} epochs rather than its {self.lookup_max_epochs}"
         return (
             f"about {format_minutes(self.minutes or 0.0)} for {self.runs_phrase} — an estimate, not a measurement: "
             f"the registry's {self.per_run_minutes} min/run on a T4 for a "
-            f"{self.reference_variants:,d}-variant library{scaled}."
+            f"{self.reference_variants:,d}-variant library{scaled}{epochs}."
         )
 
 
@@ -448,22 +470,34 @@ def n_runs(state: WizardState) -> int:
 
 
 def estimate_runtime(state: WizardState) -> RuntimeEstimate:
-    """Scale the registry's per-run T4 estimate by the run count and the library size."""
+    """Scale the registry's per-run T4 estimate by the runs, the library size and the epochs.
+
+    The epoch ceiling is the user's, so the figure beside the train button follows it: a run
+    allowed twice as many epochs is quoted at twice the minutes. It is a ceiling and early
+    stopping may come in well before it, which is why the whole sentence says "estimate".
+    """
     entry = backbone_entry(state.backbone)
     per_run = entry.approx_lora_minutes_t4 if entry else None
     runs = n_runs(state)
     reference = REFERENCE_LIBRARY_VARIANTS
+    epochs = int(state.max_epochs)
+    looked_up = int(state.budget_lookup.get("max_epochs", 0))
     minutes: float | None = None
     if per_run is not None:
         minutes = float(per_run) * runs
+        if epochs > 0 and looked_up > 0:
+            minutes = minutes * epochs / float(looked_up)
         if state.n_variants > 0:
-            minutes = max(minutes * state.n_variants / float(reference), 1.0)
+            minutes = minutes * state.n_variants / float(reference)
+        minutes = max(minutes, 1.0)
     return RuntimeEstimate(
         n_runs=runs,
         per_run_minutes=per_run,
         minutes=minutes,
         reference_variants=reference,
         n_variants=int(state.n_variants),
+        max_epochs=epochs,
+        lookup_max_epochs=looked_up,
     )
 
 
@@ -549,6 +583,15 @@ def _upload_variants(state: WizardState) -> bool:
     return state.variant_source not in ("library_head", "")
 
 
+def _budget_known(state: WizardState) -> bool:
+    """True once a registry entry has been read and the three budget boxes were filled from it.
+
+    A box that starts blank because nothing has been looked up is worse than no box: it reads
+    as a setting the user forgot rather than one the panel has not fetched yet.
+    """
+    return bool(state.budget_lookup)
+
+
 #: The whole form, declared once. Adding a field means adding a line here and a
 #: widget with the same key; nothing else knows about visibility.
 FIELD_RULES: tuple[FieldRule, ...] = (
@@ -571,6 +614,9 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("backbone", "model", _mode("train")),
     FieldRule("dtype", "model", _all(_mode("train"), _advanced)),
     FieldRule("hyperparameters", "hyperparameters", _mode("train")),
+    FieldRule("max_epochs", "hyperparameters", _all(_mode("train"), _budget_known)),
+    FieldRule("early_stopping_patience", "hyperparameters", _all(_mode("train"), _budget_known)),
+    FieldRule("micro_batch_size", "hyperparameters", _all(_mode("train"), _budget_known)),
     FieldRule("n_split_seeds", "training", _mode("train")),
     FieldRule("n_model_seeds", "training", _mode("train")),
     FieldRule("run_name", "training", _all(_mode("train"), _advanced)),
@@ -877,7 +923,7 @@ def runtime_messages(runtime: Runtime | None) -> list[Message]:
                 "no_gpu",
                 "stop",
                 "This runtime has no GPU, so nothing here will train: **Runtime → Change runtime type → T4 GPU**, "
-                "then run this cell again. The one-hot floor and the report work without one.",
+                "then run this cell again.",
             )
         )
     if not runtime.in_colab:
@@ -1079,7 +1125,7 @@ def runtime_summary(runtime: Runtime | None) -> str:
     if not runtime.has_gpu:
         return (
             f"You are on {where} with **no GPU**. Fine-tuning needs one: "
-            "**Runtime → Change runtime type → T4 GPU**. The one-hot floor and the report run without it."
+            "**Runtime → Change runtime type → T4 GPU**."
         )
     memory = f", {runtime.gpu_memory_gb:g} GB" if runtime.gpu_memory_gb else ""
     verdicts = backbone_fit(runtime)

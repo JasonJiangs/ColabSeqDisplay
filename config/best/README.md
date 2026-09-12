@@ -4,12 +4,7 @@ The committed LoRA hyperparameters. `colab/ColabSeqDisplay.ipynb` looks up the b
 picked in the form, reads the seven values from here, and offers no way to change them —
 **no hyperparameter search ever runs in Colab.**
 
-Two reasons, one practical and one scientific. A 40-trial Optuna study per backbone, plus a
-re-evaluation of its best candidates over nine runs each, is dozens of full fine-tuning runs;
-a Colab session is measured in hours and can be reclaimed mid-run. And a hyperparameter you
-re-tune while watching your own validation score is a hyperparameter that has quietly eaten
-your test set. The values are selected once, offline, and committed; what you get back from
-your own library is then a measurement rather than a search result.
+The values are selected once, offline, and committed.
 
 ## What you are looking at
 
@@ -35,10 +30,9 @@ training. `_meta.status` is `provisional` in all 14, `BestConfig.is_provisional`
 training log, `model_bundle.zip`, `performance_report.zip` (as `hyperparameters.status` in
 `performance.json` and as a paragraph in that archive's `README.txt`), the unlock cell and
 the Predict notebook. A placeholder is a real, runnable configuration — the median of the
-10 tuned entries — but no study selected it, so nothing it produces is a result. The
-one-hot floor drawn beside your model in the results step is what tells you whether a run
-worked; a large model that ties a ridge regression on one-hot residues has told you the
-landscape is additive.
+10 tuned entries — but no study selected it, so nothing it produces is a result. What the
+results step gives you instead is the validation score per condition and how far the
+repeated runs spread around it.
 
 **The 14 unreachable files stay on disk.** They are the written record of a real
 hyperparameter study — the only place its selected trials, seeds and test scores appear —
@@ -138,6 +132,15 @@ filename; `training.micro_batch_size` must be an integer or the string `auto`, w
 trainer resolves from `effective_batch_size` (all 28 shipped files set it explicitly); and
 all seven `parameters:` keys must be present. The registry is read by filename, so a
 replacement entry is picked up with no code change.
+
+**What the form lets you move.** All seven `parameters:` keys — the two learning rates, the
+three LoRA settings, the weight decay and `effective_batch_size` — are shown read-only. The
+panel prefills three editable boxes instead (`colabsd.ui.main_workflow.BUDGET_KEYS`):
+`training.max_epochs`, `training.early_stopping_patience` and `training.micro_batch_size`.
+A run records the values it actually used and which of them the user typed, in the training
+log, `model_bundle.zip` and `performance_report.zip`; untouched fields are recorded as
+looked up. `colabsd.bestconfig.BudgetOverrides` rejects any key outside
+`BUDGET_FIELDS` by name.
 
 ## Filling a gap
 

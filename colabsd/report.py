@@ -1,13 +1,23 @@
-"""The report: one CSV, one figure, and the three things a reader would otherwise assume.
+"""The report: one CSV, one figure, and the two things a reader would otherwise assume.
 
-`report.png` always states (1) the spread across the repeated runs, (2) where the one-hot
-floor sits, and (3) how many times the locked test set has been unlocked. `report.csv`
-carries every tracked metric for every condition, mean +/- sd across runs; it holds the test
-partition only once `colabsd.train.unlock_test` has recorded an unlock, so a locked report
-cannot be misread as a validation-versus-test comparison.
+`report.png` always states (1) the spread across the repeated runs and (2) how many times
+the locked test set has been unlocked. `report.csv` carries every tracked metric for every
+condition, mean +/- sd across runs; it holds the test partition only once
+`colabsd.train.unlock_test` has recorded an unlock, so a locked report cannot be misread as
+a validation-versus-test comparison.
+
+These are the fine-tuned language model's own numbers. Nothing here scores a second model
+or ranks one against another: the figure is one model, one metric, one partition.
 
 Metrics are upstream's: an already-scored run is read as-is, and a run that only carries
 predictions is scored with `colabsd.engine.metrics.evaluate_predictions`.
+
+The figure and `report.json` also carry the budget the run was given -- how many epochs, the
+early-stopping patience, and both batch sizes -- because those are a user's to set and a
+report of numbers from a run nobody can reconstruct is worth less than one they can. It is
+recorded through `colabsd.bundle`, in the same words the model bundle and the performance
+archive use, and a run that handed none over is described as not recording one rather than as
+having used the looked-up values.
 
 The run under report is a `colabsd.train.RunResult`, the unlock counter is read with
 `colabsd.train.read_unlock_count` and runs are averaged with
@@ -19,6 +29,7 @@ loaded back from disk. Nothing here needs a GPU or a network.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 
-from .baseline import PARTITIONS, baseline_floor
+from .bundle import BUDGET_KEY, budget_line, budget_of
 from .errors import ColabSDError
 from .train import UNLOCK_FILENAME, RunResult, read_unlock_count, summarize_across_runs
 
@@ -35,6 +46,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from matplotlib.figure import Figure
 
     from .spec import LibrarySpec
+
+#: The two partitions a report can carry. `colabsd.train.finetune` scores validation only;
+#: the test partition reaches a `RunResult` through `colabsd.train.unlock_test`.
+PARTITIONS: tuple[str, ...] = ("validation", "test")
 
 PARTITION_ALIASES: dict[str, str] = {
     "validation": "validation",
@@ -46,15 +61,11 @@ PARTITION_ALIASES: dict[str, str] = {
 
 # R2 is the one tracked metric with no lower bound; below this the panel stops following it
 # down and prints the true value on the clipped bar instead.
-UNBOUNDED_METRIC_FLOOR = -1.0
+UNBOUNDED_METRIC_CLIP = -1.0
 
-BAR_STYLES: tuple[tuple[str, str], ...] = (
-    ("#2f2f2f", ""),
-    ("#9a9a9a", "///"),
-    ("#d9d9d9", "xxx"),
-    ("#6e6e6e", "..."),
-    ("#efefef", "\\\\\\"),
-)
+#: One series, so one bar style. Grey rather than a colour: the figure has to survive being
+#: printed or pasted into a greyscale document.
+BAR_COLOR = "#2f2f2f"
 
 
 class ReportError(ColabSDError, ValueError):
@@ -76,18 +87,23 @@ class ReportPaths:
 
 def build_report(
     run_result: RunResult | Any,
-    baseline: dict | None,
     spec: LibrarySpec | None,
     *,
     out_dir: Path | str,
     metric: str = "Spearman",
     partition: str | None = None,
+    budget: Any = None,
 ) -> ReportPaths:
     """Write `report.csv`, `report.png` and `report.json` into *out_dir*.
 
     The figure shows the test partition only once the test set has actually been
     unlocked by `colabsd.train.unlock_test`; otherwise it shows validation and says so.
-    The CSV carries the same partitions the figure is allowed to show, for every source.
+    The CSV carries the same partitions the figure is allowed to show.
+
+    `budget` is the resolved `colabsd.bestconfig.BudgetSettings` the run was given; when it is
+    not passed, the run itself is asked for the one it carries. Either way the figure and
+    `report.json` state which of it the user set, so the numbers can be read against the run
+    that produced them rather than against a registry entry it may not have used.
     """
     from colabsd.engine.metrics import TRACKED_METRICS
 
@@ -96,36 +112,25 @@ def build_report(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    conditions = _condition_names(spec, run_result, baseline)
+    conditions = _condition_names(spec, run_result)
     model_label = _model_label(run_result)
-    sources: dict[str, list[dict]] = {}
-    plm_records = _collect_records(run_result, conditions)
-    if plm_records:
-        sources[model_label] = plm_records
-    for head_name in (baseline or {}).get("heads", []):
-        head_records = _collect_records(
-            [run for run in (baseline or {}).get("runs", []) if run.get("head") == head_name], conditions
-        )
-        if head_records:
-            sources[f"one-hot {head_name}"] = head_records
-    if not sources:
+    records = _collect_records(run_result, conditions)
+    if not records:
         raise ReportError(
-            "build_report received neither pLM runs nor one-hot baseline runs. Pass the RunResult "
-            "from colabsd.train.finetune and/or the dict from colabsd.baseline.one_hot_baseline."
+            "build_report found no scored runs to report. Pass the RunResult that "
+            "colabsd.train.finetune returned, or the run_result.json it wrote."
         )
 
-    aggregated = {name: _aggregate_source(records, conditions, TRACKED_METRICS) for name, records in sources.items()}
+    aggregated = _aggregate(records, conditions, TRACKED_METRICS)
+    settings = budget_of(budget, run_result)
     unlock = _unlock_info(run_result, out_dir)
-    primary = model_label if model_label in aggregated else None
-    shown = _shown_partition(partition, aggregated, unlock["count"], primary)
-    headline = aggregated[primary] if primary is not None else _any_source(aggregated)
-    visible = _visible_partitions(unlock["count"], shown, "test" in headline)
+    shown = _shown_partition(partition, aggregated, unlock["count"])
+    visible = _visible_partitions(unlock["count"], shown, "test" in aggregated)
 
-    frame = _report_frame(aggregated, conditions, TRACKED_METRICS, visible)
+    frame = _report_frame(model_label, aggregated, conditions, TRACKED_METRICS, visible)
     csv_path = out_dir / "report.csv"
     frame.to_csv(csv_path, index=False)
 
-    floor = baseline_floor(baseline or {}, metric=metric, partition=shown)
     figure = _build_figure(
         aggregated=aggregated,
         conditions=conditions,
@@ -133,10 +138,10 @@ def build_report(
         metric=metric,
         partition=shown,
         unlock=unlock,
-        floor=floor,
-        model_label=primary,
+        model_label=model_label,
         spec=spec,
-        n_runs={name: len(records) for name, records in sources.items()},
+        n_runs=len(records),
+        budget=settings,
     )
     png_path = out_dir / "report.png"
     figure.savefig(png_path, dpi=150, bbox_inches="tight", facecolor="white")
@@ -147,16 +152,11 @@ def build_report(
         "shown_partition": shown,
         "unlock_count": unlock["count"],
         "unlock_source": unlock["source"],
-        "n_runs": {name: len(records) for name, records in sources.items()},
-        "one_hot_floor": floor,
+        BUDGET_KEY: settings,
+        "n_runs": {model_label: len(records)},
         "reported_partitions": list(visible),
         "sources": {
-            name: {
-                partition_name: table.get("mean", {})
-                for partition_name, table in per_partition.items()
-                if partition_name in visible
-            }
-            for name, per_partition in aggregated.items()
+            model_label: {name: table.get("mean", {}) for name, table in aggregated.items() if name in visible}
         },
     }
     json_path = out_dir / "report.json"
@@ -164,21 +164,17 @@ def build_report(
     return ReportPaths(csv=csv_path, png=png_path, json=json_path)
 
 
-def _visible_partitions(unlock_count: int, shown: str, headline_has_test: bool) -> tuple[str, ...]:
-    """While the test set is locked the report carries validation only, for every source.
+def _visible_partitions(unlock_count: int, shown: str, has_test: bool) -> tuple[str, ...]:
+    """While the test set is locked the report carries validation only.
 
-    A `report.csv` that listed the one-hot floor's *test* numbers next to the pLM's
-    validation-only rows would invite exactly the validation-versus-test comparison the
-    locked-test protocol exists to prevent, so the test partition is published only when the
-    source the figure is named after has test metrics of its own.
+    Publishing test rows in `report.csv` before `colabsd.train.unlock_test` has recorded a
+    read would hand back exactly what the locked-test protocol exists to withhold, so the
+    test partition is published only once an unlock is on record — or when the caller named
+    the partition itself, which is a deliberate read of its own.
     """
-    if shown == "test" or (unlock_count > 0 and headline_has_test):
+    if shown == "test" or (unlock_count > 0 and has_test):
         return PARTITIONS
     return ("validation",)
-
-
-def _any_source(aggregated: dict[str, dict]) -> dict:
-    return next(iter(aggregated.values()), {})
 
 
 def _json_safe(value: Any) -> Any:
@@ -194,13 +190,10 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _condition_names(spec: Any, run_result: RunResult | Any, baseline: dict | None) -> list[str]:
+def _condition_names(spec: Any, run_result: RunResult | Any) -> list[str]:
     names = _lookup(spec, "condition_columns")
     if not names and isinstance(run_result, RunResult):
         names = run_result.condition_columns
-    if names:
-        return [str(name) for name in names]
-    names = (baseline or {}).get("target_columns")
     if names:
         return [str(name) for name in names]
     for record in _raw_records(run_result):
@@ -347,7 +340,8 @@ def _metric_block(payload: Any, conditions: list[str]) -> dict | None:
     return {"per_target": {}, "mean": flat} if flat else None
 
 
-def _aggregate_source(records: list[dict], conditions: list[str], metrics: tuple[str, ...]) -> dict:
+def _aggregate(records: list[dict], conditions: list[str], metrics: tuple[str, ...]) -> dict:
+    """Average the runs, per partition: `{partition: {condition | "mean": {metric: stats}}}`."""
     aggregated: dict[str, dict] = {}
     for partition in PARTITIONS:
         present = [record[partition] for record in records if partition in record]
@@ -371,56 +365,54 @@ def _aggregate_source(records: list[dict], conditions: list[str], metrics: tuple
 
 
 def _report_frame(
+    source: str,
     aggregated: dict[str, dict],
     conditions: list[str],
     metrics: tuple[str, ...],
     partitions: tuple[str, ...] = PARTITIONS,
 ) -> pd.DataFrame:
+    """One row per (partition, condition). `source` names the model on every row, so several
+    reports can be concatenated and still say whose numbers each row holds."""
     rows = []
-    for source, per_partition in aggregated.items():
-        for partition in partitions:
-            table = per_partition.get(partition)
-            if not table:
+    for partition in partitions:
+        table = aggregated.get(partition)
+        if not table:
+            continue
+        for condition in [*conditions, "mean"]:
+            entry = table.get(condition)
+            if not entry:
                 continue
-            for condition in [*conditions, "mean"]:
-                entry = table.get(condition)
-                if not entry:
-                    continue
-                row: dict[str, Any] = {"source": source, "partition": partition, "condition": condition}
-                row["n_runs"] = int(max(item["n"] for item in entry.values()))
-                for metric in metrics:
-                    row[f"{metric}_mean"] = entry[metric]["mean"]
-                    row[f"{metric}_sd"] = entry[metric]["sd"]
-                rows.append(row)
+            row: dict[str, Any] = {"source": source, "partition": partition, "condition": condition}
+            row["n_runs"] = int(max(item["n"] for item in entry.values()))
+            for metric in metrics:
+                row[f"{metric}_mean"] = entry[metric]["mean"]
+                row[f"{metric}_sd"] = entry[metric]["sd"]
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
-def _shown_partition(
-    requested: str | None,
-    aggregated: dict[str, dict],
-    unlock_count: int,
-    primary: str | None = None,
-) -> str:
+def _shown_partition(requested: str | None, aggregated: dict[str, dict], unlock_count: int) -> str:
     """Pick the partition the figure headlines.
 
-    Switching to test needs both a recorded unlock *and* test metrics on the source the
-    figure is named after: a persisted unlock counter with a `RunResult` that predates the
-    unlock would otherwise drop the pLM out of its own figure and leave the floor alone.
+    Switching to test on its own needs both a recorded unlock *and* test metrics on the run:
+    a persisted unlock counter beside a `RunResult` that predates the unlock would otherwise
+    put a test title over validation numbers.
     """
-    available = {partition for per_partition in aggregated.values() for partition in per_partition}
+    available = set(aggregated)
     if requested is not None:
         partition = PARTITION_ALIASES.get(str(requested), str(requested))
         if partition not in available:
-            raise ReportError(f"No {partition} metrics in these runs; available partitions: {sorted(available)}.")
-        if primary is not None and partition not in aggregated[primary]:
-            raise ReportError(
-                f"No {partition} metrics for {primary}; it only carries {sorted(aggregated[primary])}. "
-                "Call colabsd.train.unlock_test(run_result, output_dir=...) first, and pass the "
+            hint = (
+                " Call colabsd.train.unlock_test(run_result, output_dir=...) first, and pass the "
                 "RunResult it updated to build_report."
+                if partition == "test"
+                else ""
+            )
+            raise ReportError(
+                f"No {partition} metrics in these runs; available partitions: {sorted(available)}.{hint}"
             )
         return partition
-    headline = aggregated[primary] if primary is not None else _any_source(aggregated)
-    if unlock_count > 0 and "test" in available and "test" in headline:
+    if unlock_count > 0 and "test" in available:
         return "test"
     return "validation" if "validation" in available else sorted(available)[0]
 
@@ -482,19 +474,17 @@ def _lookup(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
-def _bar(ax, x, values, sds, *, width: float, color: str, hatch: str, label: str) -> None:
+def _bar(ax, x, values, sds, *, width: float) -> None:
     ax.bar(
         x,
         np.nan_to_num(np.asarray(values, dtype=float), nan=0.0),
         width=width,
         yerr=np.nan_to_num(np.asarray(sds, dtype=float), nan=0.0),
-        color=color,
-        hatch=hatch,
+        color=BAR_COLOR,
         edgecolor="black",
         linewidth=0.7,
         capsize=3,
         error_kw={"elinewidth": 1.0, "ecolor": "black"},
-        label=label,
         zorder=3,
     )
 
@@ -546,17 +536,6 @@ def _annotate_clipped(ax, bars: list[tuple[float, float]]) -> None:
             )
 
 
-def _group_top(aggregated: dict, sources: list[str], partition: str, metric: str, group: str) -> float:
-    """Highest bar top (mean + sd) in one x-group, used to keep labels off the bars."""
-    tops = [
-        entry["mean"] + (entry["sd"] if np.isfinite(entry["sd"]) else 0.0)
-        for source in sources
-        for entry in [aggregated[source][partition].get(group, {}).get(metric)]
-        if isinstance(entry, dict) and np.isfinite(entry["mean"])
-    ]
-    return max(tops) if tops else float("-inf")
-
-
 def _build_figure(
     *,
     aggregated: dict[str, dict],
@@ -565,62 +544,32 @@ def _build_figure(
     metric: str,
     partition: str,
     unlock: dict,
-    floor: dict | None,
-    model_label: str | None,
+    model_label: str,
     spec: Any,
-    n_runs: dict[str, int],
+    n_runs: int,
+    budget: Any = None,
 ) -> Figure:
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    sources = [name for name in aggregated if partition in aggregated[name]]
+    table = aggregated.get(partition, {})
     figure = Figure(figsize=(11.0, 8.0))
     FigureCanvasAgg(figure)
-    top, bottom = figure.subplots(2, 1, gridspec_kw={"height_ratios": [1.25, 1.0], "hspace": 0.45})
+    top, bottom = figure.subplots(2, 1, gridspec_kw={"height_ratios": [1.25, 1.0], "hspace": 0.35})
 
     groups = [*conditions, "mean"]
     positions = np.arange(len(groups), dtype=float)
-    width = 0.8 / max(len(sources), 1)
-    extremes: list[float] = []
-    for index, source in enumerate(sources):
-        color, hatch = BAR_STYLES[index % len(BAR_STYLES)]
-        table = aggregated[source][partition]
-        means = [table.get(group, {}).get(metric, {}).get("mean", float("nan")) for group in groups]
-        sds = [table.get(group, {}).get(metric, {}).get("sd", float("nan")) for group in groups]
-        offset = (index - (len(sources) - 1) / 2.0) * width
-        _bar(top, positions + offset, means, sds, width=width, color=color, hatch=hatch, label=source)
-        extremes.extend(_extremes(means, sds))
-
-    if floor is not None:
-        extremes.extend(_extremes([floor["mean"]], [floor["sd"]]))
-        top.axhline(floor["mean"], color="black", linestyle="--", linewidth=1.3, zorder=4)
-        if np.isfinite(floor["sd"]):
-            top.axhspan(floor["mean"] - floor["sd"], floor["mean"] + floor["sd"], color="0.85", alpha=0.6, zorder=0)
-        left_top = _group_top(aggregated, sources, partition, metric, groups[0])
-        right_top = _group_top(aggregated, sources, partition, metric, groups[-1])
-        on_left = left_top <= right_top
-        top.text(
-            0.012 if on_left else 0.988,
-            floor["mean"],
-            f"one-hot floor ({floor['head']}): {floor['mean']:.3f}",
-            transform=top.get_yaxis_transform(),
-            ha="left" if on_left else "right",
-            va="bottom",
-            fontsize=9,
-            fontstyle="italic",
-            bbox={"boxstyle": "square,pad=0.15", "facecolor": "white", "edgecolor": "none", "alpha": 0.85},
-            zorder=5,
-        )
-
-    _set_ylim(top, extremes, headroom=0.22)
+    means = [table.get(group, {}).get(metric, {}).get("mean", float("nan")) for group in groups]
+    sds = [table.get(group, {}).get(metric, {}).get("sd", float("nan")) for group in groups]
+    _bar(top, positions, means, sds, width=0.6)
+    _set_ylim(top, _extremes(means, sds), headroom=0.22)
     top.set_xticks(positions)
-    top.set_xticklabels([*groups[:-1], "mean"], fontsize=10)
+    top.set_xticklabels(groups, fontsize=10)
     top.set_ylabel(metric, fontsize=11)
     top.set_title(f"{metric} per condition — {partition} partition (error bars: ±1 sd across runs)", fontsize=12)
     top.axhline(0.0, color="black", linewidth=0.8)
     top.grid(axis="y", linestyle=":", linewidth=0.6, color="0.6")
     top.set_axisbelow(True)
-    top.legend(loc="upper left", bbox_to_anchor=(0.0, -0.12), ncol=min(len(sources), 3), frameon=False, fontsize=9)
 
     if not unlock["count"]:
         unlock_text = f"test set LOCKED (0 unlocks) — {partition} shown"
@@ -640,19 +589,12 @@ def _build_figure(
     )
 
     metric_positions = np.arange(len(metrics), dtype=float)
-    bottom_extremes: list[float] = []
-    bottom_bars: list[tuple[float, float]] = []
-    for index, source in enumerate(sources):
-        color, hatch = BAR_STYLES[index % len(BAR_STYLES)]
-        table = aggregated[source][partition]["mean"]
-        means = [table.get(name, {}).get("mean", float("nan")) for name in metrics]
-        sds = [table.get(name, {}).get("sd", float("nan")) for name in metrics]
-        offset = (index - (len(sources) - 1) / 2.0) * width
-        _bar(bottom, metric_positions + offset, means, sds, width=width, color=color, hatch=hatch, label=source)
-        bottom_extremes.extend(_extremes(means, sds))
-        bottom_bars.extend(zip(metric_positions + offset, means, strict=True))
-    _set_ylim(bottom, bottom_extremes, headroom=0.10, low_clip=UNBOUNDED_METRIC_FLOOR)
-    _annotate_clipped(bottom, bottom_bars)
+    mean_table = table.get("mean", {})
+    metric_means = [mean_table.get(name, {}).get("mean", float("nan")) for name in metrics]
+    metric_sds = [mean_table.get(name, {}).get("sd", float("nan")) for name in metrics]
+    _bar(bottom, metric_positions, metric_means, metric_sds, width=0.6)
+    _set_ylim(bottom, _extremes(metric_means, metric_sds), headroom=0.10, low_clip=UNBOUNDED_METRIC_CLIP)
+    _annotate_clipped(bottom, list(zip(metric_positions, metric_means, strict=True)))
     bottom.set_xticks(metric_positions)
     bottom.set_xticklabels(metrics, fontsize=9.5)
     bottom.set_ylabel("value (mean over conditions)", fontsize=10)
@@ -661,33 +603,76 @@ def _build_figure(
     bottom.grid(axis="y", linestyle=":", linewidth=0.6, color="0.6")
     bottom.set_axisbelow(True)
 
-    headline = model_label or "one-hot baseline only"
-    verdict = _verdict(aggregated, model_label, partition, metric, floor)
-    figure.suptitle(f"{headline} vs the one-hot floor — {metric}", fontsize=13.5, y=0.98)
-    figure.text(0.5, 0.945, verdict, ha="center", va="top", fontsize=10.5)
-    figure.text(0.5, 0.015, _footer(n_runs, unlock, spec, conditions), ha="center", va="bottom", fontsize=8.5)
+    figure.suptitle(f"{model_label} — {metric}", fontsize=13.5, y=0.98)
+    figure.text(0.5, 0.945, _headline(table, metric, len(conditions)), ha="center", va="top", fontsize=10.5)
+    figure.text(
+        0.5,
+        0.015,
+        _footer(n_runs, unlock, spec, conditions)
+        + "\n"
+        + _wrap_clauses(f"trained with: {budget_line(budget)}", FOOTER_WRAP),
+        ha="center",
+        va="bottom",
+        fontsize=8.5,
+    )
     return figure
 
 
-def _verdict(aggregated: dict, model_label: str | None, partition: str, metric: str, floor: dict | None) -> str:
-    if model_label is None or floor is None or model_label not in aggregated:
-        return "no pLM/one-hot comparison available"
-    entry = aggregated[model_label].get(partition, {}).get("mean", {}).get(metric)
+#: Characters per line of the budget footer. A run with all four settings moved writes half as
+#: much again as the looked-up one, and at this font that overruns an 11-inch figure: a line of
+#: provenance that runs off the page is not provenance. Wide enough that the common case stays
+#: on one line.
+FOOTER_WRAP = 150
+
+
+#: The separators `colabsd.bundle.budget_line` builds its line out of: between settings, and
+#: before the list of what was changed. Breaking anywhere else splits a clause in half.
+FOOTER_BREAKS = re.compile(r" ([·—]) ")
+
+
+def _wrap_clauses(text: str, width: int) -> str:
+    """Break a long line at its own separators, never inside a clause.
+
+    `textwrap` would break at any space, which is how "micro-batch 8 on the GPU (memory)" ends
+    up as two half-clauses on two lines. These separators are where the line means to break,
+    and the one left at the end of a line says the sentence continues.
+    """
+    parts = FOOTER_BREAKS.split(text)
+    current = parts[0]
+    lines: list[str] = []
+    for separator, clause in zip(parts[1::2], parts[2::2], strict=True):
+        if len(current) + len(clause) + 3 > width:
+            lines.append(f"{current} {separator}")
+            current = clause
+        else:
+            current = f"{current} {separator} {clause}"
+    lines.append(current)
+    return "\n".join(lines)
+
+
+def _headline(table: dict, metric: str, n_conditions: int) -> str:
+    """The single number the figure is about, spelled out under the title."""
+    entry = table.get("mean", {}).get(metric)
     if entry is None or not np.isfinite(entry["mean"]):
-        return "no pLM/one-hot comparison available"
-    delta = entry["mean"] - floor["mean"]
-    sign = "+" if delta >= 0 else "−"
-    beats = "beats" if delta > 0 else "does NOT beat"
-    return f"{model_label} {beats} the one-hot floor: {entry['mean']:.3f} vs {floor['mean']:.3f} ({sign}{abs(delta):.3f})"
+        return f"no {metric} could be computed for these runs"
+    spread = f" ± {entry['sd']:.3f}" if np.isfinite(entry["sd"]) else " (sd undefined: a single run)"
+    return (
+        f"mean {metric} over {_plural(n_conditions, 'condition')}: "
+        f"{entry['mean']:.3f}{spread} across {_plural(int(entry['n']), 'run')}"
+    )
 
 
-def _footer(n_runs: dict[str, int], unlock: dict, spec: Any, conditions: list[str]) -> str:
-    runs = ", ".join(f"{name}: {count} runs" for name, count in n_runs.items())
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _footer(n_runs: int, unlock: dict, spec: Any, conditions: list[str]) -> str:
     sites = _lookup(spec, "k")
-    site_text = f"{sites} mutated sites · " if isinstance(sites, int) else ""
+    site_text = f"{_plural(sites, 'mutated site')} · " if isinstance(sites, int) else ""
     source = unlock["source"]
     source = Path(source).name if source.endswith(".json") else source
     return (
-        f"{runs} · error bars are ±1 sd across runs · {site_text}{len(conditions)} conditions · "
+        f"{_plural(n_runs, 'run')} · error bars are ±1 sd across runs · "
+        f"{site_text}{_plural(len(conditions), 'condition')} · "
         f"test-set unlock count: {unlock['count']} (from {source}) · colabsd"
     )

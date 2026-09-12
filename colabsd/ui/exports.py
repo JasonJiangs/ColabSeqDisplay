@@ -16,9 +16,16 @@ each report file it carries is checksummed, so a truncated download is caught ra
 believed. The provenance block is `colabsd.bundle.provenance_block`, the one the model
 bundle stamps, so the two downloads describe the same run in the same words.
 
+Five questions, not four: an archive also has to say what the run was *given* — how many
+epochs, the early-stopping patience, and both batch sizes — and which of those the user set
+rather than looked up. Once someone edits the budget the run no longer matches the registry
+entry it started from, and an archive that reported the entry would be describing a run that
+never happened. The record is `colabsd.bestconfig.BudgetSettings.to_dict()`, written and read
+back through `colabsd.bundle`, so the archive and the model bundle beside it say it the same way.
+
 The decision layer is pure — `performance_facts`, `manifest_payload`, `facts_from_manifest`,
-`readme_text`, `notices`, `partition_verdict`, `unlock_verdict` — and only `export_bundle`,
-`export_performance` and the two archive functions touch a disk. The widgets are in
+`readme_text`, `notices`, `older_schema_notices`, `partition_verdict`, `unlock_verdict` — and
+only `export_bundle`, `export_performance` and the two archive functions touch a disk. The widgets are in
 `colabsd.ui.main_workflow` and `colabsd.ui.unlock`, and are a call each.
 """
 
@@ -33,12 +40,29 @@ from pathlib import Path
 from typing import Any
 
 from colabsd import __version__
-from colabsd.bundle import file_sha256, hyperparameter_status, provenance_block, sha256_hex
+from colabsd.bundle import (
+    BUDGET_KEY,
+    budget_changes_line,
+    budget_headline,
+    budget_line,
+    budget_of,
+    budget_payload,
+    budget_settings,
+    budget_was_set_by_hand,
+    file_sha256,
+    hyperparameter_status,
+    provenance_block,
+    sha256_hex,
+)
 from colabsd.errors import ColabSDError
 from colabsd.ui import theme
 from colabsd.ui.core import Message, render_messages
 
-ARCHIVE_SCHEMA_VERSION = 1
+#: Bumped to 2 when the report dropped its second source, and to 3 when the training budget
+#: became the user's and every archive started recording the one its run was given. Older
+#: manifests carry blocks this version does not write, or lack one it does; either way they
+#: still open, and `older_schema_notices` says what is different about them.
+ARCHIVE_SCHEMA_VERSION = 3
 ARCHIVE_FORMAT = "colabsd-performance"
 
 DEFAULT_BUNDLE_NAME = "model_bundle.zip"
@@ -55,7 +79,7 @@ REPORT_MEMBERS: dict[str, str] = {"csv": "report.csv", "png": "report.png", "jso
 #: What each member is for, in the README and in the manifest.
 MEMBER_PURPOSE: dict[str, str] = {
     "report.csv": "every tracked metric for every condition, mean +/- sd across the repeated runs",
-    "report.png": "the figure: the spread across runs, the one-hot floor, and the unlock count",
+    "report.png": "the figure: the spread across the repeated runs, and the unlock count",
     "report.json": "what build_report recorded about the figure it drew",
 }
 
@@ -119,10 +143,10 @@ def partition_verdict(partition: str, unlock_count: int) -> str:
 class PerformanceFacts:
     """Everything a reader of the archive needs in order to trust — or distrust — the numbers.
 
-    Four questions have to be answerable from the archive alone: which partition, how often
-    the test set was read, which backbone, and whether the hyperparameters were tuned or a
-    placeholder. Every field below exists to answer one of them, or to say who wrote the
-    answer.
+    Five questions have to be answerable from the archive alone: which partition, how often
+    the test set was read, which backbone, whether the hyperparameters were tuned or a
+    placeholder, and what budget the run was given — with the fields the user set marked as
+    theirs. Every field below exists to answer one of them, or to say who wrote the answer.
     """
 
     partition: str = "validation"
@@ -131,12 +155,13 @@ class PerformanceFacts:
     unlock_source: str = "not recorded"
     metric: str = DEFAULT_METRIC
     headline: dict[str, Any] = field(default_factory=dict)
-    one_hot_floor: dict[str, Any] | None = None
     model_name: str = "this model"
     adapter_name: str = ""
     is_provisional: bool = False
     hyperparameters: dict[str, Any] = field(default_factory=dict)
     training: dict[str, Any] = field(default_factory=dict)
+    #: `colabsd.bestconfig.BudgetSettings.to_dict()`, or empty when the run recorded none.
+    budget: dict[str, Any] = field(default_factory=dict)
     best_config_meta: dict[str, Any] = field(default_factory=dict)
     conditions: tuple[str, ...] = ()
     n_runs: int = 0
@@ -155,6 +180,15 @@ class PerformanceFacts:
         return hyperparameter_status(self.is_provisional)
 
     @property
+    def budget_was_set_by_hand(self) -> bool:
+        """True when the user set part of the budget, so this run is not the looked-up one."""
+        return budget_was_set_by_hand(self.budget)
+
+    def budget_line(self) -> str:
+        """The whole budget in one line, in `colabsd.bundle`'s words."""
+        return budget_line(self.budget)
+
+    @property
     def describes_test(self) -> bool:
         return self.partition == "test"
 
@@ -169,24 +203,12 @@ class PerformanceFacts:
         runs = int(self.headline.get("n") or self.n_runs or 0)
         return f"{self.metric} {mean} +/- {sd} over {runs} run(s)"
 
-    def floor_line(self) -> str:
-        """Where the one-hot floor sits, and how far above it this model is."""
-        floor = self.one_hot_floor or {}
-        if not floor:
-            return f"no one-hot floor for {self.metric} — nothing here says whether a language model was worth it"
-        head = f"{floor.get('head', '?')} on {floor.get('partition', self.partition)}: {number(floor.get('mean'))}"
-        mean, floor_mean = self.headline.get("mean"), floor.get("mean")
-        if mean is None or floor_mean is None or not math.isfinite(float(mean)):
-            return head
-        margin = float(mean) - float(floor_mean)
-        return f"{head} ({number(abs(margin))} {'above' if margin >= 0 else 'BELOW'} it)"
-
     def describe(self) -> str:
         """One line: what these numbers are, and what produced them."""
         return (
             f"{self.metric} on the {self.partition} partition · {self.model_name} · "
-            f"{self.hyperparameter_status} hyperparameters · test unlocked {self.unlock_count}x · "
-            f"written {self.created_utc or 'unknown'}"
+            f"{self.hyperparameter_status} hyperparameters · {budget_headline(self.budget)} · "
+            f"test unlocked {self.unlock_count}x · written {self.created_utc or 'unknown'}"
         )
 
 
@@ -231,13 +253,15 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 def _headline_source(summary: Mapping[str, Any], model_name: str) -> str:
-    """Which source in `report.json` is the model, rather than the one-hot floor."""
+    """Which entry of `report.json`'s `sources` the headline is read from.
+
+    A report describes one source: the fine-tuned model, under whichever label
+    `colabsd.report` read off the run. Prefer the name the run calls itself, and fall back to
+    the only source there is when the two spell it differently.
+    """
     sources = _mapping(summary.get("sources"))
     if model_name in sources:
         return model_name
-    for name in sources:
-        if not name.startswith("one-hot"):
-            return name
     return next(iter(sources), model_name)
 
 
@@ -249,6 +273,7 @@ def performance_facts(
     spec: Any = None,
     notes: str | None = None,
     created_utc: str | None = None,
+    budget: Any = None,
 ) -> PerformanceFacts:
     """Read the facts out of a `report.json` summary and the run that produced it.
 
@@ -256,6 +281,10 @@ def performance_facts(
     rule here: `colabsd.report` decides which partition it may show and reads the persisted
     counter. The one addition is a `RunResult` that remembers *more* unlocks than the report
     found — the honest number is the larger one.
+
+    The budget is read the same way round: the report already wrote the one it was given, so
+    that record is preferred, and an explicit `budget` or one the run carries fills in for a
+    summary written without it.
     """
     from colabsd.bundle import utc_now
 
@@ -276,12 +305,12 @@ def performance_facts(
         unlock_source=str(report_summary.get("unlock_source") or "not recorded"),
         metric=metric,
         headline=_mapping(headline),
-        one_hot_floor=_mapping(report_summary.get("one_hot_floor")) or None,
         model_name=model_name,
         adapter_name=str(_attr(run_result, "adapter_name") or model_name),
         is_provisional=bool(provisional),
         hyperparameters=_mapping(_attr(run_result, "params") or _attr(best, "params")),
         training=_mapping(_attr(run_result, "fixed") or _attr(best, "fixed")),
+        budget=budget_of(report_summary.get(BUDGET_KEY), budget, run_result, best),
         best_config_meta=_mapping(_attr(best, "meta")),
         conditions=_strings(_attr(run_result, "condition_columns") or _attr(spec, "condition_columns")),
         n_runs=int(_mapping(report_summary.get("n_runs")).get(source) or _attr(run_result, "n_runs") or 0),
@@ -309,7 +338,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def manifest_payload(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-    """`performance.json`: the four questions, answered, plus a checksum per member."""
+    """`performance.json`: the five questions, answered, plus a checksum per member."""
     provenance = provenance_block(
         is_provisional=facts.is_provisional,
         unlock_count=facts.unlock_count,
@@ -339,7 +368,6 @@ def manifest_payload(facts: PerformanceFacts, files: Mapping[str, Mapping[str, A
             "sd": facts.headline.get("sd"),
             "n_runs": facts.headline.get("n"),
         },
-        "one_hot_floor": facts.one_hot_floor,
         # 3. Which backbone produced them?
         "model": {
             "model_name": facts.model_name,
@@ -352,6 +380,14 @@ def manifest_payload(facts: PerformanceFacts, files: Mapping[str, Mapping[str, A
             "is_provisional": facts.is_provisional,
             "params": facts.hyperparameters,
             "training": facts.training,
+        },
+        # 5. What budget was it given, and how much of that was the user's rather than the
+        # registry entry's? `chosen_by_user` and `looked_up` inside the block answer the second
+        # half; an empty block means the run recorded no budget, not that it used the lookup.
+        BUDGET_KEY: {
+            **facts.budget,
+            "summary": facts.budget_line(),
+            "set_by_hand": facts.budget_was_set_by_hand,
         },
         "run": {
             "conditions": list(facts.conditions),
@@ -387,12 +423,14 @@ def facts_from_manifest(manifest: Mapping[str, Any]) -> PerformanceFacts:
             for key, value in (("mean", headline.get("mean")), ("sd", headline.get("sd")), ("n", headline.get("n_runs")))
             if value is not None
         },
-        one_hot_floor=_mapping(manifest.get("one_hot_floor")) or None,
         model_name=str(model.get("model_name") or "this model"),
         adapter_name=str(model.get("adapter_name") or ""),
         is_provisional=bool(hyperparameters.get("is_provisional", provenance.get("is_provisional", False))),
         hyperparameters=_mapping(hyperparameters.get("params")),
         training=_mapping(hyperparameters.get("training")),
+        # `summary` and `set_by_hand` are written for a reader, not read back: both are derived
+        # from the block itself, so keeping a second copy of them is how the two come to disagree.
+        budget=budget_payload(manifest.get(BUDGET_KEY)),
         best_config_meta=_mapping(provenance.get("best_config_meta")),
         conditions=_strings(run.get("conditions")),
         n_runs=int(run.get("n_runs") or 0),
@@ -407,8 +445,56 @@ def facts_from_manifest(manifest: Mapping[str, Any]) -> PerformanceFacts:
     )
 
 
+def _budget_lines(facts: PerformanceFacts) -> list[str]:
+    """The budget as a small table: one row per setting, and what each one is for.
+
+    The two batch sizes are the pair a reader confuses, so each row says which job its number
+    does, and a row the user set carries the number it was looked up from beside it.
+    """
+    from colabsd.bestconfig import BUDGET_FIELDS, BUDGET_MEANINGS
+
+    # Wrapped at the width `_wrap` uses, so "cannot be set by hand" lands on one line: it is the
+    # claim this paragraph exists to make, and a reader skimming must not have to reassemble it.
+    not_a_setting = (
+        "The learning rates, LoRA rank, alpha and dropout cannot be set by hand: they are modelling "
+        "choices, looked up for this backbone. The budget can be set by hand -- it is how long the run "
+        "was allowed to take and what fitted on the card it ran on"
+    )
+    settings = budget_settings(facts.budget)
+    if settings is None:
+        return [
+            "WHAT THE RUN WAS GIVEN",
+            "  not recorded -- nothing in this archive says how long this run trained or at what batch",
+            "  size. Absent, not looked up: do not read this backbone's registry entry as if it were",
+            "  what produced these numbers.",
+            "",
+            _wrap(f"{not_a_setting}, which is why an archive that does not record it cannot tell you."),
+        ]
+    chosen = set(settings.chosen)
+    lines = ["WHAT THE RUN WAS GIVEN" + ("  (the user set part of this)" if chosen else "")]
+    for name in BUDGET_FIELDS:
+        value = int(getattr(settings, name))
+        looked_up = settings.looked_up.get(name)
+        if name not in chosen:
+            source = "looked up"
+        elif looked_up is None:
+            source = "set by hand"
+        else:
+            source = f"set by hand, looked up {looked_up}"
+        lines.append(f"  {name:<26} {value:<6} {BUDGET_MEANINGS[name]}  [{source}]")
+    lines.append(
+        f"  {'gradient_accumulation':<26} {int(settings.gradient_accumulation):<6} "
+        "micro-batches per optimiser step  [derived]"
+    )
+    return [
+        *lines,
+        "",
+        _wrap(f"{not_a_setting}. A row marked 'set by hand' is the user's number, not the registry's."),
+    ]
+
+
 def readme_text(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]]) -> str:
-    """The same four answers as `performance.json`, for a reader who will not open JSON."""
+    """The same five answers as `performance.json`, for a reader who will not open JSON."""
     seeds = (
         f"split seeds {list(facts.split_seeds) or 'not recorded'}, "
         f"model seeds {list(facts.model_seeds) or 'not recorded'}"
@@ -430,7 +516,6 @@ def readme_text(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]])
         f"  partitions in CSV  {', '.join(facts.reported_partitions) or facts.partition}",
         f"  test set read      {facts.unlock_count}x   (counter read from: {facts.unlock_source})",
         f"  headline           {facts.headline_line()}",
-        f"  one-hot floor      {facts.floor_line()}",
         f"  conditions         {', '.join(facts.conditions) or 'not recorded'}",
         f"  repeated runs      {facts.n_runs}  ({seeds})",
         f"  library size       {str(facts.n_sequences) + ' sequences' if facts.n_sequences else 'not recorded'}",
@@ -444,6 +529,8 @@ def readme_text(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]])
         f"  selected on        {facts.selection_metric or 'not recorded'} (validation)",
         f"  trained            {facts.run_created_utc or 'not recorded'}",
         provisional,
+        *_budget_lines(facts),
+        "",
         "FILES IN THIS ARCHIVE",
     ]
     for name, record in files.items():
@@ -521,16 +608,51 @@ def notices(facts: PerformanceFacts) -> list[Message]:
                 "can do. The archive is stamped `PROVISIONAL`.",
             )
         )
-    if not facts.one_hot_floor:
+    if facts.budget_was_set_by_hand:
         found.append(
             Message(
-                "archive_no_floor",
-                "warning",
-                f"No one-hot floor was recorded for {facts.metric}, so nothing here says whether a language "
-                "model beat 20·k one-hot features. Run the one-hot baseline and export again.",
+                "archive_budget_set_by_hand",
+                "info",
+                f"The training budget was **set by hand**, not looked up — {budget_changes_line(facts.budget)}. "
+                "The archive records what ran, and marks those fields as yours.",
             )
         )
     return found
+
+
+#: What each superseded archive schema is missing, or carrying, that today's is not. An archive
+#: written under one still opens — every member is still checksummed and read back — so the
+#: panel says what is different about it rather than refusing it.
+_OLDER_SCHEMAS: dict[int, str] = {
+    1: (
+        "Archives that old came from a report that compared the model against a second source, so its "
+        f"`{MANIFEST_NAME}` may hold blocks this version does not write and its figure a comparison line "
+        "nothing produces any more."
+    ),
+    2: (
+        "Archives that old were written before the training budget was a user's to set, so nothing in them "
+        "records how many epochs the run was given or at what batch size it ran. That is absent, not "
+        "looked-up: do not read the registry entry for this backbone as if it were what produced these "
+        "numbers."
+    ),
+}
+
+
+def older_schema_notices(schema_version: int) -> list[Message]:
+    """What to say about an archive written under an older version of this format."""
+    version = int(schema_version)
+    if version >= ARCHIVE_SCHEMA_VERSION:
+        return []
+    missing = " ".join(text for older, text in sorted(_OLDER_SCHEMAS.items()) if older >= version)
+    return [
+        Message(
+            "archive_older_schema",
+            "info",
+            f"Written under performance-archive schema {version}, older than the schema "
+            f"{ARCHIVE_SCHEMA_VERSION} this version writes. {missing} Everything in it reads back exactly "
+            "as it was written.",
+        )
+    ]
 
 
 def summary_html(export: PerformanceExport) -> str:
@@ -560,7 +682,7 @@ def report_members(report_paths: Any) -> dict[str, Path]:
     if not found:
         raise ExportError(
             "No report files to archive: build_report() returned nothing with a .csv, .png or .json. "
-            "Call colabsd.report.build_report(run_result, baseline, spec, out_dir=...) first."
+            "Call colabsd.report.build_report(run_result, spec, out_dir=...) first."
         )
     return found
 
@@ -616,9 +738,15 @@ class PerformanceArchive:
     csv_text: str
     figure: bytes
     members: tuple[str, ...]
+    #: The format this file was written in, which may be older than this package writes.
+    schema_version: int = ARCHIVE_SCHEMA_VERSION
 
     def describe(self) -> str:
         return self.facts.describe()
+
+    def notices(self) -> list[Message]:
+        """What to say about this file: what its numbers are, and then how old the format is."""
+        return [*notices(self.facts), *older_schema_notices(self.schema_version)]
 
 
 def read_performance_archive(path: str | Path) -> PerformanceArchive:
@@ -671,6 +799,7 @@ def read_performance_archive(path: str | Path) -> PerformanceArchive:
     return PerformanceArchive(
         path=path,
         manifest=manifest,
+        schema_version=version,
         facts=facts_from_manifest(manifest),
         readme=readme,
         report=report,
@@ -785,7 +914,6 @@ def export_performance(
     *,
     work_dir: str | Path,
     run_result: Any = None,
-    baseline: Mapping[str, Any] | None = None,
     spec: Any = None,
     best: Any = None,
     report_dir: str | Path | None = None,
@@ -793,6 +921,7 @@ def export_performance(
     metric: str = DEFAULT_METRIC,
     partition: str | None = None,
     notes: str | None = None,
+    budget: Any = None,
     runners: ExportRunners | None = None,
     download: bool = True,
 ) -> PerformanceExport:
@@ -804,14 +933,22 @@ def export_performance(
     test numbers and the count. `partition` is left to the report, which knows what it may
     show, and `run_result` may be None — what a report can be built from is `build_report`'s
     rule, not a second one here.
+
+    `budget` is the resolved `colabsd.bestconfig.BudgetSettings` the run was given; without one
+    the run and the registry entry are asked for a budget they carry. Whatever is found is
+    handed to the report as well, so the figure inside the archive and the archive's own
+    manifest describe one run rather than two.
     """
     runners = runners or default_runners()
     work = Path(work_dir)
     out_dir = Path(report_dir) if report_dir is not None else work / DEFAULT_REPORT_DIRNAME
+    settings = budget_of(budget, run_result, best)
     options: dict[str, Any] = {"out_dir": out_dir, "metric": metric}
     if partition is not None:
         options["partition"] = partition
-    written = runners.build_report(run_result, baseline, spec, **options)
+    if settings:
+        options["budget"] = settings
+    written = runners.build_report(run_result, spec, **options)
 
     paths = report_members(written)
     summary_path = paths.get("report.json")
@@ -823,7 +960,9 @@ def export_performance(
             "numbers describe. Re-run the report."
         ) from exc
 
-    facts = performance_facts(summary, run_result=run_result, best=best, spec=spec, notes=notes)
+    facts = performance_facts(
+        summary, run_result=run_result, best=best, spec=spec, notes=notes, budget=settings
+    )
     archive = write_performance_archive(work / archive_name, facts=facts, report_paths=paths)
     if download:
         runners.download(archive)
@@ -851,6 +990,7 @@ def export_bundle(
     best: Any,
     path: str | Path,
     notes: str | None = None,
+    budget: Any = None,
     runners: ExportRunners | None = None,
     download: bool = True,
 ) -> BundleExport:
@@ -858,7 +998,8 @@ def export_bundle(
 
     The unlock count written into the manifest is `honest_unlock_count`, not whatever the
     `RunResult` happens to remember, so a bundle exported after the unlock cell ran carries
-    the same count as the performance archive beside it.
+    the same count as the performance archive beside it. The budget is resolved the same way
+    for both files, so they cannot disagree about what the run was given either.
     """
     runners = runners or default_runners()
     unlocks = honest_unlock_count(run_result, runners=runners)
@@ -870,6 +1011,7 @@ def export_bundle(
             best=best,
             notes=notes,
             unlock_count=unlocks,
+            budget=budget_of(budget, run_result, best),
         )
     )
     bundle = runners.load_bundle(written)

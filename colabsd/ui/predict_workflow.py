@@ -781,9 +781,8 @@ class PredictRunners:
 
 def default_runners() -> PredictRunners:
     """The real implementations, imported on call so importing this module stays cheap."""
-    from colabsd.baseline import one_to_three_letter
     from colabsd.bundle import load_bundle
-    from colabsd.data import read_variant_csv
+    from colabsd.data import one_to_three_letter, read_variant_csv
     from colabsd.predict import score_variants
 
     def upload(what: str, announce: Callable[[str], None] | None = None) -> Path:

@@ -142,7 +142,13 @@ def runtime_config(
     split_seeds: Sequence[int] | None = None,
     model_seeds: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """Build the config dict upstream's `train_eval_config(config=...)` expects."""
+    """Build the config dict upstream's `train_eval_config(config=...)` expects.
+
+    `params` is staged as written and handed to upstream's loader to validate, so a caller
+    whose user set their own epochs, patience or batch sizes passes the values that will
+    actually run -- `colabsd.train.finetune` passes the `parameters`/`training` mapping its
+    resolved `BudgetSettings` produced, not the looked-up blocks it started from.
+    """
     import tempfile
 
     import yaml

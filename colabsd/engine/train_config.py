@@ -43,6 +43,12 @@ in ``tests/test_engine_train_config.py``:
    a config that omits it is told which field is missing instead of being resolved
    against a protein nobody loaded. Every shipped ``config/best/`` entry sets the
    pooling explicitly and none sets ``protein:``, so nothing on disk parses differently.
+4. **The loop can report progress.** :func:`train_eval_config` takes ``on_epoch`` and
+   ``on_batch`` callbacks, both defaulting to ``None``, and passes the batch one down into
+   :func:`colabsd.engine.training.train_epoch`. colabsd runs in a notebook cell, where a
+   fine-tune that reports nothing for tens of minutes is indistinguishable from a hung one.
+   The callbacks only read: what is trained, logged and written is identical whether they are
+   given or not, which is why the side-by-side tests pass neither and still compare every number.
 """
 
 from __future__ import annotations
@@ -68,7 +74,7 @@ from colabsd.engine.heads import MLPHead
 from colabsd.engine.lora import LORA_TARGET_MODULES, inject_lora, lora_parameters
 from colabsd.engine.metrics import evaluate_predictions, summarize_metrics, validation_log_row
 from colabsd.engine.pooling import POOLING_NAME
-from colabsd.engine.training import batch_indices, train_epoch
+from colabsd.engine.training import BatchCallback, batch_indices, train_epoch
 
 # Upstream's ceiling on a derived micro-batch: with `micro_batch_size: auto` the
 # forward pass runs at most this many sequences at a time, and gradient
@@ -77,6 +83,22 @@ AUTO_MICRO_BATCH_SIZE = 4
 
 # The three validation objectives a best-config may select on.
 SELECTION_OBJECTIVES = ("mean_validation_r2", "mean_validation_pearson", "mean_validation_spearman")
+
+#: ``on_epoch(epoch, max_epochs, validation_score, train_loss)`` -- one epoch has closed.
+#: ``epoch`` is 0-based, and the score is the objective named by ``study.objective``.
+EpochProgress = Callable[[int, int, float, float], None]
+
+#: ``on_batch(epoch, max_epochs, step, n_batches, running_loss)`` -- where inside the epoch the
+#: fine-tune has got to, and its training loss so far. Called once per micro-batch, which is
+#: thousands of times an epoch: a caller that draws a widget from it has to throttle it itself.
+BatchProgress = Callable[[int, int, int, int, float], None]
+
+
+def epoch_batch_callback(on_batch: BatchProgress | None, epoch: int, max_epochs: int) -> BatchCallback | None:
+    """Bind the epoch a micro-batch belongs to onto the caller's batch callback."""
+    if on_batch is None:
+        return None
+    return lambda step, n_batches, loss: on_batch(epoch, max_epochs, step, n_batches, loss)
 
 
 @dataclass(frozen=True)
@@ -340,7 +362,8 @@ def train_eval_config(
     seed: int,
     output_dir: Path,
     source_trial: SourceTrial | None,
-    on_epoch: Callable[[int, int, float], None] | None = None,
+    on_epoch: EpochProgress | None = None,
+    on_batch: BatchProgress | None = None,
 ) -> dict[str, Any]:
     """Train one LoRA configuration on one split and score validation *and* test.
 
@@ -408,6 +431,7 @@ def train_eval_config(
             seed=seed + epoch,
             device=device,
             max_grad_norm=float(fixed.get("max_grad_norm", 1.0)),
+            on_batch=epoch_batch_callback(on_batch, epoch, max_epochs),
         )
 
         _, val_metrics = evaluate_split(
@@ -431,10 +455,10 @@ def train_eval_config(
         }
         log_rows.append(row)
         if on_epoch is not None:
-            # A fine-tune runs for tens of minutes. Without this the caller has nothing to
-            # show between "starting" and the final result, and a working run is
-            # indistinguishable from a hung one.
-            on_epoch(epoch, max_epochs, float(score))
+            # An epoch closes on the only number that decides anything -- the validation score
+            # this epoch is kept or discarded on -- so it is reported even though `on_batch` has
+            # been reporting the loss all the way through the epoch that produced it.
+            on_epoch(epoch, max_epochs, float(score), float(train_loss))
         if score > best_score:
             best_score = score
             best_epoch = epoch

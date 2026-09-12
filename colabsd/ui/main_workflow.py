@@ -20,12 +20,16 @@ session. An ESM2 backbone needs nothing, and then there is no step 3 at all.
 
 Two deliberate differences from the ColabPLM notebooks we are otherwise copying:
 
-* **The hyperparameters are read-only.** They hand the user LoRA and trainer widgets; we
+* **The modelling choices are read-only.** They hand the user LoRA and trainer widgets; we
   look the values up from a study that was already run and show them with their provenance
   and their measured test Spearman, or, for a placeholder entry, in red. A hyperparameter
   re-tuned while you watch your own validation score has quietly eaten your test set. How
   the model is read out is decided the same way and is not on the form either: the pooled
-  feature is the mean of the embeddings at the mutated sites.
+  feature is the mean of the embeddings at the mutated sites. Three settings are the
+  exception — the epoch ceiling, the early-stopping patience and the micro batch — because
+  they are budget rather than modelling: how long the user is willing to train, and what
+  fits on the card they were given. They are prefilled from the same lookup, validated
+  before the run, and whatever they end up as is what the bundle and the archive record.
 * **The test set is not unlocked here.** There is no widget on this page that can read it.
   That is a separate cell, run on purpose, which counts every unlock. The performance
   archive is written from validation numbers with that partition still locked, because the
@@ -35,7 +39,8 @@ Two deliberate differences from the ColabPLM notebooks we are otherwise copying:
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -109,8 +114,9 @@ SECTION_NOTES: dict[str, str] = {
     ),
     "structure": "",  # `prepare_workflow.section_note` writes this one: it names the backbone that caused it.
     "hyperparameters": (
-        "Nothing here is editable. Everything below is looked up for the backbone above and shown with "
-        "its provenance."
+        "Looked up for the backbone above and shown with its provenance. The learning rates, the LoRA "
+        "settings and the batch that trains were selected against a held-out score and are not editable. "
+        "The three boxes at the bottom are yours: how long you train, and what fits on your card."
     ),
     "training": "A run is one split seed x one model seed, and the ± you report is the spread across them.",
     "storage": core.DRIVE_NOTE,
@@ -121,9 +127,9 @@ SECTION_NOTES: dict[str, str] = {
         "notebook can open it, which counts every unlock."
     ),
     "results": (
-        "The language model and the one-hot floor, side by side. The floor is twenty features per mutated "
-        "site, fitted by ridge and a small MLP on the same splits; a model that does not clear it has not "
-        "earned its keep."
+        "What the fine-tuned model scored on the **validation** partition of every run: the macro average "
+        "over conditions, and one row per condition and metric. The test partition is untouched and stays "
+        "that way until the last cell of this notebook."
     ),
     "export": (
         "- **The model**, as one `.zip` the Predict notebook reads: the LoRA weights, the head, your library "
@@ -162,11 +168,11 @@ MESSAGE_SECTIONS: dict[str, str] = {
     "config_provisional": "hyperparameters",
     "config_missing": "hyperparameters",
     "config_unreadable": "hyperparameters",
+    "budget_refused": "hyperparameters",
     "single_run": "training",
     "run_exceeds_session": "training",
     "no_persistence": "storage",
     "drive_on": "storage",
-    "plm_below_floor": "results",
     "results_stale": "run",
     "scoring_on_cpu": "score",
 }
@@ -191,6 +197,11 @@ BLOCKING_KEYS: frozenset[str] = frozenset(
         "esmfold_too_long",
         "config_missing",
         "config_unreadable",
+        # A budget the training loop cannot honour: zero epochs, a patience nothing can reach,
+        # a micro batch that does not divide the effective one or does not fit the training
+        # split. Every one of those is a crash or an empty run a minute in, so the button
+        # refuses rather than warns, and `colabsd.bestconfig` supplies the sentence.
+        "budget_refused",
     }
 )
 
@@ -314,7 +325,6 @@ EXTRA_DEFAULTS: dict[str, Any] = {
     "library_loaded": False,
     "trained": False,
     "exported": False,
-    "floor_cleared": None,
     "library_csv": "",
     "wt_sequence": "",
     "positions_1based": EXAMPLE_POSITIONS,
@@ -353,6 +363,46 @@ FALLBACK_MODEL_SEEDS: tuple[int, ...] = (11, 22, 33)
 #: binding them would write rendered HTML into the state and re-enter `refresh`.
 DISPLAY_ONLY: frozenset[str] = frozenset({"hyperparameters", "esmfold_note", "example_note"})
 
+#: The three looked-up settings this panel hands back to the user, in the order they are
+#: asked. A subset of `colabsd.bestconfig.BUDGET_FIELDS`, which also holds
+#: `effective_batch_size`: that one is the batch the optimiser averages over, a study selected
+#: it against a held-out score, and gradient accumulation makes it up out of whatever micro
+#: batch the card can hold. So it stays looked up, and what a user can move is time and memory.
+BUDGET_KEYS: tuple[str, ...] = ("max_epochs", "early_stopping_patience", "micro_batch_size")
+
+#: The training share of the 8:1:1 split `colabsd.engine.splits.create_split` cuts.
+TRAIN_FRACTION: float = 0.8
+
+#: The label on each budget box, in `BUDGET_KEYS` order. These labels are the whole
+#: explanation: two of them say time and the third says memory, in the words of the thing it
+#: decides rather than the name of the field in the YAML. The one a user reaches for after an
+#: out-of-memory error is the one that carries "(memory)".
+BUDGET_LABELS: dict[str, str] = {
+    "max_epochs": "Epochs, at most:",
+    "early_stopping_patience": "Give up after this many epochs with no gain:",
+    "micro_batch_size": "Sequences on the GPU at once (memory):",
+}
+
+#: Ceilings on what the three boxes accept. High enough never to be the answer to a real
+#: question, and finite so a typed digit cannot become a number of epochs nobody meant.
+BUDGET_MAXIMA: dict[str, int] = {"max_epochs": 1000, "early_stopping_patience": 1000, "micro_batch_size": 4096}
+
+#: The metrics the results table shows, in the order they are worth reading. Which of them a
+#: given run may show is `results_metrics`: a ranking cut-off longer than the partition it
+#: ranks is not the metric it names.
+RESULTS_METRICS: tuple[str, ...] = ("Spearman", "R2", "NDCG@50")
+
+#: One text row, tall enough for the progress line and no taller.
+PROGRESS_ROW_HEIGHT = "1.6em"
+
+#: The progress line is clipped, never wrapped: `colabsd.train.finetune` rewrites it several
+#: times a second and every number in it changes width, so a line allowed to wrap would move
+#: the page under the reader's eyes. Tabular figures keep the digits from dancing too.
+PROGRESS_STYLE = (
+    "font-family:monospace;font-variant-numeric:tabular-nums;white-space:nowrap;"
+    f"overflow:hidden;text-overflow:ellipsis;height:{PROGRESS_ROW_HEIGHT};line-height:{PROGRESS_ROW_HEIGHT}"
+)
+
 
 def new_state(**changes: Any) -> core.WizardState:
     """A `WizardState` in train mode, prefilled with the bundled example's description."""
@@ -390,6 +440,9 @@ def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
         int(state.wt_3di_length),
         int(state.n_split_seeds),
         int(state.n_model_seeds),
+        int(state.max_epochs),
+        int(state.early_stopping_patience),
+        int(state.micro_batch_size),
     )
 
 
@@ -522,6 +575,9 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
                 "string** in the preparation step.",
             )
         )
+    refusal = training_budget(state).settle()[1]
+    if refusal:
+        out.append(core.Message("budget_refused", "stop", f"**That budget cannot train.** {refusal}"))
     if results_are_stale(state):
         out.append(
             core.Message(
@@ -529,17 +585,6 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
                 "warning",
                 "The settings have changed since the last run, so the results, the bundle and the scoring "
                 "outlet have been put away. Press **Train** again, or change the settings back.",
-            )
-        )
-    cleared = state.get("floor_cleared")
-    if cleared is False and has_results(state):
-        out.append(
-            core.Message(
-                "plm_below_floor",
-                "warning",
-                "The language model did not clear the one-hot floor: twenty features per mutated site do as "
-                "well, which usually means the landscape is close to additive. Do not report the model as "
-                "an improvement.",
             )
         )
     return out
@@ -776,7 +821,14 @@ def finetune_kwargs(
     splits: dict[int, dict[str, list[int]]],
     progress: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Exactly the call `colabsd.train.finetune` is about to receive."""
+    """Exactly the call `colabsd.train.finetune` is about to receive.
+
+    `budget` is the one part of the registry entry the user may move, and only the settings
+    they actually moved go in it: `finetune` resolves the rest from `best`, records what it
+    ran with on the `RunResult`, and `colabsd.bundle` and `colabsd.ui.exports` write that
+    record into the manifest and the performance archive. So the numbers on the form are the
+    numbers that train and the numbers that are reported, through one object rather than three.
+    """
     _, model_seeds = training_seeds(state, best)
     return {
         "spec": spec,
@@ -787,6 +839,7 @@ def finetune_kwargs(
         "splits": splits,
         "output_dir": run_dir(state),
         "model_seeds": model_seeds,
+        "budget": training_budget(state).overrides(),
         "progress": progress,
         "resume": bool(state.get("resume_finished_runs")),
     }
@@ -816,8 +869,15 @@ def _format_value(value: Any) -> str:
     return f"{value:.10g}" if isinstance(value, float) else str(value)
 
 
-def hyperparameter_view(best: Any) -> HyperparameterView:
-    """Present a registry entry as a settled result, or as a placeholder that says so."""
+def hyperparameter_view(best: Any, budget: TrainingBudget | None = None) -> HyperparameterView:
+    """Present a registry entry as a settled result, or as a placeholder that says so.
+
+    `budget` is what the form is set to, when there is a form. The three settings it covers
+    are in the training block below, and a reader who has moved one would otherwise find the
+    looked-up number in this table and the number they typed in a box further down with
+    nothing joining them: those rows are shown as `20 → 40`, which is how
+    `colabsd.bestconfig.BudgetSettings.describe_changes` says the same thing.
+    """
     mean = getattr(best, "test_spearman", None)
     sd = getattr(best, "test_spearman_sd", None)
     n_runs = getattr(best, "n_runs", None)
@@ -844,9 +904,19 @@ def hyperparameter_view(best: Any) -> HyperparameterView:
             f"{len(split_seeds) * len(model_seeds)} runs, selected on {getattr(best, 'objective', 'unknown')}"
         ),
         lora_rows=[(name, _format_value(value)) for name, value in sorted(dict(best.params).items())],
-        training_rows=[(name, _format_value(value)) for name, value in sorted(dict(best.fixed).items())],
+        training_rows=[
+            (name, _looked_up_value(name, value, budget)) for name, value in sorted(dict(best.fixed).items())
+        ],
         source_path=str(getattr(best, "path", "") or "the bundled registry"),
     )
+
+
+def _looked_up_value(name: str, value: Any, budget: TrainingBudget | None) -> str:
+    """One training-block value, saying what the form made of it when that is not the same."""
+    shown = _format_value(value)
+    if budget is None or name not in budget.changed:
+        return shown
+    return f"{shown} → {int(getattr(budget, name))}"
 
 
 def _rows_html(rows: Sequence[tuple[str, str]]) -> str:
@@ -901,49 +971,258 @@ def no_hyperparameters_html(backbone: str, status: core.ConfigStatus | None) -> 
     )
 
 
-def floor_rows(
-    baseline: dict[str, Any] | None, *, metric: str = "Spearman", partition: str = "validation"
-) -> list[dict[str, Any]]:
-    """The one-hot floor as one row per head, ready to sit beside the model's own table."""
-    summary = (baseline or {}).get("summary", {}).get(partition, {})
-    rows = []
-    for head_name, per_condition in summary.items():
-        entry = per_condition.get("mean", {}).get(metric)
-        if entry is None:
-            continue
-        rows.append(
-            {
-                "head": head_name,
-                f"{metric}_mean": float(entry["mean"]),
-                f"{metric}_sd": float(entry["sd"]),
-                "n_runs": int(entry["n"]),
-            }
-        )
-    return rows
+#: The one word beside a box that has been moved off the lookup, coloured like a warning
+#: rather than a failure: a budget set by hand is allowed, and only has to be visible.
+BUDGET_TAG_STYLE = f"color:{theme.SEVERITY_COLOR['warning']};font-size:90%;margin-left:8px"
 
 
-def clears_floor(plm_mean: float | None, floor: dict[str, Any] | None) -> bool | None:
-    """Did the language model beat the floor? `None` when there is nothing to compare."""
-    if floor is None or plm_mean is None or plm_mean != plm_mean:
-        return None
-    return float(plm_mean) > float(floor["mean"])
+@dataclass(frozen=True)
+class TrainingBudget:
+    """The three settings on the form, beside the four numbers they were looked up from.
+
+    A tolerant view, unlike `colabsd.bestconfig.BudgetSettings`: it holds whatever is in the
+    boxes, including what cannot train, because the panel has to draw a refused number before
+    it can refuse it. `settle()` is where it is handed to `colabsd.bestconfig` to be judged.
+    """
+
+    max_epochs: int
+    early_stopping_patience: int
+    micro_batch_size: int
+    effective_batch_size: int
+    lookup: dict[str, int] = field(default_factory=dict)
+
+    #: Rows the smallest training split will hold; 0 when no library has been read yet.
+    n_train: int = 0
+
+    @property
+    def known(self) -> bool:
+        """True once a registry entry has been read, which is what the boxes start from."""
+        return bool(self.lookup)
+
+    @property
+    def changed(self) -> tuple[str, ...]:
+        """Which of the three no longer say what the registry entry says."""
+        if not self.known:
+            return ()
+        return tuple(key for key in BUDGET_KEYS if int(self.lookup.get(key, 0)) != getattr(self, key))
+
+    def overrides(self) -> dict[str, int]:
+        """What to hand `colabsd.train.finetune` as `budget`: only the settings the user moved.
+
+        A box still holding the value it was prefilled with is not a choice the user made, so
+        it is left out and the run records itself as the looked-up one. `BudgetOverrides` also
+        accepts a field set deliberately to the same number; this panel cannot tell that apart
+        from a box nobody touched, and does not pretend to.
+        """
+        return {key: int(getattr(self, key)) for key in self.changed}
+
+    def settle(self) -> tuple[Any | None, str]:
+        """`(BudgetSettings, "")` when this budget can train, `(None, refusal)` when it cannot.
+
+        The judging is `colabsd.bestconfig.resolve_budget`'s: it owns what a budget may be, it
+        refuses in sentences that name the field and what to type instead, and `finetune` will
+        put the same combination through it a moment later. A second copy of those rules here
+        would be the copy that goes stale.
+        """
+        from colabsd.bestconfig import resolve_budget
+        from colabsd.errors import ConfigError
+
+        if not self.known:
+            return None, ""
+        try:
+            settled = resolve_budget(
+                {"effective_batch_size": self.effective_batch_size},
+                {key: self.lookup[key] for key in BUDGET_KEYS},
+                self.overrides(),
+                n_train=self.n_train or None,
+            )
+        except ConfigError as exc:
+            return None, str(exc)
+        return settled, ""
 
 
-def floor_comparison(model_label: str, plm_mean: float | None, floor: dict[str, Any] | None) -> str:
-    """One sentence saying whether the language model earned its keep."""
-    if floor is None:
-        return "No one-hot floor was computed, so there is nothing to compare this against yet."
-    line = (
-        f"{floor['head']} reaches validation Spearman {floor['mean']:.4f} ± {floor['sd']:.4f} "
-        f"over {floor['n']} run(s)."
+def training_budget(state: core.WizardState) -> TrainingBudget:
+    """What this form will train with: the three boxes, and the entry they were filled from."""
+    lookup = {str(key): int(value) for key, value in dict(state.budget_lookup or {}).items()}
+    return TrainingBudget(
+        max_epochs=int(state.max_epochs),
+        early_stopping_patience=int(state.early_stopping_patience),
+        micro_batch_size=int(state.micro_batch_size),
+        effective_batch_size=int(lookup.get("effective_batch_size", 0)),
+        lookup=lookup,
+        n_train=training_rows(state.n_variants),
     )
-    verdict = clears_floor(plm_mean, floor)
-    if verdict is None:
-        return line
-    gap = float(plm_mean) - float(floor["mean"])
-    if verdict:
-        return f"{line} {model_label} clears it by {gap:.4f} Spearman."
-    return f"{line} {model_label} FAILS to clear it, by {abs(gap):.4f} Spearman."
+
+
+def training_rows(n_variants: int) -> int:
+    """Rows an 8:1:1 split leaves to train on, which is what a micro batch has to fit inside.
+
+    `colabsd.engine.splits.create_split` takes `int(0.8 * n)` of them. Recomputed here only so
+    the panel can refuse an impossible micro batch *before* the splitter is called; the run
+    itself is handed the splitter's own indices and checks against those.
+    """
+    return int(TRAIN_FRACTION * max(0, int(n_variants)))
+
+
+def budget_lookup(best: Any) -> dict[str, int]:
+    """The four budget numbers one registry entry declares, as `colabsd.bestconfig` reads them.
+
+    Asked of `resolve_budget` with nothing overridden, so `micro_batch_size: auto` resolves to
+    the number that would actually run and the panel prefills from the same reading of the
+    entry that the run will use. Empty for an entry that declares no budget at all, which
+    takes the three boxes off the page rather than filling them with zeros.
+    """
+    if best is None:
+        return {}
+    from colabsd.bestconfig import resolve_budget
+    from colabsd.errors import ConfigError
+
+    try:
+        settled = resolve_budget(dict(getattr(best, "params", {}) or {}), dict(getattr(best, "fixed", {}) or {}))
+    except ConfigError:
+        return {}
+    return dict(settled.looked_up)
+
+
+def changed_tag_html(used: int, looked_up: int) -> str:
+    """What sits beside one budget box: nothing, or that it no longer holds the looked-up value.
+
+    At the point of change on purpose. One line elsewhere saying "you changed two things"
+    makes the user hunt for which two.
+    """
+    if int(used) == int(looked_up):
+        return ""
+    return f'<span style="{BUDGET_TAG_STYLE}">changed · {int(looked_up)} looked up</span>'
+
+
+def budget_note(budget: TrainingBudget) -> str:
+    """The line that keeps the two batch sizes apart, under the boxes that confuse them.
+
+    There are two and they do different jobs: the one on the form is how many sequences sit on
+    the card at once, and the one in the table above it is the batch the optimiser averages
+    over, which gradient accumulation makes up out of the first. Someone who has just hit an
+    out-of-memory error needs the first; someone who reads "batch size" as the second would
+    otherwise change it and see no difference but the speed.
+
+    Both are named in YAML as well as in English, because the table above spells them
+    `micro_batch_size` and `effective_batch_size` and the box below spells one of them
+    "Sequences on the GPU at once". A reader looking for "the batch size" has to be able to
+    tell which row the editable box is.
+    """
+    settled, _refusal = budget.settle()
+    accumulation = int(getattr(settled, "gradient_accumulation", 0) or 0)
+    if settled is None:
+        # These numbers do not make a batch at all. The refusal directly below says so; this
+        # line must not answer "out of how many passes?" with one it has invented.
+        made_of = ""
+    else:
+        made_of = f", {accumulation} × {budget.micro_batch_size}" if accumulation > 1 else ", one pass"
+    return (
+        "**Sequences on the GPU at once (`micro_batch_size`) is memory, not optimisation.** Gradient "
+        f"accumulation still trains in batches of {budget.effective_batch_size} (`effective_batch_size`"
+        f"{made_of}), so lowering it for an out-of-memory error changes what fits on the card and not what "
+        "is learned."
+    )
+
+
+def out_of_memory_advice(exc: BaseException, budget: TrainingBudget) -> str:
+    """What to do about a training run the GPU could not hold, named as a box on this form.
+
+    A CUDA out-of-memory error ends in an allocation size and a list of reserved blocks, and
+    names no setting anybody can reach. This is the one moment the panel can say which of the
+    two batch sizes is the one that helps — `micro_batch_size` is memory and
+    `effective_batch_size` is not — so it says it here rather than leaving the reader to guess
+    from a traceback. Empty for anything that is not an out-of-memory error, and for a panel
+    that has not read a registry entry yet and so has no box to point at.
+    """
+    if not budget.known:
+        return ""
+    text = str(exc).lower()
+    if type(exc).__name__ != "OutOfMemoryError" and "out of memory" not in text:
+        return ""
+    box = BUDGET_LABELS["micro_batch_size"].rstrip(":")
+    if budget.micro_batch_size <= 1:
+        return (
+            f"**The GPU ran out of memory.** *{box}* is already 1, the smallest it can be, so this "
+            "backbone does not fit this card at all: pick a smaller one above, or switch to an L4 or "
+            "A100 runtime."
+        )
+    return (
+        f"**The GPU ran out of memory.** Lower *{box}* — it is {budget.micro_batch_size} now, and it is "
+        "the only setting on this form that changes how much memory a run needs. Training still happens "
+        f"in batches of {budget.effective_batch_size}, so what is learned does not change."
+    )
+
+
+def metric_cutoff(metric: str) -> int | None:
+    """The *k* in `NDCG@50` or `P@10`; `None` for a metric that ranks nothing.
+
+    `colabsd.engine.metrics` spells every ranking metric this way, so the number a column
+    promises is read off the column rather than written down a second time here.
+    """
+    _, at, tail = str(metric).partition("@")
+    return int(tail) if at and tail.isdigit() else None
+
+
+def truncated_metrics(n_validation: int) -> list[str]:
+    """Those of `RESULTS_METRICS` whose cut-off is larger than the partition they rank.
+
+    `colabsd.engine.metrics.ndcg_k` and `precision_k` score the top `min(k, n)`, so on a
+    partition shorter than *k* the column is not the cut it names: every row is inside it.
+    """
+    rows = int(n_validation)
+    if rows <= 0:
+        return []
+    return [metric for metric in RESULTS_METRICS if (metric_cutoff(metric) or 0) > rows]
+
+
+def results_metrics(n_validation: int) -> list[str]:
+    """The metrics the results table may show for a validation partition this size."""
+    dropped = set(truncated_metrics(n_validation))
+    return [metric for metric in RESULTS_METRICS if metric not in dropped]
+
+
+def truncation_note(dropped: Sequence[str], n_validation: int) -> str:
+    """Why a metric the run did record is missing from the table. Empty when none is."""
+    if not dropped:
+        return ""
+    names = ", ".join(f"`{metric}`" for metric in dropped)
+    cuts = ", ".join(str(metric_cutoff(metric)) for metric in dropped)
+    rows = int(n_validation)
+    counted = f"{rows} row" if rows == 1 else f"{rows} rows"
+    verb, named = ("is", "it names") if len(dropped) == 1 else ("are", "they name")
+    return (
+        f"{names} {verb} not in this table: the validation partition is **{counted}**, shorter than the "
+        f"cut {named} ({cuts}). Every variant falls inside a cut that long, so the number cannot mean what "
+        "its name promises — with that few rows even an arbitrary ranking scores a long way above zero. "
+        "`report.csv` in the performance archive carries it anyway."
+    )
+
+
+def validation_rows(splits: Any) -> int:
+    """How many rows the smallest validation partition of these splits holds; 0 when unknown."""
+    try:
+        sizes = [len(split["val_idx"]) for split in dict(splits).values()]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return 0
+    return min(sizes) if sizes else 0
+
+
+def progress_html(done: int, total: int, label: str) -> str:
+    """The training progress line: runs finished, and what the run in flight is doing.
+
+    `done` counts *finished* runs, so it holds still while the label beside it counts the
+    epochs and batches of the one being trained. `colabsd.train.finetune` rewrites that label
+    several times a second and its length changes with every number in it, so the line is one
+    fixed-height row that is clipped rather than wrapped, and carries the whole label as hover
+    text. Nothing below it moves while a run reports.
+    """
+    shown = str(label).strip()
+    return (
+        f"<div title=\"{escape(shown)}\" style=\"{PROGRESS_STYLE}\">"
+        f"<code>{int(done)}/{int(total)} runs finished</code>"
+        f"{' · ' + escape(shown) if shown else ''}</div>"
+    )
 
 
 def validation_headline(summary: dict[str, Any] | None) -> str:
@@ -1043,16 +1322,6 @@ class Backend:
 
         return finetune(**kwargs)
 
-    def one_hot_baseline(self, *args: Any, **kwargs: Any) -> Any:
-        from colabsd.baseline import one_hot_baseline
-
-        return one_hot_baseline(*args, **kwargs)
-
-    def baseline_floor(self, baseline: dict, **kwargs: Any) -> Any:
-        from colabsd.baseline import baseline_floor
-
-        return baseline_floor(baseline, **kwargs)
-
     def save_bundle_from_run(self, path: Path, **kwargs: Any) -> Path:
         from colabsd.bundle import save_bundle_from_run
 
@@ -1122,7 +1391,7 @@ def random_variants(spec: LibrarySpec, how_many: int, seed: int) -> Any:
     import numpy as np
     import pandas as pd
 
-    from colabsd.baseline import one_to_three_letter
+    from colabsd.data import one_to_three_letter
 
     residues = list("ACDEFGHIKLMNPQRSTVWY")
     if spec.three_letter:
@@ -1169,8 +1438,6 @@ class MainWizard:
         self.adapter: Any = None
         self.splits: Any = None
         self.run: Any = None
-        self.baseline: Any = None
-        self.floor: dict[str, Any] | None = None
         self.bundle: Any = None
         self.bundle_path: Path | None = None
         self.performance: exports.PerformanceExport | None = None
@@ -1325,9 +1592,32 @@ class MainWizard:
         ]
 
     def _build_hyperparameters(self) -> None:
+        """The lookup, read-only, and under it the three boxes that start at its own numbers.
+
+        The section keeps its shape: what a study selected is still a table nobody can type
+        into. The budget sits below it as ordinary fields, each beside the one word that says
+        whether it is still the looked-up value. They start at zero and are off screen until
+        `_sync_budget` has an entry to fill them from.
+        """
         self.fields["hyperparameters"] = theme.html("")
+        self.budget_tags: dict[str, Any] = {}
+        self.budget_rows: dict[str, Any] = {}
+        for key in BUDGET_KEYS:
+            self.fields[key] = self.w.BoundedIntText(
+                value=int(self.state.get(key) or 0),
+                min=0,
+                max=BUDGET_MAXIMA[key],
+                description=BUDGET_LABELS[key],
+                style=_LABEL,
+                layout=_WIDE,
+            )
+            self.budget_tags[key] = theme.html("")
+            self.budget_rows[key] = self.w.HBox([self.fields[key], self.budget_tags[key]])
+        self.budget_note = theme.note("")
         self._layout["hyperparameters"] = [
             self.fields["hyperparameters"],
+            *self.budget_rows.values(),
+            self.budget_note,
             self.boards["hyperparameters"].widget,
             self.logs["hyperparameters"],
         ]
@@ -1383,6 +1673,9 @@ class MainWizard:
         )
         self.fields["run_button"] = self._button("Train", "primary")
         self.progress = theme.html("")
+        # Reserved before anything is trained: the first progress line then appears in space
+        # that is already there rather than pushing the log below it down the page.
+        self.progress.layout.min_height = PROGRESS_ROW_HEIGHT
         self._layout["run"] = [
             self.fields["advanced_toggle"],
             self.boards["run"].widget,
@@ -1565,16 +1858,23 @@ class MainWizard:
         self.refresh()
 
     def _guard(self, section: str, action: Callable[[], None]) -> Callable[[], None]:
-        """Run a step, and put whatever it raises on the page instead of in a traceback."""
+        """Run a step, and put whatever it raises on the page instead of in a traceback.
+
+        The training section gets one sentence more than the exception carries: a run the card
+        could not hold is the reason the micro batch is on this form at all, and the error it
+        dies with names bytes rather than a field. Only `run` — the folding step above runs out
+        of memory too, `colabsd.structure` already says what to do about that, and lowering a
+        micro batch would not be it.
+        """
 
         def handle() -> None:
             self.logs[section].value = ""
             try:
                 action()
             except Exception as exc:  # noqa: BLE001 - the message is the product here
-                self.logs[section].value = theme.message_html(
-                    f"**That did not work.** {type(exc).__name__}: {exc}", "stop"
-                )
+                text = f"**That did not work.** {type(exc).__name__}: {exc}"
+                advice = out_of_memory_advice(exc, training_budget(self.state)) if section == "run" else ""
+                self.logs[section].value = theme.message_html(f"{text}\n\n{advice}" if advice else text, "stop")
             self.refresh()
 
         return handle
@@ -1592,13 +1892,14 @@ class MainWizard:
     def _refresh(self) -> core.Plan:
         status = self._config_status()
         self._sync_seed_limits()
+        self._sync_budget()
         artefact = self.artefact()
         self._sync_structure(artefact)
         self.plan = core.plan(self.state, runtime=self.runtime, status=status)
         items = messages(self.state, runtime=self.runtime, status=status, artefact=artefact)
 
         visible = section_visibility(self.state)
-        core.apply_field_visibility({k: v for k, v in self.fields.items() if k in core.FIELD_KEYS}, self.state)
+        core.apply_field_visibility(self._visibility_targets(), self.state)
         for key, shown in outlet_field_visibility(self.state).items():
             core.set_display(self.outlets[key], shown)
         titles = numbered_titles(self.state)
@@ -1614,10 +1915,47 @@ class MainWizard:
         self.plan_note.value = theme.note_html(plan_line(self.state, self.best))
         self.fields["run_button"].disabled = not can_train(items)
         if self.best is not None:
-            self.fields["hyperparameters"].value = hyperparameter_html(hyperparameter_view(self.best))
+            view = hyperparameter_view(self.best, training_budget(self.state))
+            self.fields["hyperparameters"].value = hyperparameter_html(view)
         else:
             self.fields["hyperparameters"].value = no_hyperparameters_html(self.state.backbone, status)
         return self.plan
+
+    def _visibility_targets(self) -> dict[str, Any]:
+        """The widget `core.apply_field_visibility` shows or hides for each declared field.
+
+        A budget box lives in an `HBox` beside the tag that says whether it still holds the
+        looked-up value; hiding the box alone would leave the tag stranded on the page.
+        """
+        targets = {key: widget for key, widget in self.fields.items() if key in core.FIELD_KEYS}
+        targets.update(self.budget_rows)
+        return targets
+
+    def _sync_budget(self) -> None:
+        """Fill the three boxes from the entry on screen, then say which no longer match it.
+
+        The prefill happens whenever the numbers the boxes were filled from change: the first
+        refresh after a lookup, and again when a new backbone's entry says something different.
+        A backbone whose entry says exactly what the last one said is not a new prefill, so a
+        micro batch someone lowered after an out-of-memory error survives changing the model —
+        the card did not get any bigger. Between prefills the user's numbers stand, and each
+        box carries whether it is still the looked-up one.
+        """
+        lookup = budget_lookup(self.best)
+        if lookup and lookup != self.state.budget_lookup:
+            self.state.budget_lookup = lookup
+            for key in BUDGET_KEYS:
+                self.state.set(key, int(lookup[key]))
+                self.fields[key].value = int(lookup[key])
+        elif not lookup and self.state.budget_lookup:
+            # The backbone on screen has no entry at all. Nothing was looked up, so there is
+            # nothing for the boxes to mean and `core`'s rule takes them off the page.
+            self.state.budget_lookup = {}
+        budget = training_budget(self.state)
+        for key in BUDGET_KEYS:
+            self.budget_tags[key].value = changed_tag_html(getattr(budget, key), budget.lookup.get(key, 0))
+        self.budget_note.value = theme.note_html(budget_note(budget)) if budget.known else ""
+        core.set_display(self.budget_note, budget.known)
 
     def artefact(self) -> prep.Artefact | None:
         """The 3Di string this session made, when it still describes the wild type on screen."""
@@ -1674,7 +2012,13 @@ class MainWizard:
         return status
 
     def _progress(self, done: int, total: int, label: str) -> None:
-        self.progress.value = f"<div><code>{done}/{total}</code> {label}</div>"
+        """`colabsd.train.finetune`'s progress callback, rendered as one line.
+
+        Called as often as the trainer reports -- several times a second, from inside the
+        training loop -- so it does the least a widget update can do: format one string and
+        assign it.
+        """
+        self.progress.value = progress_html(done, total, label)
 
     def _say(self, section: str, text: str) -> None:
         self.logs[section].value = theme.note_html(text)
@@ -1762,7 +2106,7 @@ class MainWizard:
             )
 
         self.adapter = self.backend.create_adapter(self.state.backbone, **adapter_kwargs(self.state, self.spec))
-        split_seeds, model_seeds = training_seeds(self.state, self.best)
+        split_seeds, _ = training_seeds(self.state, self.best)
         self.splits = self.backend.make_splits(
             len(self.sequences), split_seeds, split_dir(self.state, len(self.sequences))
         )
@@ -1778,19 +2122,6 @@ class MainWizard:
                 progress=self._progress,
             )
         )
-        self.baseline = self.backend.one_hot_baseline(
-            self.frame,
-            self.spec,
-            self.targets,
-            self.splits,
-            model_seeds=model_seeds,
-            heads=("ridge", "mlp"),
-            progress=self._progress,
-        )
-        self.floor = self.backend.baseline_floor(self.baseline, metric="Spearman", partition="validation")
-
-        macro = (getattr(self.run, "validation_summary", {}) or {}).get("Spearman", {})
-        self.state.set("floor_cleared", clears_floor(macro.get("mean"), self.floor))
         # Freeze what this run actually was. `self.best` follows the dropdown; the bundle
         # must not, or it records one backbone's hyperparameters beside another's weights.
         self.trained_best, self.trained_spec = self.best, self.spec
@@ -1802,30 +2133,27 @@ class MainWizard:
             self.logs["run"].value += theme.message_html(warning, "warning")
 
     def _results_html(self) -> str:
-        """The validation numbers and the one-hot floor, side by side."""
-        import pandas as pd
-
+        """What this run scored on validation, per condition and averaged over them."""
         summary = getattr(self.run, "validation_summary", {}) or {}
-        macro = summary.get("Spearman", {})
         model_label = getattr(self.run, "model_name", self.state.backbone)
+        n_validation = validation_rows(self.splits)
         aggregate = getattr(self.run, "aggregate", None)
         if aggregate is not None and len(aggregate):
-            model_table = aggregate[aggregate["metric"].isin(["Spearman", "R2", "NDCG@50"])].to_html(index=False)
+            table = aggregate[aggregate["metric"].isin(results_metrics(n_validation))].to_html(index=False)
         else:
-            model_table = "<i>no per-condition table</i>"
-        rows = floor_rows(self.baseline)
-        floor_table = pd.DataFrame(rows).to_html(index=False) if rows else "<i>no floor computed</i>"
+            table = "<i>no per-condition table</i>"
+        note = truncation_note(truncated_metrics(n_validation), n_validation)
         return (
             theme.note_html(
                 f"Finished {getattr(self.run, 'n_runs', 0)} run(s) in "
                 f"{core.format_minutes(getattr(self.run, 'minutes', 0.0))}.\n"
-                f"- **{validation_headline(summary)}**\n"
-                f"- {floor_comparison(model_label, macro.get('mean'), self.floor)}"
+                f"- **{validation_headline(summary)}**"
             )
-            + "<div style='display:flex;gap:28px;flex-wrap:wrap;margin-top:10px'>"
-            + f"<div><b>{model_label} — validation</b>{model_table}</div>"
-            + f"<div><b>One-hot floor — validation</b>{floor_table}</div></div>"
-            + theme.note_html("These are validation numbers: the test partition is still locked.")
+            + f"<div style='margin-top:10px'><b>{model_label} — validation</b>{table}</div>"
+            + theme.note_html(
+                "These are validation numbers: the test partition is still locked."
+                + (f"\n\n{note}" if note else "")
+            )
         )
 
     def _export_runners(self) -> exports.ExportRunners:
@@ -1875,7 +2203,6 @@ class MainWizard:
         export = exports.export_performance(
             work_dir=work_dir(self.state),
             run_result=self.run,
-            baseline=self.baseline,
             spec=self.trained_spec,
             best=self.trained_best,
             archive_name=archive_name,

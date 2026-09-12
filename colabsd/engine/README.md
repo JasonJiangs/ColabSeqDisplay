@@ -3,7 +3,7 @@
 **This directory is a copy of someone else's research code.** It derives from
 **SequenceDisplay-Workflow-Optimization** (Python package `seqdisplay_opt`), which owns
 the method `colabsd` runs: LoRA injection, the training loop, pooling, the metrics, the
-head registry and the split protocol. Every module here opens with a header naming the
+regression head and the split protocol. Every module here opens with a header naming the
 upstream file it came from and what was changed on the way in.
 [`ATTRIBUTION.md`](../../ATTRIBUTION.md) collects those headers, and records that the
 upstream project ships no licence file.
@@ -48,9 +48,9 @@ changes; it runs `inject_lora` against real HuggingFace attention naming (`EsmMo
 `T5EncoderModel`, built from a small config with no weights and no network) rather than a
 toy module tree; and it compares every shared definition at AST level, with docstrings,
 annotations, formatting and the deliberate renames normalised away, so an undocumented
-edit to a body here fails even where no behavioural test reaches it. The six bodies that
-`ATTRIBUTION.md` records as deliberate departures are its allow-list: adding a seventh
-without recording it fails, and so does leaving one listed after it has been reverted.
+edit to a body here fails even where no behavioural test reaches it. The bodies that
+`ATTRIBUTION.md` records as deliberate departures are its allow-list: adding one without
+recording it fails, and so does leaving one listed after it has been reverted.
 
 These comparisons need the research checkout and skip cleanly without it, so the suite
 stays green for a user who only has this repository:
@@ -72,11 +72,10 @@ module you need.
 | `lora.py` | `LoRALinear`, `inject_lora`, `target_roles`, `validate_qkvo_coverage`, `lora_parameters` |
 | `training.py` | `train_epoch` and its batching helpers — the loop the tuned configs were selected on |
 | `train_config.py` | `train_eval_config` (one fine-tune + evaluation) and `load_lora_best_config` |
-| `heads.py` | the head registry, `MLPHead`, `RidgeHead`, `create_head`, `select_safe_device` |
+| `heads.py` | `MLPHead` — the one head this pipeline trains — its AdamW loop, and `select_safe_device` |
 | `metrics.py` | `evaluate_predictions` and the validation-log helpers |
 | `pooling.py` | position selection and the mean reducer, composed into one `pool` |
 | `splits.py` | the reproducible 8:1:1 split protocol |
 | `protein_db.py` | the protein record: a wild type's length and the sites its library mutates |
-| `one_hot.py` | the amino-acid vocabulary and per-site one-hot encoder behind the floor |
 | `formats.py` | per-family input formatting (SaProt 3Di interleaving, ProtT5, Ankh, SeqDance) |
 | `adapters.py`, `schema.py`, `config_space.py`, `loader.py`, `sequences.py` | the protocol, config objects and small helpers the above depend on |
