@@ -117,7 +117,10 @@ class HFAdapterBase:
         except Exception as exc:
             raise BackboneError(
                 f"Could not load the {what} for '{self.model_name}' from '{self.hf_id}': "
-                f"{type(exc).__name__}: {exc}. Four things cause this. The repo may be missing or "
+                f"{type(exc).__name__}: {exc}. Five things cause this. The runtime may have torch older "
+                "than 2.6, which transformers will not load a `pytorch_model.bin` with "
+                "(CVE-2025-32434) — SaProt ships .bin, so it is the one this stops. The repo may be "
+                "missing or "
                 "renamed. The runtime may have no internet access. A previous download may have "
                 "stopped part-way and left the config and tokenizer cached without the weights — "
                 "clear ~/.cache/huggingface/hub and retry. Or an expired HF_TOKEN may be turning a "
