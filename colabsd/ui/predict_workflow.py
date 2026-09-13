@@ -467,6 +467,10 @@ def visible_fields(state: PredictState) -> frozenset[str]:
     if state.facts is None:
         return frozenset(shown)
     shown |= {"variants_source", "prepare_button", "rank_by", "top_n_to_show", "score_batch_size", "output_name"}
+    if state.variants_source in ("upload_variants_csv", "rows_of_a_library_csv"):
+        # Both of these ask the user for a file carrying the bundle's mutated-site columns,
+        # so both get the template. `random_combinations` builds its own rows and needs none.
+        shown.add("example_button")
     if state.variants_source in ("random_combinations", "rows_of_a_library_csv"):
         shown.add("how_many")
     if state.variants_source == "random_combinations":
@@ -896,9 +900,18 @@ class PredictWizard:
         self.score_button = ipywidgets.Button(
             description="Score and rank", button_style="success", layout=ipywidgets.Layout(width="220px")
         )
+        # The columns a variants CSV needs are the bundle's, not ours to print in a label,
+        # so the answer to "what shape is this file" is a file. `visible_fields` keeps it off
+        # the page until a bundle has been read, because until then there is nothing to write.
+        self.example_button = ipywidgets.Button(
+            description="Download an example variants CSV",
+            button_style="",
+            layout=ipywidgets.Layout(width="280px"),
+        )
         self.fields["load_bundle_button"] = self.load_bundle_button
         self.fields["prepare_button"] = self.prepare_button
         self.fields["score_button"] = self.score_button
+        self.fields["example_button"] = self.example_button
 
         self.bundle_box = theme.html("")
         self.notice_box = theme.html("")
@@ -911,6 +924,7 @@ class PredictWizard:
         self.load_bundle_button.on_click(self.on_load_bundle)
         self.prepare_button.on_click(self.on_prepare_variants)
         self.score_button.on_click(self.on_score)
+        self.example_button.on_click(self.on_example_variants)
         self.refresh()
 
     # -- state ---------------------------------------------------------------------------
@@ -1007,6 +1021,7 @@ class PredictWizard:
             "variants_source",
             "how_many",
             "random_seed",
+            "example_button",
             "prepare_button",
             "rank_by",
             "top_n_to_show",
@@ -1039,6 +1054,32 @@ class PredictWizard:
         """
         self.notice_box.value = theme.message_html(upload_wait_text(what), "warning") + self.notice_box.value
         return Path(self.runners.upload(what, announce=lambda text: self._say(plain_text(text))))
+
+    def on_example_variants(self, _button: Any = None) -> Path | None:
+        """Write a variants template with this bundle's columns and offer it for download."""
+        from colabsd import templates
+
+        if self.bundle is None or self.facts is None:
+            self._say("load a bundle first: the columns of the template come from it.")
+            return None
+        try:
+            spec = self.bundle.spec
+            wt = str(getattr(spec, "wt_sequence", "") or "")
+            positions = list(self.facts.positions_1based)
+            residues = (
+                [wt[position - 1] for position in positions]
+                if wt and positions and max(positions) <= len(wt)
+                else None
+            )
+            target = templates.write_variants_template(
+                self.work_dir, self.facts.mutation_columns, wt_residues=residues
+            )
+        except Exception as exc:  # a template is a convenience; it may not break the panel
+            self._say(f"could not write the example: {type(exc).__name__}: {exc}")
+            return None
+        self._say(f"wrote {target}")
+        self.runners.download(target)
+        return target
 
     def on_load_bundle(self, _button: Any = None) -> BundleFacts | None:
         """Load the bundle and put everything it contains on the screen."""

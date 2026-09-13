@@ -84,8 +84,10 @@ free-T4 ceiling is 700 residues.
 ### Steps 3 to 6 — hyperparameters, runs, storage, train
 
 **Step 3 displays the seven LoRA values looked up from `config/best/`**, the fixed training block
-and the provenance — for every backbone the notebook offers, today, a red `PROVISIONAL` banner
-reading `ESM2-35M · PROVISIONAL — hyperparameters are a placeholder, performance unknown` (see
+and the provenance. Six of the seven backbones the notebook offers carry tuned values and show
+them — `ESM2-35M · tuned (test ρ=0.5608 ± 0.0120, 9 runs)`. The seventh, `ESM2-8M`, has no study
+behind it and shows a red banner instead: `ESM2-8M · PROVISIONAL — hyperparameters are a
+placeholder, performance unknown` (see
 [Reading the PROVISIONAL warning](#reading-the-provisional-warning)). None of those is editable.
 
 **Three boxes under that table are yours**, prefilled from the same entry: *Epochs, at most* (20),
@@ -242,16 +244,15 @@ wherever it appears, and never stops you: the step 3 banner and its message boar
 after training, the performance archive, the bundle's description line, and the unlock cell and
 Predict notebook beside the numbers themselves.
 
-**Every entry the notebook can reach is a placeholder today**, and each says where its numbers came
-from: `source: median of the 10 tuned cosine_p90_mean configs`, the entry's own record of the
-hyperparameter study it is the median of. Nobody searched those values for this backbone, and no
-performance number stands behind them. A model trained on them can still rank variants usefully; it
+**One offered backbone is still a placeholder: `ESM2-8M`.** Its entry says where its numbers came
+from — `source: the 10 tuned mutation_site_mean configs`, the median of the others — and nobody
+searched them for this backbone. A model trained on them can still rank variants usefully; it
 cannot support a claim about how well this backbone performs.
 
-**A `tuned` entry would not settle it either.** Those hyperparameters were selected once by an
-Optuna search on the benchmark library. On *your* protein, "tuned" would mean *transferred from a
-tuned search on another library* — a better starting point than a placeholder, not a configuration
-fitted to your data.
+**A `tuned` entry does not settle it either.** Those hyperparameters were selected once by an
+Optuna search on the benchmark library, with the same mutated-site read-out a run here uses. On
+*your* protein, "tuned" still means *transferred from a tuned search on another library* — a
+better starting point than a placeholder, not a configuration fitted to your data.
 
 ### A sensible first pass on a new library
 

@@ -126,32 +126,38 @@ loads a bundle from any of them.
 ## Configurations
 
 `config/best/` holds 28 files, two per backbone. The lookup takes a backbone name and nothing else
-and always reads the same half — the 14 entries a run can reach, **every one of them a
-placeholder**: `_meta.status: provisional`, the median of the study's ten tuned entries, with no
-measured performance behind it. The panel, the training log, both exports, the bundle manifest, the
-unlock cell and Predict all print `PROVISIONAL`.
+and always reads the same half — the 14 `mutation_site_mean` entries, of which **10 are tuned and
+4 are placeholders** (`Ankh-large`, `ESM2-8M`, `ESMC-600M`, `SeqDance`). A placeholder carries
+`_meta.status: provisional` and no measured performance, and the panel, the training log, both
+exports, the bundle manifest, the unlock cell and Predict all print `PROVISIONAL` for it. A tuned
+entry prints its ρ instead.
 
-The other 14 are the written record of the study those medians come from; nothing reads them. **ρ
-is the mean test Spearman over the nine re-evaluation runs in such a file, measured on the SlugCas9
-5NNK library by the seqdisplay-opt study** (see [Acknowledgement](#acknowledgement)) — not by this
-package, not on your protein, and with a read-out of that protein this package no longer computes.
-Read it as the provenance of the placeholders, not as a prediction about your library:
+**These ρ were selected with the read-out this pipeline actually uses.** Earlier releases could
+only quote the study's other half, chosen by averaging a discovered region of the benchmark
+protein — a read-out this package no longer computes. The `mutation_site_mean` study averages the
+mutated sites, which is what a run here does, so the numbers below and the configuration a run
+loads come from the same experiment.
+
+**ρ is the mean test Spearman over nine re-evaluation runs, measured on the SlugCas9 5NNK library
+by the seqdisplay-opt study** (see [Acknowledgement](#acknowledgement)) — not by this package, and
+not on your protein:
 
 | Backbone | Study ρ on SlugCas9 5NNK |
 |---|---|
-| `ESM2-8M` | — |
-| `ESM2-35M` | 0.5486 ± 0.0145 |
-| `ESM2-150M` | 0.5546 ± 0.0105 |
-| `ESM2-650M` | 0.5636 ± 0.0128 |
-| `SaProt-35M` | 0.5576 ± 0.0162 |
-| `SaProt-650M` | 0.5592 ± 0.0110 |
-| `SaProt-1.3B` | 0.5578 ± 0.0142 |
+| `ESM2-8M` | — (placeholder) |
+| `ESM2-35M` | 0.5608 ± 0.0120 |
+| `ESM2-150M` | 0.5636 ± 0.0113 |
+| `ESM2-650M` | 0.5618 ± 0.0125 |
+| `SaProt-35M` | 0.5555 ± 0.0126 |
+| `SaProt-650M` | 0.5580 ± 0.0085 |
+| `SaProt-1.3B` | 0.5559 ± 0.0162 |
 
-Each came from a 40-trial Optuna study per model on split seed 1 and training seed 11; the three
-best validation configurations were re-trained over three splits × three training seeds and the
-highest mean validation Spearman across those nine runs kept. Across all 28 files: 10 tuned, 18
-placeholder; the four tuned files outside this table are `ESMC-300M`, `ProtT5-XL`, `ESMDance` and
-`METL`.
+Each came from a 40-trial Optuna study per model on split seed 1 and training seed 11; the
+selected trial was re-trained over three split seeds × three training seeds, and ρ is the mean and
+standard deviation of the test Spearman across those nine runs. Across all 28 files: 20 tuned, 8
+placeholder. Four tuned `mutation_site_mean` entries sit outside the table because the notebook
+does not offer their backbone — `ESMC-300M`, `ProtT5-XL`, `ESMDance` and `METL` — and a
+`model_bundle.zip` trained on one of them still scores in Predict.
 
 **Fixed training settings**, identical in every file: 20 maximum epochs, early stopping with
 patience 3, MSE loss, targets z-scored on the training split, gradient accumulation derived from
@@ -204,7 +210,7 @@ GPU first.
 | How well any backbone predicts activity | **not measured here.** Every benchmark number on this page is the seqdisplay-opt study's, on SlugCas9 5NNK; the one run this repository has made is an illustration. The bundled MG8 example shows the workflow runs — its 13 test variants measure nothing |
 | Any Colab runtime timing | **not measured** — every minute quoted here is an estimate, scaled from one timed forward pass: ESM2-650M over the study library's 16,424 sequences of 1054 residues in float16, 319 s, on a B200 |
 | Benchmark ρ in the [configuration table](#configurations) | produced by the seqdisplay-opt study on NVIDIA B200-class GPUs, nine runs per model over three splits × three seeds. A single default Colab run reports `nan` for the standard deviation |
-| The hyperparameters those ρ selected | chosen with a read-out that averaged a discovered region of the benchmark protein, which this package no longer computes. How they transfer to averaging the mutated sites has not been measured; the 14 entries a run can reach are their median, and provisional |
+| The hyperparameters those ρ selected | selected on the benchmark protein, with the same mutated-site read-out a run here uses. How they transfer to *your* protein has not been measured. Four of the 14 reachable entries have no study behind them at all and stay provisional: `Ankh-large`, `ESM2-8M`, `ESMC-600M`, `SeqDance` |
 | `colabsd/engine/` | a copy of the seqdisplay-opt code the notebooks reach, not a shared library; the search machinery that *produces* a tuned configuration stayed with the original study. [`ATTRIBUTION.md`](ATTRIBUTION.md) lists what was copied, what was left behind, and the deliberate departures |
 | Determinism | fixing a seed fixes the split and the initialisation; it does not make GPU training bit-reproducible across cards, drivers or library versions |
 | Predictions | rank variants; they do not measure them |

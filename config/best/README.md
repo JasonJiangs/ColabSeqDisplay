@@ -14,7 +14,7 @@ twice the size of the list of backbones:
 
 | filename half | count | status | reachable |
 |---|---|---|---|
-| `<model>_mutation_site_mean.yaml` | 14 | all `provisional` — placeholders | **yes**, this is the half `colabsd.bestconfig` reads |
+| `<model>_mutation_site_mean.yaml` | 14 | 10 `tuned`, 4 `provisional` | **yes**, this is the half `colabsd.bestconfig` reads |
 | `<model>_cosine_p90_mean.yaml` | 14 | 10 `tuned`, 4 `provisional` | no |
 
 `colabsd.bestconfig.load_best_config(model)` takes a backbone name and nothing else. It
@@ -24,69 +24,57 @@ ask for a `cosine_p90_mean` entry, and `training.pooling` in a file is a label r
 which half of the study it belongs to, not a setting: an entry whose field and filename
 disagree is refused rather than run under the wrong name.
 
-**So every entry a run can reach today is a placeholder**, and the workflow says so before
-training. `_meta.status` is `provisional` in all 14, `BestConfig.is_provisional` is True,
-`describe()` prints `PROVISIONAL` in capitals, and the same flag follows the run into the
-training log, `model_bundle.zip`, `performance_report.zip` (as `hyperparameters.status` in
-`performance.json` and as a paragraph in that archive's `README.txt`), the unlock cell and
-the Predict notebook. A placeholder is a real, runnable configuration — the median of the
-10 tuned entries — but no study selected it, so nothing it produces is a result. What the
-results step gives you instead is the validation score per condition and how far the
-repeated runs spread around it.
+**Ten of the 14 reachable entries are tuned**, and four are placeholders: `Ankh-large`,
+`ESM2-8M`, `ESMC-600M` and `SeqDance`, for which the study ran no `mutation_site_mean` search.
+For those four `_meta.status` is `provisional`, `BestConfig.is_provisional` is True, `describe()`
+prints `PROVISIONAL` in capitals, and the same flag follows the run into the training log,
+`model_bundle.zip`, `performance_report.zip` (as `hyperparameters.status` in `performance.json`
+and as a paragraph in that archive's `README.txt`), the unlock cell and the Predict notebook. A
+placeholder is a real, runnable configuration — built from the ten tuned entries — but no study
+selected it, so nothing it produces is a result.
 
-**The 14 unreachable files stay on disk.** They are the written record of a real
-hyperparameter study — the only place its selected trials, seeds and test scores appear —
-and `ATTRIBUTION.md` points at them. Deleting them would delete the provenance of the
-numbers the placeholders are the median of. Nothing reads them; they are here to be read by
-a person.
+**The 14 `cosine_p90_mean` files stay on disk.** They are the written record of the study's other
+half — the only place its selected trials, seeds and test scores appear — and `ATTRIBUTION.md`
+points at them. Nothing reads them; they are here to be read by a person.
 
 ## Where the tuned numbers came from
 
 Not from this package. The 10 `tuned` entries are the seqdisplay-opt study's selected LoRA
-configurations, measured on **its own SlugCas9 5NNK library, which is not redistributed
-here** (see `../../ATTRIBUTION.md`). Each came from a 40-trial Optuna study on one split
-seed; the three best validation configurations were re-trained over three split seeds ×
-three model seeds, and the one with the highest mean validation Spearman across those nine
-runs was kept. ρ below is that entry's mean ± sd **test** Spearman over the same nine runs,
-as stored in its `_meta` block.
+configurations for **this pooling**, measured on **its own SlugCas9 5NNK library, which is not
+redistributed here** (see `../../ATTRIBUTION.md`). Each came from a 40-trial Optuna study on one
+split seed; the selected trial was re-trained over three split seeds × three model seeds. ρ below
+is that entry's mean ± sd **test** Spearman over those nine runs, as stored in its `_meta` block,
+and `_meta.source_file` names the upstream file each parameter block was copied from.
 
 | backbone | offered | ρ, study measurement | Optuna trial |
 |---|---|---|---|
-| ESM2-650M | yes | 0.5636 ± 0.0128 | 21 |
-| SaProt-650M | yes | 0.5592 ± 0.0110 | 38 |
-| ProtT5-XL | no | 0.5583 ± 0.0105 | 32 |
-| SaProt-1.3B | yes | 0.5578 ± 0.0142 | 33 |
-| SaProt-35M | yes | 0.5576 ± 0.0162 | 18 |
-| METL | no | 0.5574 ± 0.0187 | 22 |
-| ESM2-150M | yes | 0.5546 ± 0.0105 | 30 |
-| ESMC-300M | no | 0.5487 ± 0.0166 | 16 |
-| ESM2-35M | yes | 0.5486 ± 0.0145 | 10 |
-| ESMDance | no | 0.5478 ± 0.0092 | 18 |
+| ESM2-150M | yes | 0.5636 ± 0.0113 | 27 |
+| ESM2-650M | yes | 0.5618 ± 0.0125 | 39 |
+| ESMC-300M | no | 0.5611 ± 0.0107 | 35 |
+| ESM2-35M | yes | 0.5608 ± 0.0120 | 37 |
+| ProtT5-XL | no | 0.5581 ± 0.0162 | 21 |
+| SaProt-650M | yes | 0.5580 ± 0.0085 | 2 |
+| ESMDance | no | 0.5569 ± 0.0128 | 28 |
+| SaProt-1.3B | yes | 0.5559 ± 0.0162 | 12 |
+| SaProt-35M | yes | 0.5555 ± 0.0126 | 2 |
+| METL | no | 0.5482 ± 0.0158 | 12 |
 
-The trial number is the one selected *after* re-evaluating the study's best candidates,
-which is not always its single best validation trial.
+**Two things those ρ are not.** They are one protein and one assay, not yours. And they are a
+measurement of the *study's* library, not a prediction about the transfer to yours. What they are
+no longer is a number from a different read-out: this half of the study pooled the mutated sites,
+which is exactly what a run here does.
 
-**Two things those ρ are not.** They are one protein and one assay, not yours. And they were
-selected with a read-out that averaged a discovered region of that protein — a region that
-had to be recomputed for every new protein, and which this package no longer computes at
-all, because pooling the mutated sites needs nothing computed first. How the values transfer
-to the read-out a run actually uses has not been measured. Read the table as the provenance
-of the placeholders, not as a prediction about your library.
-
-Whole spread across the ten: 0.5478 to 0.5636, a range of 0.0158 — smaller than it looks
-next to a single backbone's own ±0.0128 across nine runs. LoRA is fairly forgiving, which is
-why a placeholder is a sensible starting point. What it is not is a measured one.
-
-`ESM2-8M`, `Ankh-large`, `ESMC-600M` and `SeqDance` are provisional in both halves: the
-study ran no LoRA search for them. ESM2-3B and ESM2-15B have no entries at all — they do not
-fit the hardware this tool targets.
+Whole spread across the ten: 0.5482 to 0.5636, a range of 0.0154 — comparable to a single
+backbone's own ±0.0162 across nine runs. LoRA is fairly forgiving, which is why the median of
+these is a sensible starting point for a backbone the study never searched. What it is not is a
+measured one.
 
 ## File format
 
 ```yaml
 _meta:                          # provenance; not read by the training code
   status: provisional           # or: tuned
-  source: median of the 10 tuned cosine_p90_mean configs
+  source: the 10 tuned mutation_site_mean configs
   replace_with: output of seqdisplay-lora-optuna for this model/pooling
   test_spearman_mean: unknown   # tuned entries carry the number, its sd,
                                 # optuna_trial and n_reevaluation_runs instead
@@ -144,8 +132,9 @@ looked up. `colabsd.bestconfig.BudgetOverrides` rejects any key outside
 
 ## Filling a gap
 
-What is missing is a tuned `mutation_site_mean` entry for any backbone — that is the whole
-gap, and it is why all 14 reachable files are placeholders. Closing it means running the
+What is missing is a tuned `mutation_site_mean` entry for `Ankh-large`, `ESM2-8M`, `ESMC-600M`
+and `SeqDance`, the four backbones the study did not search. Of the seven the notebook offers,
+only `ESM2-8M` is in that list. Closing a gap means running the
 search offline against your own library with the seqdisplay-opt command line
 (`seqdisplay-lora-optuna` to run the study, `seqdisplay-lora-reevaluate` to retrain its best
 candidates across split and model seeds), then copying the winning trial's values in with

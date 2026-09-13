@@ -1463,6 +1463,7 @@ class MainWizard:
         self.fields: dict[str, Any] = {}
         self.outlets: dict[str, Any] = {}
         self.uploads: dict[str, Any] = {}
+        self.examples: dict[str, Any] = {}
 
         self._build_data()
         self._build_model()
@@ -1499,7 +1500,14 @@ class MainWizard:
             style=_LABEL,
         )
         self.outlets["example_note"] = theme.note(example_note())
-        self.fields["library_csv"] = self._upload_row("library_csv", "Upload library.csv", "your library.csv", "data")
+        self.fields["library_csv"] = self._upload_row(
+            "library_csv",
+            "Upload library.csv",
+            "your library.csv",
+            "data",
+            example=self._write_library_template,
+            example_label="Download an example library.csv",
+        )
         self.fields["wt_sequence"] = self.w.Textarea(
             value=str(self.state.get("wt_sequence") or ""),
             placeholder="MSKQ… , or the URL of a FASTA file (an AlphaFold or UniProt link works)",
@@ -1744,7 +1752,12 @@ class MainWizard:
             layout=_WIDE,
         )
         self.outlets["score_variants_csv"] = self._upload_row(
-            "score_variants_csv", "Upload variants CSV", "a variants CSV", "score"
+            "score_variants_csv",
+            "Upload variants CSV",
+            "a variants CSV",
+            "score",
+            example=self._write_variants_template,
+            example_label="Download an example variants CSV",
         )
         self.outlets["score_rank_by"] = self.w.Dropdown(
             options=[("Average over conditions (pred_mean)", "pred_mean"), ("Worst condition (pred_min)", "pred_min")],
@@ -1782,8 +1795,23 @@ class MainWizard:
     def _button(self, description: str, style: str) -> Any:
         return self.w.Button(description=description, button_style=style, layout=_WIDE)
 
-    def _upload_row(self, name: str, description: str, what: str, section: str) -> Any:
-        """An upload button beside the path it produced, so a typed path works too."""
+    def _upload_row(
+        self,
+        name: str,
+        description: str,
+        what: str,
+        section: str,
+        *,
+        example: Callable[[], Path] | None = None,
+        example_label: str = "Download an example",
+    ) -> Any:
+        """An upload button beside the path it produced, so a typed path works too.
+
+        `example` writes a template of the file this row is asking for and returns its path;
+        a button offering it sits on the row below. A label cannot say what the columns have
+        to be -- they are the user's own names for their mutated sites -- so the answer is a
+        file they can open and imitate.
+        """
         button = self.w.Button(description=description, button_style="info", layout={"width": "260px"})
         path = self.w.Text(
             value=str(self.state.get(name) or ""),
@@ -1792,7 +1820,43 @@ class MainWizard:
         )
         core.on_click(button, self._guard(section, lambda: self._take_upload(path, what, section)))
         self.uploads[name] = (button, path)
-        return self.w.HBox([button, path])
+        row = self.w.HBox([button, path])
+        if example is None:
+            return row
+
+        download = self.w.Button(description=example_label, button_style="", layout={"width": "260px"})
+        core.on_click(download, self._guard(section, lambda: self._offer_example(example, section)))
+        self.examples[name] = download
+        return self.w.VBox([row, download])
+
+    def _write_library_template(self) -> Path:
+        """The bundled example library, copied out under a name of its own."""
+        from colabsd import templates
+
+        return templates.write_library_template(work_dir(self.state), example_path("library.csv"))
+
+    def _write_variants_template(self) -> Path:
+        """A variants table with *this* library's mutated-site columns and its wild-type row.
+
+        Generated rather than shipped: the column names are whatever the user called their
+        sites, so a static file would name somebody else's. It carries no condition column --
+        those hold what was measured, and these are the variants that have not been.
+        """
+        from colabsd import templates
+
+        spec = self.trained_spec or self.spec
+        if spec is None:
+            raise RuntimeError("Read a library first: the columns of the template come from it.")
+        residues = [spec.wt_sequence[position - 1] for position in spec.positions_1based]
+        return templates.write_variants_template(
+            work_dir(self.state), spec.mutation_columns, wt_residues=residues
+        )
+
+    def _offer_example(self, build: Callable[[], Path], section: str) -> None:
+        """Write a template and hand it to the browser, saying where it also landed."""
+        target = build()
+        self._say(section, f"Wrote `{target}`, and handed it to the browser.")
+        self.backend.offer_download(target)
 
     def _take_upload(self, path_widget: Any, what: str, section: str) -> None:
         """Say what is being waited for, *then* open the picker that freezes the page.

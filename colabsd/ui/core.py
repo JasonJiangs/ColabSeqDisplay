@@ -839,8 +839,7 @@ def config_messages(state: WizardState, status: ConfigStatus, estimate: RuntimeE
         ]
     if not status.provisional:
         return []
-    # Every `mutation_site_mean` entry in `config/best/` is a placeholder, so this message is
-    # on every page: it may only escalate to `stop` when the hour it is about to waste is a
+    # This message may only escalate to `stop` when the hour it is about to waste is a
     # *measured* length. Before a library has been read the estimate is the reference
     # library's, and "this run is about 40 min" would be a number about somebody else's.
     long_run = estimate is not None and estimate.scaled and (estimate.minutes or 0.0) >= PERSISTENCE_MINUTES

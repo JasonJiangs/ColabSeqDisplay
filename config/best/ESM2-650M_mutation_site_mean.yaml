@@ -3,19 +3,22 @@
 # colabsd.engine.train_config.load_lora_best_config().
 
 _meta:
-  status: provisional
-  source: median of the 10 tuned cosine_p90_mean configs
-  replace_with: output of seqdisplay-lora-optuna for this model/pooling
-  test_spearman_mean: unknown
+  status: tuned
+  source: seqdisplay-opt LoRA study, mutation_site_mean pooling, SlugCas9 5NNK library
+  source_file: config/lora/best/mutation_site_mean/esm2_650m.yaml
+  optuna_trial: 39
+  test_spearman_mean: 0.5618
+  test_spearman_sd: 0.0125
+  n_reevaluation_runs: 9
 
 model: ESM2-650M
 
 parameters:
-  adapter_lr: 0.00017
-  head_lr: 5.5e-05
-  adapter_weight_decay: 0.001
+  adapter_lr: 8.117236827503685e-05
+  head_lr: 5.0060745629180135e-05
+  adapter_weight_decay: 0.0
   lora_rank: 32
-  lora_alpha: 128
+  lora_alpha: 64
   lora_dropout: 0.1
   effective_batch_size: 16
 

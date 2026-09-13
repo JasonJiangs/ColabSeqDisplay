@@ -170,12 +170,17 @@ much larger dataset as the bundled example so that a complete run fits inside on
 session. [`examples/mg8_petases/README.md`](examples/mg8_petases/README.md) records how the
 table was built and what is known about it.
 
-**`config/best/`** is entirely derived from upstream's study. The ten entries marked
-`status: tuned` are its selected LoRA configurations, taken from
-`results/p90_lora/selected_lora_configs.csv`, each the product of a 40-trial Optuna study
-whose top three trials were re-trained across 3 split seeds × 3 model seeds. The other 18
-are placeholders computed as the median of those ten, and say so at load time. The
-`_meta` block of every file records which it is.
+**`config/best/`** is entirely derived from upstream's study, which ran twice — once per
+pooling. The twenty entries marked `status: tuned` are its selected LoRA configurations:
+the `cosine_p90_mean` half from `results/p90_mean/lora/selected_lora_configs.csv`, whose
+top three trials were re-trained across 3 split seeds × 3 model seeds, and the
+`mutation_site_mean` half — the only half this pipeline reads — from
+`results/mutation_site_mean/lora/selected_lora_configs.csv`, whose single selected trial
+was re-trained across the same nine. Each is the product of a 40-trial Optuna study. Their
+parameter blocks are copies of upstream's own generated files in
+`config/lora/best/mutation_site_mean/`, value for value. The remaining 8 are placeholders
+computed from those, and say so at load time; the `_meta` block of every file records which
+it is and, for a tuned one, the upstream file it came from.
 
 **Every performance number in this repository comes from that study.** The test Spearman
 figures in `README.md`, in `config/best/README.md`, in each `_meta` block and in the
