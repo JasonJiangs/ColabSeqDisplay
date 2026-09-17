@@ -38,6 +38,7 @@ Two deliberate differences from the ColabPLM notebooks we are otherwise copying:
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from html import escape
@@ -150,6 +151,7 @@ SECTION_NOTES: dict[str, str] = {
 #: nothing is ever silently dropped.
 MESSAGE_SECTIONS: dict[str, str] = {
     "min_count_without_count_column": "data",
+    "count_column_ignored": "data",
     "library_not_loaded": "data",
     "unknown_backbone": "model",
     "backbone_not_in_colab": "model",
@@ -173,8 +175,22 @@ MESSAGE_SECTIONS: dict[str, str] = {
     "run_exceeds_session": "training",
     "no_persistence": "storage",
     "drive_on": "storage",
+    "run_directory_moved": "storage",
     "results_stale": "run",
     "scoring_on_cpu": "score",
+}
+
+#: How to run each guarded step again, so a step the user interrupted can say which control
+#: to reach for. Keyed by the section names `_guard` is called with. The storage one is not a
+#: button: it is a checkbox that is already ticked by the time its handler runs, so pressing
+#: it again is unticking it first.
+SECTION_RETRY: dict[str, str] = {
+    "data": "Press **Check my library** again",
+    "structure": "Press **Get the 3Di string** again",
+    "storage": "Untick **Save to Google Drive** and tick it again",
+    "run": "Press **Train** again",
+    "export": "Press the export button again",
+    "score": "Press **Score them** again",
 }
 
 #: `core` marks a message `stop` when it means "this is a bad idea"; only some of those make
@@ -333,6 +349,9 @@ EXTRA_DEFAULTS: dict[str, Any] = {
     "three_letter_residues": False,
     "count_column": "",
     "min_count": 0,
+    # The read-count column the last load asked to filter on and did not find. Empty when the
+    # load filtered on what it was given, which is every load naming a column the CSV has.
+    "count_column_missing": "",
     "three_di_text": "",
     "three_di_file": "",
     "structure_file": "",
@@ -350,6 +369,12 @@ EXTRA_DEFAULTS: dict[str, Any] = {
     "score_rank_by": "pred_mean",
     "score_batch_size": 8,
     "trained_fingerprint": None,
+    # Where the run whose numbers are on screen actually wrote. Recorded when the run ends
+    # because the working directory can move afterwards -- one tick of "Save to Google Drive"
+    # moves it -- and the unlock cell reads `run_dir`, not the run.
+    "trained_run_dir": "",
+    # The working directory the Drive mount replaced, so unticking the box puts it back.
+    "output_dir_before_drive": "",
 }
 
 SCORE_SOURCES: tuple[str, ...] = ("library_head", "random_combinations", "upload_csv")
@@ -422,7 +447,10 @@ def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
     """Everything that decides *what* a run is, so a change to any of it invalidates one.
 
     Where the results are written is deliberately not in here: mounting Drive half way
-    through does not make the numbers on screen belong to a different experiment.
+    through does not make the numbers on screen belong to a different experiment. What it
+    does change is where the next run goes, and `run_dir` and `run_directory_moved` are
+    where that is kept straight -- the results stay, and they keep pointing at the directory
+    they were written to.
     """
     return (
         state.data_source,
@@ -438,6 +466,7 @@ def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
         state.dtype,
         state.three_di_source,
         int(state.wt_3di_length),
+        str(state.get("wt_3di_digest") or ""),
         int(state.n_split_seeds),
         int(state.n_model_seeds),
         int(state.max_epochs),
@@ -563,6 +592,29 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
                 "warning",
                 f"You asked to drop variants seen fewer than {state.get('min_count')} times, but no read-count "
                 "column is named, so every row will be kept. Name the column above, or set the threshold to 0.",
+            )
+        )
+    ignored_column = str(state.get("count_column_missing") or "")
+    if ignored_column and ignored_column == str(state.get("count_column") or "").strip():
+        out.append(
+            core.Message(
+                "count_column_ignored",
+                "warning",
+                f"The library that loaded has no **{ignored_column}** column, so the threshold of "
+                f"{state.get('min_count')} filtered nothing and all {state.n_variants:,} variants were kept. "
+                "Correct the column name above and press **Check my library** again, or set the threshold to "
+                "0 if you meant to keep every variant.",
+            )
+        )
+    if run_directory_moved(state):
+        out.append(
+            core.Message(
+                "run_directory_moved",
+                "warning",
+                f"The run on this page wrote to `{state.get('trained_run_dir')}`, and the working directory "
+                f"now names `{next_run_dir(state)}`. The results, the exports and the test-set cell all still "
+                "read the run where it is; anything written from here — the bundle, the performance archive, "
+                "the next **Train** — goes to the new one.",
             )
         )
     if three_di_is_promised_but_missing(state):
@@ -708,6 +760,20 @@ def library_spec(state: core.WizardState, wt_sequence: str, *, wt_3di: str | Non
     )
 
 
+def missing_count_column(frame: Any, state: core.WizardState) -> str:
+    """The read-count column a filter was asked for and the table that loaded does not have.
+
+    Empty when there is nothing to report: no column named, no threshold set, or a column the
+    table actually has. `colabsd.data` warns and keeps every row in that case rather than
+    failing, so this is what the page has to notice on the user's behalf.
+    """
+    column = str(state.get("count_column") or "").strip()
+    if not column or int(state.get("min_count") or 0) <= 0:
+        return ""
+    columns = [str(name) for name in getattr(frame, "columns", [])]
+    return "" if column in columns else column
+
+
 def load_blockers(state: core.WizardState) -> list[str]:
     """What stops the check-my-library button, each said as the thing to go and fix."""
     problems = []
@@ -800,9 +866,31 @@ def work_dir(state: core.WizardState) -> Path:
     return Path(str(state.output_dir or core.DEFAULT_WORK_DIR))
 
 
-def run_dir(state: core.WizardState) -> Path:
-    """The directory one fine-tune writes into."""
+def next_run_dir(state: core.WizardState) -> Path:
+    """The directory the *next* fine-tune will write into: what the form says now."""
     return work_dir(state) / (str(state.get("run_name") or "run").strip() or "run")
+
+
+def run_dir(state: core.WizardState) -> Path:
+    """The run directory the results on this page belong to.
+
+    Before anything has been trained that is where the next run will go. Afterwards it is
+    where the run that produced those results actually wrote, recorded when it finished,
+    because the working directory can move between the run and the unlock cell -- ticking
+    **Save to Google Drive** moves it in one click -- and the unlock cell reads this
+    function. Following the form there would point the test-set cell at an empty folder and
+    have it announce that a run directory it has never looked at has never been unlocked.
+    """
+    recorded = str(state.get("trained_run_dir") or "")
+    if recorded and state.get("trained"):
+        return Path(recorded)
+    return next_run_dir(state)
+
+
+def run_directory_moved(state: core.WizardState) -> bool:
+    """True when the form now names a different run directory than the last run wrote to."""
+    recorded = str(state.get("trained_run_dir") or "")
+    return bool(recorded and state.get("trained")) and Path(recorded) != next_run_dir(state)
 
 
 def split_dir(state: core.WizardState, n_rows: int) -> Path:
@@ -837,7 +925,7 @@ def finetune_kwargs(
         "adapter": adapter,
         "best": best,
         "splits": splits,
-        "output_dir": run_dir(state),
+        "output_dir": next_run_dir(state),
         "model_seeds": model_seeds,
         "budget": training_budget(state).overrides(),
         "progress": progress,
@@ -1154,26 +1242,67 @@ def out_of_memory_advice(exc: BaseException, budget: TrainingBudget) -> str:
     )
 
 
+def interrupted_text(section: str, where: Path | None = None) -> str:
+    """What the page says when the user's stop press landed inside this step.
+
+    `KeyboardInterrupt` is not an `Exception`, so the guard's `except Exception` never saw
+    one and neither did ipywidgets': the step died, its log stayed blank, the progress line
+    stayed frozen on the last epoch it had written, and nothing on the page said anything at
+    all. Colab's stop button is one of the two ways a long run ends, so it gets a sentence of
+    its own rather than a traceback that reaches no cell.
+
+    It promises nothing about what survives. Whether a half-finished run can be carried on is
+    `colabsd.train`'s business and it is recorded in the run directory, which is why this says
+    where that directory is instead of guessing what is in it.
+    """
+    lines = ["**Stopped.** You interrupted this step before it finished, so it did not do what you asked."]
+    if where is not None:
+        lines.append(f"Anything the run had already written is under `{where}`.")
+    lines.append(f"{SECTION_RETRY.get(section, 'Press the button again')} when you are ready.")
+    return " ".join(lines)
+
+
+def capture_loader_warnings(load: Callable[[], Any]) -> tuple[Any, list[str]]:
+    """Run a library load, and hand back both what it produced and what it warned about.
+
+    `colabsd.data` warns rather than raises when the read-count column it was told to filter
+    on is not in the CSV: the library still loads, and what trains is not what the form asked
+    for. A warning written to stderr inside an ipywidgets callback reaches no cell in Colab,
+    so the one warning that changes the training set has to be caught here and put on the
+    page. `simplefilter("always", ...)` because Python shows a warning once per source line
+    and the second press of the button would otherwise be silent.
+    """
+    import warnings
+
+    from colabsd.data import MinCountIgnoredWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", MinCountIgnoredWarning)
+        result = load()
+    return result, [
+        str(item.message) for item in caught if issubclass(item.category, MinCountIgnoredWarning)
+    ]
+
+
 def metric_cutoff(metric: str) -> int | None:
     """The *k* in `NDCG@50` or `P@10`; `None` for a metric that ranks nothing.
 
-    `colabsd.engine.metrics` spells every ranking metric this way, so the number a column
-    promises is read off the column rather than written down a second time here.
+    Delegated to `colabsd.report`, which owns the rule, because the panel and the performance
+    archive publish the same columns to the same person: a cut-off that is real on one page
+    and not on the other is worse than either answer alone. Imported inside the call rather
+    than at module scope so that loading the panel still does not drag in `colabsd.train`,
+    which `tests/test_docs_promises.py` holds the package to.
     """
-    _, at, tail = str(metric).partition("@")
-    return int(tail) if at and tail.isdigit() else None
+    from colabsd import report
+
+    return report.metric_cutoff(metric)
 
 
 def truncated_metrics(n_validation: int) -> list[str]:
-    """Those of `RESULTS_METRICS` whose cut-off is larger than the partition they rank.
+    """Those of `RESULTS_METRICS` whose cut-off is larger than the partition they rank."""
+    from colabsd import report
 
-    `colabsd.engine.metrics.ndcg_k` and `precision_k` score the top `min(k, n)`, so on a
-    partition shorter than *k* the column is not the cut it names: every row is inside it.
-    """
-    rows = int(n_validation)
-    if rows <= 0:
-        return []
-    return [metric for metric in RESULTS_METRICS if (metric_cutoff(metric) or 0) > rows]
+    return report.truncated_metrics(n_validation, RESULTS_METRICS)
 
 
 def results_metrics(n_validation: int) -> list[str]:
@@ -1441,6 +1570,9 @@ class MainWizard:
         self.bundle: Any = None
         self.bundle_path: Path | None = None
         self.performance: exports.PerformanceExport | None = None
+        #: Where the finished run wrote, under one of the names `colabsd.ui.unlock` looks for,
+        #: so the test-set cell can be handed this wizard and find the run rather than the form.
+        self.out_dir: Path | None = None
         self._best_key: str | None = None
         self._refreshing = False
         self.trained_best: Any = None
@@ -1520,6 +1652,14 @@ class MainWizard:
         self.fields["condition_columns"] = self._text(
             "condition_columns", "Condition columns:", EXAMPLE_CONDITION_COLUMNS
         )
+        # The switch for every advanced field on the page, and it lives here because this is the
+        # one section that is on screen before anything has succeeded. In the Train section --
+        # which only appears once the library has loaded -- it could not be reached by the user
+        # who needs it most: a three-letter-code library cannot load until the checkbox below is
+        # ticked, and that checkbox is advanced.
+        self.fields["advanced_toggle"] = self.w.Checkbox(
+            value=self.state.show_advanced, description="Show the advanced settings", indent=False, style=_LABEL
+        )
         self.fields["three_letter_residues"] = self.w.Checkbox(
             value=bool(self.state.get("three_letter_residues")),
             description="Residues are written as Asn, not N",
@@ -1545,6 +1685,7 @@ class MainWizard:
             self.fields["positions_1based"],
             self.fields["mutation_columns"],
             self.fields["condition_columns"],
+            self.fields["advanced_toggle"],
             self.fields["three_letter_residues"],
             self.fields["count_column"],
             self.fields["min_count"],
@@ -1676,16 +1817,12 @@ class MainWizard:
         ]
 
     def _build_run(self) -> None:
-        self.fields["advanced_toggle"] = self.w.Checkbox(
-            value=self.state.show_advanced, description="Show the advanced settings", indent=False, style=_LABEL
-        )
         self.fields["run_button"] = self._button("Train", "primary")
         self.progress = theme.html("")
         # Reserved before anything is trained: the first progress line then appears in space
         # that is already there rather than pushing the log below it down the page.
         self.progress.layout.min_height = PROGRESS_ROW_HEIGHT
         self._layout["run"] = [
-            self.fields["advanced_toggle"],
             self.boards["run"].widget,
             self.fields["run_button"],
             self.progress,
@@ -1848,8 +1985,14 @@ class MainWizard:
         if spec is None:
             raise RuntimeError("Read a library first: the columns of the template come from it.")
         residues = [spec.wt_sequence[position - 1] for position in spec.positions_1based]
+        # In the notation *this* library uses. Writing one-letter residues unconditionally
+        # handed a three-letter library a template its own loader refuses at row 0 -- the
+        # download told the user to imitate a format the upload then rejected.
         return templates.write_variants_template(
-            work_dir(self.state), spec.mutation_columns, wt_residues=residues
+            work_dir(self.state),
+            spec.mutation_columns,
+            wt_residues=residues,
+            three_letter=bool(getattr(spec, "three_letter", False)),
         )
 
     def _offer_example(self, build: Callable[[], Path], section: str) -> None:
@@ -1880,7 +2023,11 @@ class MainWizard:
                 core.bind(self.uploads[name][1], self.state, name, on_change=self._changed)
             elif hasattr(widget, "value") and hasattr(widget, "observe"):
                 target = "show_advanced" if name == "advanced_toggle" else name
-                changed = self._drive_changed if name == "use_drive" else self._changed
+                changed = self._changed
+                if name == "use_drive":
+                    changed = self._drive_changed
+                elif name == "drive_folder":
+                    changed = self._drive_folder_changed
                 core.bind(widget, self.state, target, on_change=changed)
         core.on_click(self.check_button, self._guard("data", self.on_check_library))
         core.on_click(self.three_di.button, self._guard("structure", self.on_get_three_di))
@@ -1897,19 +2044,60 @@ class MainWizard:
         """
         self._guard("storage", self.mount_drive)()
 
+    def _drive_folder_changed(self, state: core.WizardState) -> None:
+        """Renaming the folder after the mount moves the mount, rather than only the label.
+
+        The box was wired to a plain refresh, so a name typed after the tick changed the form
+        and nothing else: the run, the weights cache and the foldseek binary all still went to
+        the folder the box no longer named. The text field commits on Enter or on leaving it
+        (`continuous_update=False` in `core.drive_widgets`), so this remounts once per edit
+        rather than once per keystroke.
+        """
+        if not state.use_drive:
+            self._changed(state)
+            return
+        self._guard("storage", self.mount_drive)()
+
     def mount_drive(self) -> None:
         """Mount Drive if the box is ticked, and point the working directory at it."""
         if not self.state.use_drive:
-            self._say("storage", "Google Drive is off. Everything stays on this machine until the session ends.")
+            self._leave_drive()
             return
         mount = core.mount_drive(enable=True, folder=self.state.drive_folder)
         if mount.mounted and mount.output_dir is not None:
-            self.state.output_dir = str(mount.output_dir)
-            self.fields["output_dir"].value = str(mount.output_dir)
+            if not str(self.state.get("output_dir_before_drive") or ""):
+                self.state.set("output_dir_before_drive", self.state.output_dir)
+            self._set_output_dir(str(mount.output_dir))
         else:
             self.state.use_drive = False
             self.fields["use_drive"].value = False
         self._say("storage", mount.describe())
+
+    def _leave_drive(self) -> None:
+        """Unticking the box puts the working directory back where the mount found it.
+
+        A box that moves the working directory on the way in and leaves it moved on the way
+        out makes "everything stays on this machine" false, and hides the folder the results
+        are really under behind the advanced toggle -- a path the user never typed and has no
+        way to remember.
+        """
+        previous = str(self.state.get("output_dir_before_drive") or "")
+        self.state.set("output_dir_before_drive", "")
+        if previous and previous != self.state.output_dir:
+            moved = self.state.output_dir
+            self._set_output_dir(previous)
+            self._say(
+                "storage",
+                f"Google Drive is off, and the working directory is back to `{previous}`. What was already "
+                f"written to `{moved}` is still there, and so is the model-weights cache the mount set up.",
+            )
+            return
+        self._say("storage", "Google Drive is off. Everything stays on this machine until the session ends.")
+
+    def _set_output_dir(self, path: str) -> None:
+        """Move the working directory, keeping the box on the form and the state together."""
+        self.state.output_dir = path
+        self.fields["output_dir"].value = path
 
     def _changed(self, state: core.WizardState) -> None:
         """One observer for every field. Re-entrant calls are dropped, not recursed into.
@@ -1935,11 +2123,23 @@ class MainWizard:
             self.logs[section].value = ""
             try:
                 action()
+            except KeyboardInterrupt:
+                # Colab's stop button, landing anywhere outside the trainer's own epoch loop.
+                # `KeyboardInterrupt` is not an `Exception`, so before this branch existed the
+                # step simply vanished: no log line, no refresh, and a progress line frozen on
+                # the last epoch it had written.
+                where = next_run_dir(self.state) if section == "run" else None
+                if section == "run":
+                    self.progress.value = ""
+                self.logs[section].value = theme.message_html(interrupted_text(section, where), "warning")
             except Exception as exc:  # noqa: BLE001 - the message is the product here
                 text = f"**That did not work.** {type(exc).__name__}: {exc}"
                 advice = out_of_memory_advice(exc, training_budget(self.state)) if section == "run" else ""
                 self.logs[section].value = theme.message_html(f"{text}\n\n{advice}" if advice else text, "stop")
-            self.refresh()
+            finally:
+                # In a `finally` because an interrupted step has to leave the page in the state
+                # it is actually in, exactly like a failed one.
+                self.refresh()
 
         return handle
 
@@ -2096,14 +2296,16 @@ class MainWizard:
         csv_path, wt_sequence = self._resolve_library_inputs()
         spec = library_spec(self.state, wt_sequence)
         spec.validate()
-        frame, sequences, targets = self.backend.load_library(
-            csv_path, spec, min_count=int(self.state.get("min_count") or 0)
+        loaded, warned = capture_loader_warnings(
+            lambda: self.backend.load_library(csv_path, spec, min_count=int(self.state.get("min_count") or 0))
         )
+        frame, sequences, targets = loaded
 
         self.spec, self.frame, self.sequences, self.targets = spec, frame, sequences, targets
         self.state.n_variants = len(frame)
         self.state.wt_length = len(spec.wt_sequence)
         self.state.wt_3di_length = 0
+        self.state.set("count_column_missing", missing_count_column(frame, self.state))
         self.state.set("library_loaded", True)
         self._say(
             "data",
@@ -2113,6 +2315,10 @@ class MainWizard:
             f"`{spec.wt_residues()}`.\n"
             f"- {spec.n_targets} conditions: {', '.join(spec.condition_columns)}.",
         )
+        # The loader's own words, which name the columns the CSV does have. A load that warned
+        # is a load that did something other than what the form asked for.
+        for warning in warned:
+            self.logs["data"].value += theme.message_html(warning, "warning")
 
     def _resolve_library_inputs(self) -> tuple[Path, str]:
         if self.state.data_source == "bundled_example":
@@ -2143,6 +2349,11 @@ class MainWizard:
         self.spec = replace(self.spec, wt_3di=three_di)
         self.spec.validate()
         self.state.wt_3di_length = len(three_di)
+        # The string itself, digested, so `training_fingerprint` can see a *different*
+        # structure of the same length from the same source. Length and source alone made two
+        # uploads of two different models of one protein indistinguishable, so the results of
+        # the first were never marked stale when the second arrived.
+        self.state.set("wt_3di_digest", hashlib.sha256(three_di.encode()).hexdigest()[:16])
         target = work_dir(self.state) / prep.THREE_DI_FILENAME
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(three_di + "\n")
@@ -2189,6 +2400,12 @@ class MainWizard:
         # Freeze what this run actually was. `self.best` follows the dropdown; the bundle
         # must not, or it records one backbone's hyperparameters beside another's weights.
         self.trained_best, self.trained_spec = self.best, self.spec
+        # And freeze where it went. The working directory follows the form, and the form can
+        # move afterwards -- ticking "Save to Google Drive" moves it in one click -- so the
+        # run's own `output_dir` is what the results, the exports and the unlock cell mean.
+        written = getattr(self.run, "output_dir", None)
+        self.out_dir = Path(written) if written is not None else next_run_dir(self.state)
+        self.state.set("trained_run_dir", str(self.out_dir))
         self.state.set("trained_fingerprint", training_fingerprint(self.state))
         self.state.set("trained", True)
         self.state.set("exported", False)

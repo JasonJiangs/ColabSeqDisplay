@@ -27,9 +27,13 @@ import numpy as np
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import ndcg_score
 
-# Upstream's default target names: the four SlugCas9 5NNK PAMs, in output order. They are
-# applied only when a caller passes no target names at all; pass `target_names` explicitly
-# whenever the columns are not these PAMs.
+# Upstream's default target names: the four SlugCas9 5NNK PAMs, in output order. They are a
+# last resort, applied only when a caller passes no target names at all. Nothing inside
+# colabsd relies on them any more: `colabsd.train.finetune` puts the library's own condition
+# columns in `config["data"]["target_names"]`, and
+# `colabsd.engine.train_config.train_eval_config` labels every per-target block it writes with
+# those. The names survive here because this function is also upstream's, and a caller that
+# scores four SlugCas9 PAM columns with no names still gets the labels that study used.
 DEFAULT_TARGET_NAMES: tuple[str, ...] = ("NNGA", "NNGT", "NNGC", "NNGG")
 
 # Every metric `evaluate_predictions` records, in report order.

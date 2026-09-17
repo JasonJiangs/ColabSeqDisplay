@@ -117,56 +117,116 @@ def curve_frame(run_result: Any) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+#: One hue per split seed, lightness per model seed inside it. A 3 x 3 evaluation is nine
+#: curves that lie almost on top of each other, and a nine-colour cycle says only "these are
+#: different"; grouping the hue says *which* of the two seeds a spread belongs to, which is
+#: the question somebody plotting nine runs actually has.
+_SPLIT_HUES: tuple[str, ...] = ("#0d5c63", "#9b4a1f", "#3f3d8f", "#2f6b40", "#7a2d52")
+
+#: The single-run colour. Most runs are one run, and one line needs no palette at all.
+_SOLO = "#0d5c63"
+
+
+def _lighten(hex_colour: str, amount: float) -> tuple[float, float, float]:
+    """Mix *hex_colour* toward white by *amount* in [0, 1)."""
+    value = hex_colour.lstrip("#")
+    rgb = tuple(int(value[index : index + 2], 16) / 255 for index in (0, 2, 4))
+    return tuple(channel + (1.0 - channel) * amount for channel in rgb)
+
+
+def curve_colours(frame: pd.DataFrame) -> dict[str, tuple[float, float, float] | str]:
+    """A colour per run label: hue from the split seed, lightness from the model seed."""
+    runs = list(dict.fromkeys(frame["run"]))
+    if len(runs) == 1:
+        return {runs[0]: _SOLO}
+
+    splits = list(dict.fromkeys(frame["split_seed"]))
+    colours: dict[str, tuple[float, float, float] | str] = {}
+    for name in runs:
+        part = frame[frame["run"] == name]
+        split = part["split_seed"].iloc[0]
+        seeds = list(dict.fromkeys(frame[frame["split_seed"] == split]["model_seed"]))
+        hue = _SPLIT_HUES[splits.index(split) % len(_SPLIT_HUES)]
+        step = seeds.index(part["model_seed"].iloc[0])
+        colours[name] = _lighten(hue, 0.0 if len(seeds) < 2 else 0.42 * step / (len(seeds) - 1))
+    return colours
+
+
 def build_curve_figure(frame: pd.DataFrame, *, model_label: str = "") -> Figure:
     """Two stacked panels sharing an epoch axis: MSE on top, validation below."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
+    from matplotlib.ticker import MaxNLocator
 
-    figure = Figure(figsize=(11.0, 7.0))
+    figure = Figure(figsize=(10.0, 6.6))
     FigureCanvasAgg(figure)
-    top, bottom = figure.subplots(2, 1, sharex=True, gridspec_kw={"hspace": 0.18})
+    top, bottom = figure.subplots(2, 1, sharex=True, gridspec_kw={"hspace": 0.13})
 
     metric_column = f"val_{CURVE_METRIC.lower()}"
     runs = list(dict.fromkeys(frame["run"])) if len(frame) else []
+    colours = curve_colours(frame) if runs else {}
     for name in runs:
         part = frame[frame["run"] == name].sort_values("epoch")
+        colour = colours[name]
         # An epoch axis a reader counts from 1, matching the panel's "epoch 3/20" line. The
         # log counts from 0 because that is the loop variable.
         epochs = part["epoch"] + 1
-        top.plot(epochs, part["train_loss_mse"], marker="o", markersize=3, linewidth=1.4, label=name)
-        bottom.plot(epochs, part[metric_column], marker="o", markersize=3, linewidth=1.4, label=name)
+        style = {"color": colour, "marker": "o", "markersize": 2.6, "linewidth": 1.3}
+        top.plot(epochs, part["train_loss_mse"], **style)
+        bottom.plot(epochs, part[metric_column], label=name, **style)
         kept = part[part["is_best"]]
         if len(kept):
+            # The exported epoch, in the line's own colour so it reads as part of that curve
+            # rather than as a separate series. A heavy black ring did the opposite.
             bottom.scatter(
                 kept["epoch"] + 1,
                 kept[metric_column],
-                s=110,
-                facecolors="none",
-                edgecolors="black",
-                linewidths=1.4,
+                s=58,
+                facecolors="white",
+                edgecolors=[colour],
+                linewidths=1.8,
                 zorder=5,
             )
 
-    top.set_ylabel("training loss (MSE)", fontsize=11)
+    top.set_ylabel("training loss (MSE)", fontsize=10.5)
     title = "Training curves" + (f" — {model_label}" if model_label else "")
-    top.set_title(title, fontsize=12)
-    bottom.set_ylabel(f"validation {CURVE_METRIC} (mean over conditions)", fontsize=11)
-    bottom.set_xlabel("epoch", fontsize=11)
+    top.set_title(title, fontsize=12.5, pad=10)
+    bottom.set_ylabel(f"validation {CURVE_METRIC}", fontsize=10.5)
+    bottom.set_xlabel("epoch", fontsize=10.5)
     for axis in (top, bottom):
-        axis.grid(True, alpha=0.25, linewidth=0.6)
-    if len(runs) > 1:
-        bottom.legend(fontsize=8, ncol=min(3, len(runs)), frameon=False)
-    if len(frame):
-        bottom.annotate(
-            "○ the epoch each run kept",
-            xy=(0.99, 0.02),
-            xycoords="axes fraction",
-            ha="right",
-            fontsize=8,
-            alpha=0.75,
-        )
-    # No `tight_layout`: the two shared-axis panels make it warn that it may get the result
-    # wrong, and `savefig(bbox_inches="tight")` below already trims the margins.
+        axis.grid(True, alpha=0.22, linewidth=0.6)
+        axis.set_axisbelow(True)
+        for side in ("top", "right"):
+            axis.spines[side].set_visible(False)
+        axis.tick_params(labelsize=9.5)
+    # Epochs are whole numbers; the default locator was offering 2.5 and 7.5.
+    bottom.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    if runs:
+        # Under the axes, never over the data: nine curves that converge leave no corner free,
+        # and a legend that covers the interesting part of a plot is worse than no legend.
+        kept_note = "○ marks the epoch each run kept — the weights that were exported"
+        if len(runs) == 1:
+            figure.text(0.5, 0.02, kept_note, ha="center", fontsize=8.5, alpha=0.7)
+        else:
+            # The note is the legend's title rather than a second floating label: laid out as
+            # part of the legend it cannot land on top of it, which is what happened when the
+            # two were positioned independently and the entries wrapped to a second row.
+            handles, labels = bottom.get_legend_handles_labels()
+            legend = figure.legend(
+                handles,
+                labels,
+                title=kept_note,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.055),
+                ncol=min(5, len(runs)),
+                fontsize=8.5,
+                frameon=False,
+                handlelength=1.6,
+                columnspacing=1.4,
+            )
+            legend.get_title().set_fontsize(8.5)
+            legend.get_title().set_alpha(0.7)
     return figure
 
 

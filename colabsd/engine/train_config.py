@@ -49,6 +49,18 @@ in ``tests/test_engine_train_config.py``:
    fine-tune that reports nothing for tens of minutes is indistinguishable from a hung one.
    The callbacks only read: what is trained, logged and written is identical whether they are
    given or not, which is why the side-by-side tests pass neither and still compare every number.
+5. **A stop press that lands outside the epoch loop raises an ordinary exception.** Upstream has
+   no notebook and no stop button: a ``KeyboardInterrupt`` anywhere in this function is its
+   caller's problem. colabsd runs inside a widget callback whose guard catches ``Exception``,
+   which ``KeyboardInterrupt`` is not, so an interrupt during the final evaluation or the
+   artefact writes killed the run with no message at all. The epoch loop still absorbs one
+   (that is early stopping by hand); everything after it records the cut-short run on disk and
+   re-raises it as :class:`TrainingStopped`, which every guard can see.
+6. **The per-target metric names come from the config.** Upstream names the first four target
+   columns after its own study's four SlugCas9 PAMs. When ``config["data"]["target_names"]``
+   lists the user's condition columns -- :func:`colabsd.train.finetune` always sets it -- the
+   ``metrics.json`` this writes carries those names instead. Without the key the upstream
+   default is unchanged.
 """
 
 from __future__ import annotations
@@ -93,6 +105,42 @@ EpochProgress = Callable[[int, int, float, float], None]
 #: fine-tune has got to, and its training loss so far. Called once per micro-batch, which is
 #: thousands of times an epoch: a caller that draws a widget from it has to throttle it itself.
 BatchProgress = Callable[[int, int, int, int, float], None]
+
+
+class TrainingStopped(RuntimeError):
+    """A stop press that landed outside the epoch loop, as an exception a guard can catch.
+
+    A `KeyboardInterrupt` inside the epoch loop is early stopping by hand: the loop ends and
+    the run finishes normally, marked `stopped_early: "interrupted"`. One that lands after it
+    -- during the final validation and test passes, or while the artefacts are being written --
+    cannot be absorbed that way, because the numbers those passes were going to produce do not
+    exist. The weights of the best epoch are still on disk, so the run is recorded as cut short
+    and this is raised. It derives from `RuntimeError`, i.e. from `Exception`, because the panel
+    that calls this runs inside a widget callback whose guard catches `Exception`: raising
+    `KeyboardInterrupt` past it is what made the run die with a blank log and a frozen progress
+    line.
+    """
+
+
+def configured_target_names(config: Mapping[str, Any], n_targets: int) -> list[str] | None:
+    """The condition names `config["data"]["target_names"]` lists, or None.
+
+    Upstream names unnamed target columns after its own study's PAMs, which is a surprise in
+    anybody else's `metrics.json`. `colabsd.train.finetune` writes the library's own condition
+    columns here; a config that does not carry them (or carries the wrong number of them) falls
+    back to the upstream default rather than mislabelling anything.
+    """
+    names = (config.get("data") or {}).get("target_names")
+    if not isinstance(names, (list, tuple)) or len(names) != int(n_targets):
+        return None
+    return [str(name) for name in names]
+
+
+def relabel_per_target(per_target: Mapping[str, Any], names: list[str] | None) -> dict[str, Any]:
+    """Re-key one per-target metric block positionally, leaving the numbers alone."""
+    if names is None or len(names) != len(per_target):
+        return dict(per_target)
+    return {name: dict(block) for name, block in zip(names, per_target.values(), strict=True)}
 
 
 def epoch_batch_callback(on_batch: BatchProgress | None, epoch: int, max_epochs: int) -> BatchCallback | None:
@@ -321,6 +369,9 @@ def build_checkpoint(
     mutation_positions_1based: Any,
     source_trial: Any = None,
     complete: bool = False,
+    stopped_early: str | None = None,
+    epochs_run: int = 0,
+    epochs_budget: int | None = None,
 ) -> dict[str, Any]:
     """Everything needed to rebuild the trained model, for the epoch holding the record.
 
@@ -328,6 +379,8 @@ def build_checkpoint(
     session that dies leaves something behind, and once at the end with `complete=True`.
     A reader that finds `complete: False` has the weights of a run that was cut short --
     they are real and loadable, and its `metrics.json` and `predictions.npz` are missing.
+    `colabsd.train.recover_runs` is that reader, and `epochs_run` and `stopped_early` are
+    what let it say how far the run got without any other file to go on.
     """
     payload: dict[str, Any] = {
         "model_name": adapter.model_name,
@@ -349,6 +402,15 @@ def build_checkpoint(
         "pooling": pooling,
         "mutation_positions_1based": mutation_positions_1based,
         "complete": complete,
+        # Why the run ended and how far it got, in the file that survives when nothing else
+        # does: `None` while the loop is still running, "patience" for early stopping and
+        # "interrupted" for a stop press.
+        "stopped_early": stopped_early,
+        "epochs_run": int(epochs_run),
+        # The budget *this run* was given, not the registry's. A session that vanished
+        # leaves only this file, and the reader that rescues it would otherwise have to fall
+        # back on the looked-up number -- which is wrong for anyone who moved the box.
+        "epochs_budget": None if epochs_budget is None else int(epochs_budget),
     }
     if source_trial is not None:
         payload["source_trial"] = asdict(source_trial)
@@ -446,12 +508,18 @@ def train_eval_config(
     Early stopping keeps the epoch with the best validation objective, restores it,
     and writes ``best_checkpoint.pt``, ``predictions.npz``, ``training_log.json`` and
     ``metrics.json`` into *output_dir*. The returned dictionary is ``metrics.json``.
+
+    A stop press inside the epoch loop ends it and finishes the run, which then records
+    ``stopped_early: "interrupted"`` and the number of epochs it got through. One that lands
+    after the loop cannot be finished: the checkpoint is rewritten with ``complete: False`` so
+    the weights say what they are, and :class:`TrainingStopped` is raised.
     """
     set_reproducible_seed(seed)
     fixed = config["fixed"]
     objective_name = str(config["study"]["objective"])
     objective_metric = validation_metric_name(config)
     mutation_positions_1based = pooling_positions_1based(config)
+    target_names = configured_target_names(config, int(targets.shape[1]))
     device = default_device()
     train_idx = [int(i) for i in split["train_idx"]]
     val_idx = [int(i) for i in split["val_idx"]]
@@ -514,6 +582,8 @@ def train_eval_config(
             pooling=str(fixed["pooling"]),
             mutation_positions_1based=mutation_positions_1based,
             source_trial=source_trial,
+            epochs_run=len(log_rows),
+            epochs_budget=max_epochs,
         )
 
     try:
@@ -586,7 +656,9 @@ def train_eval_config(
         # re-evaluated and written -- and the run says which of the two ended it.
         stopped_early = "interrupted"
         if best_lora_state is None:
-            raise RuntimeError(
+            # `TrainingStopped` rather than a bare RuntimeError so that every stop press this
+            # function can see raises one class -- and so that it reaches the panel's guard.
+            raise TrainingStopped(
                 "Interrupted before the first epoch finished, so there is no checkpoint to keep. "
                 "Lower `max_epochs` or let one epoch complete."
             ) from None
@@ -594,6 +666,114 @@ def train_eval_config(
     if best_lora_state is None or best_head_state is None or best_metric_summary is None:
         raise RuntimeError("Training finished without a best checkpoint.")
 
+    try:
+        return _finalise_run(
+            adapter=adapter,
+            model=model,
+            head=head,
+            sequences=sequences,
+            targets=targets,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            scaler=scaler,
+            micro_batch_size=micro_batch_size,
+            device=device,
+            params=params,
+            fixed=fixed,
+            split_seed=split_seed,
+            seed=seed,
+            matched=matched,
+            objective_name=objective_name,
+            objective_metric=objective_metric,
+            mutation_positions_1based=mutation_positions_1based,
+            target_names=target_names,
+            best_epoch=best_epoch,
+            best_score=best_score,
+            best_metric_summary=best_metric_summary,
+            best_lora_state=best_lora_state,
+            best_head_state=best_head_state,
+            log_rows=log_rows,
+            stopped_early=stopped_early,
+            output_dir=output_dir,
+            source_trial=source_trial,
+        )
+    except KeyboardInterrupt:
+        # A second stop press, landing in the final evaluation or the artefact writes. The
+        # epoch loop is over and its numbers are gone, so this run cannot be finished; what it
+        # can do is leave the best epoch's weights saying exactly that, and raise something the
+        # notebook's guard can catch. `colabsd.train.finetune` writes no `colabsd_run.json` for
+        # a run that raised, so the next Train press retrains it rather than reusing it.
+        write_checkpoint_atomically(
+            build_checkpoint(
+                adapter=adapter,
+                split_seed=split_seed,
+                seed=seed,
+                params=params,
+                matched=matched,
+                objective_name=objective_name,
+                objective_metric=objective_metric,
+                best_epoch=best_epoch,
+                best_score=best_score,
+                best_metric_summary=best_metric_summary,
+                best_lora_state=best_lora_state,
+                best_head_state=best_head_state,
+                scaler=scaler,
+                pooling=str(fixed["pooling"]),
+                mutation_positions_1based=mutation_positions_1based,
+                source_trial=source_trial,
+                complete=False,
+                stopped_early="interrupted",
+                epochs_run=len(log_rows),
+                epochs_budget=max_epochs,
+            ),
+            output_dir / CHECKPOINT_NAME,
+        )
+        raise TrainingStopped(
+            f"Stopped after the epoch loop of split seed {split_seed}, model seed {seed}, so this run has no "
+            f"validation or test numbers. The {len(log_rows)} epoch(s) it did train are not lost: the weights of "
+            f"its best epoch ({best_epoch + 1}) are in {output_dir / CHECKPOINT_NAME}, marked as a run that was "
+            "cut short. Press Train again to run it properly -- that moves these weights aside rather than "
+            "overwriting them -- or keep them with colabsd.bundle.save_bundle_from_checkpoint()."
+        ) from None
+
+
+def _finalise_run(
+    *,
+    adapter: SequenceAdapter,
+    model: nn.Module,
+    head: nn.Module,
+    sequences: list[str],
+    targets: np.ndarray,
+    val_idx: list[int],
+    test_idx: list[int],
+    scaler: LabelScaler,
+    micro_batch_size: int,
+    device: torch.device,
+    params: dict[str, Any],
+    fixed: dict[str, Any],
+    split_seed: int,
+    seed: int,
+    matched: Any,
+    objective_name: str,
+    objective_metric: str,
+    mutation_positions_1based: Any,
+    target_names: list[str] | None,
+    best_epoch: int,
+    best_score: float,
+    best_metric_summary: dict[str, float],
+    best_lora_state: dict[str, torch.Tensor],
+    best_head_state: dict[str, torch.Tensor],
+    log_rows: list[dict[str, Any]],
+    stopped_early: str | None,
+    output_dir: Path,
+    source_trial: SourceTrial | None,
+) -> dict[str, Any]:
+    """Restore the best epoch, score both partitions and write the run's artefacts.
+
+    Split out of :func:`train_eval_config` so that a stop press landing in here is caught in
+    one place: everything this function does is after the point where a run can still be
+    finished honestly.
+    """
     load_lora_state_dict(model, best_lora_state, device)
     load_head_state(head, best_head_state, device)
     val_predictions, val_metrics = evaluate_split(
@@ -618,6 +798,10 @@ def train_eval_config(
         batch_size=micro_batch_size,
         device=device,
     )
+    # The numbers are positional; only the labels change. Without this the per-target blocks
+    # in metrics.json would be named after upstream's own study's four PAMs.
+    val_metrics = relabel_per_target(val_metrics, target_names)
+    test_metrics = relabel_per_target(test_metrics, target_names)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = build_checkpoint(
@@ -638,6 +822,9 @@ def train_eval_config(
         mutation_positions_1based=mutation_positions_1based,
         source_trial=source_trial,
         complete=True,
+        stopped_early=stopped_early,
+        epochs_run=len(log_rows),
+        epochs_budget=int(fixed["max_epochs"]),
     )
     write_checkpoint_atomically(checkpoint, output_dir / CHECKPOINT_NAME)
     np.savez_compressed(
@@ -664,6 +851,17 @@ def train_eval_config(
         "selection_metric": objective_metric,
         "pooling": fixed["pooling"],
         "mutation_positions_1based": mutation_positions_1based,
+        # How many rows each number was scored on. Every ranking metric here is a cut of the
+        # top k -- `precision_k` and `ndcg_k` both score min(k, n) -- so a partition shorter
+        # than k turns `P@50` into "all of them", which reads as a perfect score. Nothing
+        # downstream could say that, because nothing recorded n.
+        # The split is a partition of the library, so the training count is the remainder --
+        # `_finalise_run` is handed the two partitions it scores and the whole sequence list.
+        "partition_rows": {
+            "train": len(sequences) - len(val_idx) - len(test_idx),
+            "validation": len(val_idx),
+            "test": len(test_idx),
+        },
         "best_epoch": best_epoch,
         "best_validation_score": best_score,
         "best_validation_r2": best_metric_summary["R2"],

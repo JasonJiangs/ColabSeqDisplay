@@ -58,6 +58,32 @@ def _recorded_metrics() -> tuple[str, ...]:
     return tuple(str(metric) for metric in recorded) or FALLBACK_METRICS
 
 
+#: Used only when `colabsd.train` cannot be imported at all, exactly like `FALLBACK_METRICS`:
+#: the name is read from that module so the panel and the trainer cannot disagree about it.
+FALLBACK_LOCKED_DIRNAME = "locked_test"
+
+
+def _locked_dirname() -> str:
+    try:
+        from colabsd.train import LOCKED_DIRNAME
+    except ImportError:  # pragma: no cover - colabsd.train is a hard dependency in Colab
+        return FALLBACK_LOCKED_DIRNAME
+    return str(LOCKED_DIRNAME)
+
+
+def has_locked_test(output_dir: Path | str | None) -> bool:
+    """True when `colabsd.train.unlock_test` would find something to read under *output_dir*.
+
+    The two conditions that function applies -- a `locked_test/` directory, holding at least
+    one run's `test_metrics.json` -- asked before the button instead of after it, so the panel
+    can say "there is nothing here" rather than describe a directory it has never looked at.
+    """
+    if output_dir is None:
+        return False
+    locked = Path(output_dir) / _locked_dirname()
+    return locked.is_dir() and any(locked.glob("*/test_metrics.json"))
+
+
 METRICS: tuple[str, ...] = _recorded_metrics()
 #: One value, so the dropdown, the archive and the report cannot default to different metrics.
 DEFAULT_METRIC = exports.DEFAULT_METRIC
@@ -175,13 +201,56 @@ def missing_inputs(inputs: UnlockInputs) -> list[str]:
     return missing
 
 
-def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) -> list[Message]:
+def truncated_metric_notices(run_result: Any, metric: str) -> list[Message]:
+    """Refuse to headline a cut the test partition is too short to be a cut of.
+
+    `P@50` over thirteen rows is 1.0000 for any ranking at all, and this dropdown is where a
+    reader picks the number the final report leads with -- and the number the archive's own
+    headline is rewritten to. The panel's results table already drops such a column; nothing
+    stopped the same column becoming the headline of the thing people share.
+    """
+    from colabsd import report
+
+    rows = report.partition_rows(run_result).get("test", 0)
+    if not rows or metric not in report.truncated_metrics(rows, [metric]):
+        return []
+    counted = f"{rows} row" if rows == 1 else f"{rows} rows"
+    return [
+        Message(
+            "metric_truncated",
+            "warning",
+            f"**`{metric}` is not a cut of a partition this size.** The test partition is {counted}, "
+            f"shorter than the {report.metric_cutoff(metric)} that name promises, so every variant falls "
+            "inside it and the number is near 1 for any ranking at all. Pick a metric that ranks the whole "
+            "partition — `Spearman` — if you want the headline to mean something.",
+        )
+    ]
+
+
+def status_notices(
+    *,
+    inputs: UnlockInputs,
+    unlock_count: int,
+    confirmed: bool,
+    locked_test: bool | None = None,
+    metric: str = DEFAULT_METRIC,
+) -> list[Message]:
     """The messages this panel shows, most consequential first.
 
     The "already unlocked" warning comes first, so it is read before the second unlock rather
     than after.
+
+    `locked_test` is whether `output_dir` actually holds a locked test partition, which
+    `UnlockPanel` reads off the disk for every refresh. It is what stops this panel making a
+    statement about a directory nothing has ever written to: the counter in an absent
+    `unlock.json` reads 0, and "this run directory has never been unlocked: the test partition
+    has been on disk, untouched, since training finished" was then said about a folder with no
+    test partition and no training behind it -- and said while the real run directory's own
+    counter said otherwise. `None` means nobody looked, and nothing is claimed either way.
     """
     out: list[Message] = []
+    nothing_locked = inputs.output_dir is not None and locked_test is False
+    out.extend(truncated_metric_notices(inputs.run_result, metric))
     if unlock_count == 1:
         out.append(
             Message(
@@ -202,13 +271,25 @@ def status_notices(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) 
                 "export afterwards.",
             )
         )
-    else:
+    elif not nothing_locked:
         out.append(
             Message(
                 "never_unlocked",
                 "info",
                 "This run directory has never been unlocked: the test partition has been on disk, untouched, "
                 "since training finished.",
+            )
+        )
+
+    if nothing_locked:
+        out.append(
+            Message(
+                "no_locked_test",
+                "stop",
+                f"**There is no locked test partition under `{inputs.output_dir}`**, so there is nothing "
+                f"here to unlock: no `{_locked_dirname()}/` directory holding a finished run. Either nothing "
+                "has been trained into that directory yet, or this cell has been pointed at a different one "
+                "than the run wrote to — train in the panel above, and check the working directory it names.",
             )
         )
 
@@ -323,6 +404,18 @@ def report_html(
             + ", ".join(f"<code>{Path(path).name}</code>" for path in paths.values())
             + "</div>"
         )
+    # The bundle was exported before this cell ran -- that is the order the page itself sets
+    # out -- so its manifest records the count as it stood then. Both files are right about
+    # their own moment, and nothing on the page said so, which left two archives of one run
+    # disagreeing about the same number.
+    stamped = (
+        "<div style='margin-top:8px;color:#555'>"
+        "<code>model_bundle.zip</code> was written before this cell ran, so its manifest records the "
+        f"count as it stood then. Press <b>Write model_bundle.zip</b> again to stamp it {unlock_count}x."
+        "</div>"
+        if unlock_count
+        else ""
+    )
     settings = (
         "<div style='margin-top:8px;color:#555'>trained with: "
         f"{exports.budget_line(budget)}</div>"
@@ -345,7 +438,7 @@ def report_html(
         f"<th style='padding-right:14px'>test {metric}</th><th>runs</th></tr>{body}</table>"
         f"<div style='margin-top:8px'><b>Test {metric}, averaged over conditions:</b> "
         f"{number(macro_mean)} ± {number(macro_sd)}</div>"
-        f"{settings}{provisional}{files}</div>"
+        f"{settings}{provisional}{files}{stamped}</div>"
     )
 
 
@@ -369,6 +462,15 @@ def render_report(report: FinalReport) -> str:
 # ----------------------------------------------------------------------------------------
 
 
+def _assume_locked_test(_output_dir: Any) -> bool:
+    """`UnlockRunners.locked_test_present` when nobody supplied one: assume there is one.
+
+    The panel must not refuse an unlock because of a check the caller never wired up; the
+    real check is `has_locked_test`, which `default_runners` installs.
+    """
+    return True
+
+
 @dataclass(frozen=True)
 class UnlockRunners:
     """The side effects, injected so the panel can be driven headlessly in tests."""
@@ -378,6 +480,11 @@ class UnlockRunners:
     build_report: Callable[..., Any]
     download: Callable[[Path], None]
     show_table: Callable[[Any], None]
+    #: Whether a run directory holds a test partition to read at all. It is in this seam, and
+    #: not read straight off the disk by the panel, because it predicts what `unlock_test`
+    #: will do: a runner set that replaces the unlock has replaced the thing being predicted,
+    #: so the default answers yes and `default_runners` supplies the one that looks.
+    locked_test_present: Callable[[Any], bool] = _assume_locked_test
 
 
 def default_runners() -> UnlockRunners:
@@ -403,6 +510,7 @@ def default_runners() -> UnlockRunners:
         build_report=build_report,
         download=download,
         show_table=show_table,
+        locked_test_present=has_locked_test,
     )
 
 
@@ -464,10 +572,21 @@ class UnlockPanel:
             self._say(f"could not read the unlock counter: {exc}")
             return 0
 
+    @property
+    def locked_test_present(self) -> bool:
+        """Whether the run directory this panel was handed holds a test partition at all."""
+        if self.inputs.output_dir is None:
+            return False
+        return bool(self.runners.locked_test_present(self.inputs.output_dir))
+
     def notices(self) -> list[Message]:
         """The messages for the current state."""
         return status_notices(
-            inputs=self.inputs, unlock_count=self.unlock_count, confirmed=bool(self.confirm.value)
+            inputs=self.inputs,
+            unlock_count=self.unlock_count,
+            confirmed=bool(self.confirm.value),
+            locked_test=self.locked_test_present,
+            metric=str(self.metric.value),
         )
 
     def log_text(self) -> str:

@@ -33,6 +33,12 @@ that used different ones would be a lie. `training_budget` therefore records
 said, and which fields the user set. A run that never handed one over records
 nothing rather than the lookup; `budget_line` says "not recorded" in as many words.
 
+`training_status` is the other half of that: the budget says what a run was given, this
+says what it spent. A run stopped by hand at epoch 2 of 20 is still a usable model, but a
+manifest that published `max_epochs: 20` and nothing else would describe a model that never
+existed, so the block records `epochs_run`, `epochs_budget` and `stopped_early`, and
+`training_status_line` says it in one sentence.
+
 The provenance block is built by `provenance_block`, and `colabsd.ui.exports`
 stamps the same block into the performance archive a session downloads beside the
 bundle. The two therefore say "tuned" or "PROVISIONAL", count the test-set reads,
@@ -69,6 +75,9 @@ SCHEMA_VERSION = 3
 #: a pooling instead, and this version cannot honour that name.
 MUTATION_SITE_SCHEMA = 2
 MANIFEST_NAME = "manifest.json"
+#: Manifest key: what the run actually spent of the budget it was given. Absent from bundles
+#: written before this, which is why every reader here treats "not recorded" as its own answer.
+TRAINING_STATUS_KEY = "training_status"
 LORA_NAME = "lora.pt"
 HEAD_NAME = "head.pt"
 
@@ -144,6 +153,137 @@ BUDGET_ATTRIBUTES: tuple[str, ...] = ("budget", "budget_settings", BUDGET_KEY)
 #: a bundle written before `training_budget` existed has no record, and saying so is the only
 #: honest thing to print over it.
 BUDGET_NOT_RECORDED = "training budget not recorded"
+
+
+def json_safe(value: Any) -> Any:
+    """Whatever JSON can carry, from whatever numpy and pandas hand over.
+
+    NaN and +-inf are not JSON. Python's `json` writes them as the bare tokens `NaN`,
+    `Infinity` and `-Infinity` and reads them back again, so nothing inside this package ever
+    notices; every stricter parser -- `JSON.parse`, Go, Rust, a Python reader that passes
+    `parse_constant` -- rejects the file. A manifest is the one artefact written to be read by
+    somebody else's tools, and the single-run `sd` is NaN by design (one run shows no spread),
+    so it is written as `null` and the writer refuses to emit the tokens at all.
+    """
+    import numpy as np
+
+    if isinstance(value, Mapping):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, str):
+        return value
+    if hasattr(value, "tolist"):
+        return json_safe(value.tolist())
+    return value
+
+
+#: The keys a manifest stores a *number* under. A `null` beneath one of them is an undefined
+#: statistic -- the sd of a single run, a precision@k on a prediction with no spread -- written
+#: as `null` because JSON has no NaN. Everywhere else a `null` means what it says, so the two
+#: are kept apart rather than restored wholesale.
+UNDEFINED_NUMBER_KEYS = frozenset(
+    {
+        "mean",
+        "sd",
+        "n",
+        "n_runs",
+        "best_validation_score",
+        "R2",
+        "Pearson",
+        "Spearman",
+        "P@10",
+        "P@50",
+        "NDCG@10",
+        "NDCG@50",
+        "mean_R2",
+        "mean_Pearson",
+        "mean_Spearman",
+    }
+)
+
+
+def restore_undefined_numbers(value: Any) -> Any:
+    """Undo `json_safe` for the metrics a manifest carries: `null` statistics become NaN again.
+
+    `json_safe` has to write NaN as `null`, or the file is not JSON. Reading it back as `None`
+    would quietly turn "undefined" into "missing" -- a number that cannot exist into a field
+    nobody filled in -- and the numbers a bundle hands back would no longer be the numbers the
+    run produced. Only the keys in :data:`UNDEFINED_NUMBER_KEYS` are restored, so the `None`s
+    that genuinely mean "none" (`source_run`, `stopped_early`) survive untouched.
+    """
+    if isinstance(value, Mapping):
+        return {
+            key: float("nan") if item is None and key in UNDEFINED_NUMBER_KEYS else restore_undefined_numbers(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [restore_undefined_numbers(item) for item in value]
+    return value
+
+
+def training_status(
+    *,
+    run: Mapping[str, Any] | None = None,
+    checkpoint: Mapping[str, Any] | None = None,
+    fixed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """What a run spent of its budget: epochs run, epochs allowed, and how it ended.
+
+    `run` is a row of `colabsd.train.RunResult.runs` (or a `training_status` block read back
+    out of a manifest), `checkpoint` the payload of a `best_checkpoint.pt`. Either can carry
+    `epochs_run` and `stopped_early`; only a checkpoint carries `complete`, which is how a
+    session that vanished mid-run is told apart from one a person stopped. A bundle written
+    before any of this carries none of it, which is `recorded: False` rather than a guess.
+    """
+    sources = [source for source in (run, checkpoint) if isinstance(source, Mapping)]
+    epochs_run = next((source["epochs_run"] for source in sources if source.get("epochs_run") is not None), None)
+    stopped = next((source["stopped_early"] for source in sources if source.get("stopped_early")), None)
+    complete = next((source["complete"] for source in sources if source.get("complete") is not None), None)
+    if complete is None and isinstance(run, Mapping) and run.get("fingerprint"):
+        # A row in a RunResult exists only for a run that finalised and wrote its numbers.
+        complete = True
+    budget = next(
+        (source["epochs_budget"] for source in sources if source.get("epochs_budget") is not None),
+        None,
+    )
+    if budget is None and isinstance(fixed, Mapping):
+        budget = fixed.get("max_epochs")
+    finished = None
+    if epochs_run is not None:
+        finished = complete is not False and str(stopped or "") != "interrupted"
+    return {
+        "recorded": epochs_run is not None,
+        "epochs_run": None if epochs_run is None else int(epochs_run),
+        "epochs_budget": None if budget is None else int(budget),
+        "stopped_early": None if stopped is None else str(stopped),
+        "complete": None if complete is None else bool(complete),
+        "finished": finished,
+    }
+
+
+def training_status_line(status: Mapping[str, Any] | None) -> str:
+    """One sentence a notebook, a report footer or a README can print unchanged."""
+    status = dict(status or {})
+    if not status.get("recorded"):
+        return "epochs actually trained: not recorded"
+    ran, budget = status.get("epochs_run"), status.get("epochs_budget")
+    of_budget = f" of {budget}" if budget else ""
+    if status.get("stopped_early") == "interrupted":
+        return f"STOPPED EARLY BY HAND: trained {ran}{of_budget} epochs"
+    if status.get("complete") is False:
+        return f"DID NOT FINISH: trained {ran}{of_budget} epochs before the session ended"
+    if status.get("stopped_early") == "patience":
+        return f"trained {ran}{of_budget} epochs, stopped by early stopping"
+    return f"trained {ran}{of_budget} epochs"
 
 
 def _count(value: Any) -> int | None:
@@ -356,6 +496,26 @@ class Bundle:
         """True when the user set part of the budget, so this run is not the looked-up one."""
         return budget_was_set_by_hand(self.training_budget)
 
+    @property
+    def training_status(self) -> dict[str, Any]:
+        """What the run behind these weights actually spent: epochs run, and why it ended.
+
+        Empty of facts (`recorded: False`) for a bundle written before this block existed:
+        those load unchanged, and nothing here invents a number for them.
+        """
+        recorded = self.manifest.get(TRAINING_STATUS_KEY)
+        return training_status(run=recorded if isinstance(recorded, Mapping) else None, fixed=self.fixed)
+
+    @property
+    def was_stopped_early(self) -> bool:
+        """True when the manifest records a run that did not finish -- stopped, or cut off.
+
+        `False` for a bundle that records nothing about how its run ended: absence of a record
+        is not evidence that a run completed, and `training_status["recorded"]` is what says
+        which of the two this is.
+        """
+        return self.training_status.get("finished") is False
+
     def describe(self) -> str:
         """One human-readable line for a notebook."""
         provenance = self.manifest.get("provenance", {})
@@ -383,6 +543,7 @@ def save_bundle(
     adapter_hf_id: str | None = None,
     trained_with: Any = None,
     budget: Any = None,
+    status: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write a `.zip` bundle and return its path.
 
@@ -391,7 +552,8 @@ def save_bundle(
     and `fixed` -- and wins wherever it has something to say, because a manifest has to publish
     the hyperparameters that ran rather than the ones that were looked up. `budget` is the
     resolved `colabsd.bestconfig.BudgetSettings`; without one, `trained_with` and `best` are
-    searched for a budget they carry, and a run that recorded none records none.
+    searched for a budget they carry, and a run that recorded none records none. `status` is
+    `training_status(...)` for the run these weights came out of -- what it spent of that budget.
     """
     import torch
 
@@ -429,6 +591,9 @@ def save_bundle(
         "hyperparameters": _block(trained_with, best, "params"),
         "training": _block(trained_with, best, "fixed"),
         BUDGET_KEY: budget_of(budget, trained_with, best),
+        # The budget above is what the run was allowed; this is what it used. A model that was
+        # stopped at epoch 2 of 20 says so here, in the file whose purpose is provenance.
+        TRAINING_STATUS_KEY: _status_block(status, trained_with, best),
         "evaluation": dict(getattr(best, "evaluation", {}) or {}),
         "metrics": metrics,
         "label_scaler": _label_scaler_payload(label_scaler),
@@ -449,10 +614,20 @@ def save_bundle(
     }
 
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(MANIFEST_NAME, json.dumps(manifest, indent=2))
+        # `allow_nan=False` so this can never silently regress: NaN and inf are sanitised to
+        # null by `json_safe`, and anything that slips past raises here rather than writing a
+        # manifest only Python's own parser will read.
+        archive.writestr(MANIFEST_NAME, json.dumps(json_safe(manifest), indent=2, allow_nan=False))
         archive.writestr(LORA_NAME, lora_blob)
         archive.writestr(HEAD_NAME, head_blob)
     return path
+
+
+def _status_block(status: Mapping[str, Any] | None, trained_with: Any, best: Any) -> dict[str, Any]:
+    """The `training_status` block, from what the caller passed or from the run's own record."""
+    if status is not None:
+        return dict(status)
+    return training_status(fixed=_block(trained_with, best, "fixed"))
 
 
 def _block(trained_with: Any, best: Any, name: str) -> dict[str, Any]:
@@ -503,7 +678,7 @@ def load_bundle(path: str | Path) -> Bundle:
         head_state=head,
         adapter_dtype=manifest.get("adapter_dtype"),
         adapter_hf_id=manifest.get("adapter_hf_id"),
-        metrics=manifest.get("metrics"),
+        metrics=restore_undefined_numbers(manifest.get("metrics")),
         label_scaler=manifest.get("label_scaler"),
         path=path,
     )
@@ -568,6 +743,13 @@ def save_bundle_from_run(
 
     run = run_result.best_run() if checkpoint is None else None
     checkpoint_path = Path(checkpoint) if checkpoint is not None else Path(run["checkpoint"])
+    if run is None:
+        # A caller who named the checkpoint still gets the row that produced it, when the run
+        # result knows about it: that row is where `epochs_run` and `stopped_early` live.
+        run = next(
+            (row for row in run_result.runs if str(row.get("checkpoint", "")) == str(checkpoint_path)),
+            None,
+        )
     if not checkpoint_path.is_file():
         raise BundleError(
             f"No checkpoint at {checkpoint_path}. Keep the finetune() output_dir around, or pass "
@@ -577,6 +759,7 @@ def save_bundle_from_run(
     _require_checkpoint_positions(blob, spec, checkpoint_path)
     recorded = int(getattr(run_result, "unlock_count", 0) or 0)
     unlocks = recorded if unlock_count is None else max(int(unlock_count), recorded)
+    status = training_status(run=run, checkpoint=blob, fixed=getattr(run_result, "fixed", None))
     metrics = {
         "validation_summary": run_result.validation_summary,
         "validation_runs": run_result.runs,
@@ -586,6 +769,7 @@ def save_bundle_from_run(
         "split_seeds": run_result.split_seeds,
         "model_seeds": run_result.model_seeds,
         "source_run": None if run is None else {"split_seed": run["split_seed"], "model_seed": run["model_seed"]},
+        "training_status": status,
     }
     if run_result.test_runs is not None:
         metrics["test_runs"] = run_result.test_runs
@@ -604,6 +788,91 @@ def save_bundle_from_run(
         adapter_hf_id=getattr(run_result, "adapter_hf_id", None),
         trained_with=run_result,
         budget=budget,
+        status=status,
+    )
+
+
+def save_bundle_from_checkpoint(
+    path: str | Path,
+    *,
+    checkpoint: str | Path,
+    spec: LibrarySpec,
+    best: BestConfig,
+    adapter_name: str | None = None,
+    adapter_dtype: str | None = None,
+    adapter_hf_id: str | None = None,
+    notes: str | None = None,
+    unlock_count: int | None = None,
+    budget: Any = None,
+) -> Path:
+    """Bundle a checkpoint that has no `RunResult` left beside it.
+
+    This is what makes the per-epoch checkpoint worth writing. A Colab session that is
+    pre-empted at hour two of three leaves `runs/<split>_<seed>/best_checkpoint.pt` and nothing
+    else: no metrics, no `RunResult`, and `save_bundle_from_run` needs one. Find the file with
+    `colabsd.train.recover_runs(output_dir)` and pass it here with the spec and the registry
+    entry the run used, and those weights become a bundle `colabsd.predict` can score with.
+
+    The manifest says what it is. `metrics` carries the checkpoint's own record -- the best
+    epoch and its validation score, measured on that epoch during training -- and nothing else,
+    because a run that never finished never measured anything else; `training_status` records
+    the epochs it got through and that it was cut short; and `provenance.notes` says the bundle
+    was recovered from a checkpoint rather than exported from a completed run.
+    """
+    import torch
+
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_file():
+        raise BundleError(
+            f"No checkpoint at {checkpoint_path}. List what a run directory still holds with "
+            "colabsd.train.recover_runs(output_dir)."
+        )
+    blob = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(blob, dict) or "lora_state_dict" not in blob or "head_state_dict" not in blob:
+        raise BundleError(
+            f"{checkpoint_path} is not a colabsd training checkpoint: it carries no LoRA and head weights. "
+            "Pass a best_checkpoint.pt or unfinished_checkpoint.pt from a run directory."
+        )
+    _require_checkpoint_positions(blob, spec, checkpoint_path)
+    status = training_status(checkpoint=blob, fixed=_block(None, best, "fixed"))
+    complete = bool(blob.get("complete", False))
+    metrics = {
+        "recovered_from_checkpoint": str(checkpoint_path),
+        "selection_metric": blob.get("selection_metric"),
+        "best_epoch": blob.get("best_epoch"),
+        "best_validation_score": blob.get("best_validation_score"),
+        "best_validation_metrics": blob.get("best_validation_metrics"),
+        "n_runs": 1,
+        "split_seeds": [blob["split_seed"]] if blob.get("split_seed") is not None else [],
+        "model_seeds": [blob["seed"]] if blob.get("seed") is not None else [],
+        "unlock_count": int(unlock_count or 0),
+        "training_status": status,
+        "_warning": (
+            "Recovered from a training checkpoint. These are the best epoch's own validation numbers, "
+            "measured during training; this bundle carries no validation summary across runs and no test "
+            "metrics, because the run that wrote it never finished."
+        ),
+    }
+    recovered_note = (
+        f"Recovered from {checkpoint_path.name} ({'complete' if complete else 'a run that was cut short'}): "
+        f"{training_status_line(status)}."
+    )
+    return save_bundle(
+        path,
+        spec=spec,
+        adapter_name=str(adapter_name or blob.get("model_name") or getattr(best, "model", "unknown")),
+        best=best,
+        lora_state=blob["lora_state_dict"],
+        head_state=blob["head_state_dict"],
+        metrics=metrics,
+        label_scaler=blob.get("label_scaler"),
+        unlock_count=int(unlock_count or 0),
+        notes=recovered_note if not notes else f"{recovered_note} {notes}",
+        adapter_dtype=adapter_dtype,
+        adapter_hf_id=adapter_hf_id,
+        trained_with={"params": blob.get("params") or {}},
+        budget=budget,
+        status=status,
     )
 
 

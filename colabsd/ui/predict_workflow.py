@@ -51,6 +51,10 @@ _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 ASSUMED_LENGTH = 1000
 RANKINGS = ("pred_mean", "pred_min")
 
+#: What the ranked table is called when the box is left alone. A name with a folder in it is
+#: honoured -- the folder is made under the working directory -- rather than lost.
+DEFAULT_OUTPUT_NAME = "ranked_variants.csv"
+
 VARIANT_SOURCES = ("upload_variants_csv", "random_combinations", "rows_of_a_library_csv")
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 
@@ -388,7 +392,7 @@ class PredictState:
     rank_by: str = "pred_mean"
     top_n_to_show: int = 20
     score_batch_size: int = 8
-    output_name: str = "ranked_variants.csv"
+    output_name: str = DEFAULT_OUTPUT_NAME
     has_gpu: bool = False
     facts: BundleFacts | None = None
     n_variants: int = 0
@@ -888,7 +892,7 @@ class PredictWizard:
                 value=8, min=1, max=32, description="Batch size:", style=style, layout=wide()
             ),
             "output_name": ipywidgets.Text(
-                value="ranked_variants.csv", description="Output file:", style=style, layout=wide()
+                value=DEFAULT_OUTPUT_NAME, description="Output file:", style=style, layout=wide()
             ),
         }
         self.load_bundle_button = ipywidgets.Button(
@@ -921,10 +925,10 @@ class PredictWizard:
         for key, widget in self.fields.items():
             if hasattr(widget, "observe") and not key.endswith("_button"):
                 widget.observe(self._observer(key), names="value")
-        self.load_bundle_button.on_click(self.on_load_bundle)
-        self.prepare_button.on_click(self.on_prepare_variants)
-        self.score_button.on_click(self.on_score)
-        self.example_button.on_click(self.on_example_variants)
+        core.on_click(self.load_bundle_button, self._guarded(self.on_load_bundle))
+        core.on_click(self.prepare_button, self._guarded(self.on_prepare_variants))
+        core.on_click(self.score_button, self._guarded(self.on_score))
+        core.on_click(self.example_button, self._guarded(self.on_example_variants))
         self.refresh()
 
     # -- state ---------------------------------------------------------------------------
@@ -961,6 +965,28 @@ class PredictWizard:
 
     def _say(self, message: str) -> None:
         self.log.append_stdout(message + "\n")
+
+    def _guarded(self, action: Callable[[], Any]) -> Callable[[], Any]:
+        """Run a button's step, and put whatever it raises in the log instead of nowhere.
+
+        ipywidgets hands an exception raised inside a callback to `IPython.showtraceback()`,
+        which reaches no cell in Colab: the button returns, the page does not move, and the
+        work is gone with no message. Each step already reports the failures it expects; this
+        is the net under the ones it does not, and under Colab's stop button, which raises a
+        `KeyboardInterrupt` that is not an `Exception` and so is caught by nothing else.
+        """
+
+        def handle() -> Any:
+            try:
+                return action()
+            except KeyboardInterrupt:
+                self._say("stopped: you interrupted this step before it finished. Press the button again.")
+            except Exception as exc:  # noqa: BLE001 - the message is the product here
+                self._say(f"that did not work: {type(exc).__name__}: {exc}")
+            self.refresh()
+            return None
+
+        return handle
 
     # -- rendering -----------------------------------------------------------------------
 
@@ -1071,8 +1097,13 @@ class PredictWizard:
                 if wt and positions and max(positions) <= len(wt)
                 else None
             )
+            # The bundle records which notation its library was written in, and the template
+            # has to match it or the loader refuses the file it just handed over.
             target = templates.write_variants_template(
-                self.work_dir, self.facts.mutation_columns, wt_residues=residues
+                self.work_dir,
+                self.facts.mutation_columns,
+                wt_residues=residues,
+                three_letter=bool(self.facts.three_letter),
             )
         except Exception as exc:  # a template is a convenience; it may not break the panel
             self._say(f"could not write the example: {type(exc).__name__}: {exc}")
@@ -1171,9 +1202,21 @@ class PredictWizard:
         except Exception as exc:
             self._say(f"scoring failed: {exc}")
             return None
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        path = self.work_dir / (state.output_name.strip() or "ranked_variants.csv")
-        ranked.to_csv(path, index=False)
+        # Everything from here down used to run bare, after the model had already run: a name
+        # with a folder in it ("results/ranked.csv") made pandas raise where nothing was
+        # catching it, and the whole scoring pass was lost without a word. The folder the user
+        # named is made rather than refused, and what is left over is reported.
+        path = self.work_dir / (state.output_name.strip() or DEFAULT_OUTPUT_NAME)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            ranked.to_csv(path, index=False)
+        except OSError as exc:
+            # Nothing kept: no file, and no table on the page either, so the panel does not
+            # hold a result the user cannot see or download.
+            self.ranked, self.ranked_path = None, None
+            self._say(f"could not write {path}: {type(exc).__name__}: {exc}")
+            self._say("nothing was saved. Correct 'Output file:' and press Score and rank again.")
+            return None
         self.ranked, self.ranked_path = ranked, path
         self.result_box.value = result_html(
             n_ranked=len(ranked),

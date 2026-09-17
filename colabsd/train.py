@@ -13,6 +13,30 @@ into `output_dir/locked_test/` the moment a run finishes, so nothing a notebook
 touches -- neither `RunResult` nor `runs/<run>/metrics.json` nor
 `runs/<run>/predictions.npz` -- carries test information. Reading it back is
 `unlock_test`, which increments and persists `output_dir/unlock.json`.
+
+What a half-finished run directory means
+----------------------------------------
+A Colab session can end at any moment -- the stop button, or a pre-empted free
+runtime -- so `runs/<split>_<seed>/` has to say which of the two it holds. One rule,
+obeyed by both the writer and the reader:
+
+* A run is **finished** only when it holds a `colabsd_run.json` whose `stopped_early`
+  is not `"interrupted"`. That file is written last, after the test artefacts are
+  locked, so a run that died before it never counts as finished.
+* A **cut short** run -- a stop press (`stopped_early: "interrupted"`), or a session
+  that vanished mid-epoch and left nothing but `best_checkpoint.pt` -- is never reused
+  as a finished result. `finetune(resume=True)` retrains it, and says so in
+  `RunResult.warnings`.
+* Its weights are never destroyed by that retrain. `best_checkpoint.pt` is moved to
+  `unfinished_checkpoint.pt` (numbered if one is already there) *before* the retry's
+  first epoch overwrites anything, and that move is reported too.
+* Those weights stay reachable: `recover_runs(output_dir)` lists every checkpoint under
+  a run directory and says how far each run got, and
+  `colabsd.bundle.save_bundle_from_checkpoint` turns any one of them into a bundle.
+* What actually ran travels with the numbers. Every row in `RunResult.runs` carries
+  `stopped_early`, `epochs_run` and `epochs_budget`, so `run_result.json`,
+  `validation_runs.csv`, the report and the bundle manifest can all say "2 of 20 epochs"
+  rather than publishing the budget as though it had been spent.
 """
 
 from __future__ import annotations
@@ -43,6 +67,12 @@ PROTEIN_ID = "user_protein"
 LOCKED_DIRNAME = "locked_test"
 UNLOCK_FILENAME = "unlock.json"
 RUNS_DIRNAME = "runs"
+#: Where the weights of a run that never finished are moved, so that retraining the same split
+#: and seed cannot overwrite them. `recover_runs` reads these as readily as `best_checkpoint.pt`.
+UNFINISHED_CHECKPOINT_NAME = "unfinished_checkpoint.pt"
+#: The one value of `stopped_early` that means a person (or a dying session) ended the run,
+#: rather than early stopping doing its job.
+INTERRUPTED = "interrupted"
 METRICS = ("R2", "Pearson", "Spearman", "P@10", "P@50", "NDCG@10", "NDCG@50")
 SKIPPED_FINGERPRINT = "interrupted"
 LOCKED_WARNING = "Locked test partition. Read it through colabsd.train.unlock_test, which records every unlock."
@@ -197,12 +227,16 @@ def finetune(
     carries `budget`, which says what ran and which of it was the user's.
 
     `config` overrides the runtime config that would otherwise be built through
-    `colabsd.protein_db`; `resume` reuses a finished run only when its fingerprint --
-    the model, the hyperparameters, the mutated sites, the split and a hash of the
-    sequences and targets themselves -- is identical, so a changed library always
-    retrains. Test metrics are never returned: call `unlock_test` for those.
+    `colabsd.protein_db`; `resume` reuses a *finished* run only when its fingerprint --
+    the model, the backbone and the dtype it was built at, the hyperparameters, the mutated
+    sites, the wild-type 3Di string, the split and a hash of the sequences and targets
+    themselves -- is identical, so a changed library, a changed structure or a changed
+    backbone always retrains. A run that was cut short is never reused, and its weights are
+    moved to `unfinished_checkpoint.pt` before it is retrained rather than overwritten; see
+    the module docstring and `recover_runs`. Test metrics are never returned: call
+    `unlock_test` for those.
     """
-    from colabsd.engine.train_config import train_eval_config
+    from colabsd.engine.train_config import TrainingStopped, train_eval_config
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -236,6 +270,7 @@ def finetune(
     )
     params = {**dict(best.params), "effective_batch_size": settings.effective_batch_size}
     fixed = dict(runtime["fixed"])
+    max_epochs = int(fixed.get("max_epochs", 0) or 0)
     selection_metric = _selection_metric(runtime)
     pooled_positions = _pooled_positions(adapter, spec, runtime)
     data_digest = _data_digest(sequences, targets)
@@ -247,97 +282,124 @@ def finetune(
 
     rows: list[dict[str, Any]] = []
     run_dirs: list[Path] = []
+    notes: list[str] = []
     started = time.time()
-    for split_seed in split_seeds:
-        split = cleaned_splits[split_seed]
-        for model_seed in seeds:
-            name = f"split{split_seed}_seed{model_seed}"
-            run_dir = runs_root / name
-            fingerprint = _fingerprint(
-                model=str(best.model),
-                params=params,
-                fixed=fixed,
-                split=split,
-                data=data_digest,
-                pooled_positions=pooled_positions,
-                n_sequences=len(sequences),
-                n_targets=int(targets.shape[1]),
-                split_seed=split_seed,
-                model_seed=model_seed,
-            )
-            cached = _cached_row(run_dir, fingerprint) if resume else None
-            if cached is None:
-                run_dir.mkdir(parents=True, exist_ok=True)
-                _lock_interrupted_artifacts(run_dir, locked_dir / name, condition_columns)
-                t0 = time.time()
-                on_epoch, on_batch = _run_reporters(progress, len(rows), total, t0)
-                metrics = train_eval_config(
-                    adapter=adapter,
-                    sequences=sequences,
-                    targets=targets,
-                    split=split,
+    try:
+        for split_seed in split_seeds:
+            split = cleaned_splits[split_seed]
+            for model_seed in seeds:
+                name = f"split{split_seed}_seed{model_seed}"
+                run_dir = runs_root / name
+                fingerprint = _fingerprint(
+                    model=str(best.model),
+                    # What the adapter actually is, not just which registry entry was looked up.
+                    # A SaProt adapter interleaves the 3Di string into every token, so two runs
+                    # with different structures are two different models; the dtype and the
+                    # HuggingFace id decide which weights are loaded. All three reach
+                    # `create_adapter`, and leaving them out here made changing any of them a
+                    # silent reuse of the previous model's weights and numbers.
+                    adapter=_adapter_name(adapter, best),
+                    adapter_dtype=_text_attr(adapter, "dtype"),
+                    adapter_hf_id=_text_attr(adapter, "hf_id"),
+                    wt_3di=str(getattr(spec, "wt_3di", "") or ""),
                     params=params,
-                    config=runtime,
-                    split_seed=split_seed,
-                    seed=model_seed,
-                    output_dir=run_dir,
-                    source_trial=None,
-                    on_epoch=on_epoch,
-                    on_batch=on_batch,
-                )
-                minutes = (time.time() - t0) / 60.0
-                _lock_test_artifacts(
-                    run_dir=run_dir,
-                    locked_run_dir=locked_dir / name,
-                    metrics=metrics,
-                    fingerprint=fingerprint,
-                    condition_columns=condition_columns,
-                )
-                row = _visible_row(
-                    metrics=metrics,
-                    condition_columns=condition_columns,
+                    fixed=fixed,
+                    split=split,
+                    data=data_digest,
+                    pooled_positions=pooled_positions,
+                    n_sequences=len(sequences),
+                    n_targets=int(targets.shape[1]),
                     split_seed=split_seed,
                     model_seed=model_seed,
-                    run_dir=run_dir,
-                    minutes=minutes,
-                    fingerprint=fingerprint,
                 )
-                _write_visible_metrics(run_dir, row)
-            else:
-                row = cached
-            rows.append(row)
-            run_dirs.append(run_dir)
-            _notify(progress, len(rows), total, name)
+                cached = _cached_row(run_dir, fingerprint) if resume else None
+                if cached is None:
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    _lock_interrupted_artifacts(run_dir, locked_dir / name, condition_columns)
+                    notes.extend(_preserve_unfinished_checkpoint(run_dir, name))
+                    t0 = time.time()
+                    on_epoch, on_batch = _run_reporters(progress, len(rows), total, t0)
+                    metrics = train_eval_config(
+                        adapter=adapter,
+                        sequences=sequences,
+                        targets=targets,
+                        split=split,
+                        params=params,
+                        config=runtime,
+                        split_seed=split_seed,
+                        seed=model_seed,
+                        output_dir=run_dir,
+                        source_trial=None,
+                        on_epoch=on_epoch,
+                        on_batch=on_batch,
+                    )
+                    minutes = (time.time() - t0) / 60.0
+                    _lock_test_artifacts(
+                        run_dir=run_dir,
+                        locked_run_dir=locked_dir / name,
+                        metrics=metrics,
+                        fingerprint=fingerprint,
+                        condition_columns=condition_columns,
+                    )
+                    row = _visible_row(
+                        metrics=metrics,
+                        condition_columns=condition_columns,
+                        split_seed=split_seed,
+                        model_seed=model_seed,
+                        run_dir=run_dir,
+                        minutes=minutes,
+                        fingerprint=fingerprint,
+                        max_epochs=max_epochs,
+                    )
+                    _write_visible_metrics(run_dir, row)
+                    notes.extend(_cut_short_warning(row, name))
+                else:
+                    row = cached
+                rows.append(row)
+                run_dirs.append(run_dir)
+                _notify(progress, len(rows), total, name)
 
-    aggregate = _aggregate(rows, condition_columns, partition="validation")
-    result = RunResult(
-        model_name=str(best.model),
-        adapter_name=_adapter_name(adapter, best),
-        condition_columns=condition_columns,
-        params=params,
-        fixed=fixed,
-        budget=settings,
-        is_provisional=bool(getattr(best, "is_provisional", False)),
-        selection_metric=selection_metric,
-        split_seeds=split_seeds,
-        model_seeds=seeds,
-        runs=rows,
-        aggregate=aggregate,
-        validation_summary=_macro_summary(rows, "validation"),
-        output_dir=output_dir,
-        run_dirs=run_dirs,
-        locked_dir=locked_dir,
-        paths={},
-        n_sequences=len(sequences),
-        created_utc=_utc_now(),
-        unlock_count=read_unlock_count(output_dir),
-        minutes=(time.time() - started) / 60.0,
-        warnings=_provisional_warning(best) + _budget_warning(settings),
-        adapter_dtype=_text_attr(adapter, "dtype"),
-        adapter_hf_id=_text_attr(adapter, "hf_id"),
-    )
-    result.save()
-    return result
+        aggregate = _aggregate(rows, condition_columns, partition="validation")
+        result = RunResult(
+            model_name=str(best.model),
+            adapter_name=_adapter_name(adapter, best),
+            condition_columns=condition_columns,
+            params=params,
+            fixed=fixed,
+            budget=settings,
+            is_provisional=bool(getattr(best, "is_provisional", False)),
+            selection_metric=selection_metric,
+            split_seeds=split_seeds,
+            model_seeds=seeds,
+            runs=rows,
+            aggregate=aggregate,
+            validation_summary=_macro_summary(rows, "validation"),
+            output_dir=output_dir,
+            run_dirs=run_dirs,
+            locked_dir=locked_dir,
+            paths={},
+            n_sequences=len(sequences),
+            created_utc=_utc_now(),
+            unlock_count=read_unlock_count(output_dir),
+            minutes=(time.time() - started) / 60.0,
+            warnings=_provisional_warning(best) + _budget_warning(settings) + notes,
+            adapter_dtype=_text_attr(adapter, "dtype"),
+            adapter_hf_id=_text_attr(adapter, "hf_id"),
+        )
+        result.save()
+        return result
+    except KeyboardInterrupt:
+        # The stop button, landing between one run's last epoch and the next run's first --
+        # in the artefact locking, the bookkeeping or the aggregation, all of which are
+        # outside `train_eval_config`'s own reach. Re-raised as an exception the notebook's
+        # guard can catch, because a `KeyboardInterrupt` here goes straight past `except
+        # Exception` and kills the run with an empty log and a frozen progress line.
+        raise TrainingStopped(
+            f"Stopped between runs, while {output_dir} was being written. Nothing is corrupt: every run that "
+            "finished is recorded, and any run that did not keeps the weights of its best epoch. "
+            "colabsd.train.recover_runs(output_dir) says which is which, and pressing Train again retrains "
+            "only the runs that did not finish."
+        ) from None
 
 
 def unlock_test(run_result: RunResult, *, output_dir: str | Path) -> dict[str, Any]:
@@ -403,6 +465,124 @@ def unlock_test(run_result: RunResult, *, output_dir: str | Path) -> dict[str, A
     run_result.unlock_count = count
     run_result.save()
     return payload
+
+
+@dataclass(frozen=True)
+class RecoveredRun:
+    """One checkpoint found under a run directory, and how far the run that wrote it got.
+
+    `status` is the contract in one word:
+
+    * `"finished"` -- the epoch loop ran to its budget or to early stopping, and the run wrote
+      its metrics. These weights are what `finetune` would have exported.
+    * `"interrupted"` -- a stop press ended the epoch loop. The weights are the best epoch of
+      however many epochs ran, and `epochs_run` says how many.
+    * `"unfinished"` -- the run never got to write its numbers: the session died, or a stop
+      press landed after the epoch loop. Real, loadable weights; no metrics beside them.
+    """
+
+    run_dir: Path
+    checkpoint: Path
+    status: str
+    split_seed: int | None
+    model_seed: int | None
+    model_name: str | None
+    selection_metric: str | None
+    best_epoch: int | None
+    best_validation_score: float | None
+    epochs_run: int | None
+    stopped_early: str | None
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status == "finished"
+
+    def describe(self) -> str:
+        """One line for a notebook: which run, how it ended, what it scored, where it is."""
+        ran = f" after {self.epochs_run} epoch(s)" if self.epochs_run else ""
+        best = "" if self.best_epoch is None else f" · best epoch {self.best_epoch + 1}"
+        score = (
+            ""
+            if self.best_validation_score is None or not np.isfinite(self.best_validation_score)
+            else f" · validation {self.selection_metric or 'score'} {self.best_validation_score:.4f}"
+        )
+        return f"{self.run_dir.name} · {self.status}{ran}{best}{score} · {self.checkpoint}"
+
+
+def recover_runs(output_dir: str | Path) -> list[RecoveredRun]:
+    """Every checkpoint under *output_dir*, whether the run that wrote it finished or not.
+
+    This is the reader the per-epoch checkpoint exists for. A session that is pre-empted at hour
+    two of three leaves `runs/<split>_<seed>/best_checkpoint.pt` and nothing else -- no
+    `metrics.json`, no `RunResult`, nothing any other entry point in this package will accept.
+    Point this at the same `output_dir` in the next session and it says what survived and how
+    far each run got; `colabsd.bundle.save_bundle_from_checkpoint` turns any one of them into a
+    model bundle.
+
+    Weights moved aside by a later retrain (`unfinished_checkpoint*.pt`) are listed too, so
+    nothing that was ever written becomes unreachable.
+    """
+    import torch
+
+    output_dir = Path(output_dir)
+    roots = [output_dir / RUNS_DIRNAME, output_dir]
+    seen: set[Path] = set()
+    found: list[RecoveredRun] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for run_dir in sorted([root, *(path for path in root.iterdir() if path.is_dir())]):
+            if run_dir.name == LOCKED_DIRNAME:
+                continue
+            for checkpoint in sorted(run_dir.glob("*checkpoint*.pt")):
+                resolved = checkpoint.resolve()
+                if resolved in seen or checkpoint.name.endswith(".partial"):
+                    continue
+                seen.add(resolved)
+                try:
+                    blob = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                except (RuntimeError, ValueError, EOFError, AttributeError):
+                    continue
+                if not isinstance(blob, dict) or "lora_state_dict" not in blob:
+                    continue
+                found.append(_recovered(run_dir, checkpoint, blob))
+    return found
+
+
+def _recovered(run_dir: Path, checkpoint: Path, blob: dict[str, Any]) -> RecoveredRun:
+    recorded = _recorded_json(run_dir, "colabsd_run.json") or {}
+    moved_aside = checkpoint.name != _checkpoint_name()
+    stopped = blob.get("stopped_early", recorded.get("stopped_early"))
+    if moved_aside or not blob.get("complete", False):
+        status = "unfinished"
+    elif stopped == INTERRUPTED:
+        status = INTERRUPTED
+    elif not moved_aside and not recorded and not (run_dir / "metrics.json").is_file():
+        # Complete weights, but the run never wrote the numbers that go beside them.
+        status = "unfinished"
+    else:
+        status = "finished"
+    score = blob.get("best_validation_score")
+    return RecoveredRun(
+        run_dir=run_dir,
+        checkpoint=checkpoint,
+        status=status,
+        split_seed=_as_int(blob.get("split_seed")),
+        model_seed=_as_int(blob.get("seed")),
+        model_name=None if blob.get("model_name") is None else str(blob["model_name"]),
+        selection_metric=None if blob.get("selection_metric") is None else str(blob["selection_metric"]),
+        best_epoch=_as_int(blob.get("best_epoch")),
+        best_validation_score=None if score is None else float(score),
+        epochs_run=_as_int(blob.get("epochs_run")) or _as_int(recorded.get("epochs_run")),
+        stopped_early=None if stopped is None else str(stopped),
+    )
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _require_matching_fingerprint(
@@ -549,10 +729,23 @@ def _visible_row(
     run_dir: Path,
     minutes: float,
     fingerprint: str,
+    max_epochs: int = 0,
 ) -> dict[str, Any]:
+    """One run as everything downstream sees it: the numbers, and what produced them.
+
+    `stopped_early`, `epochs_run` and `epochs_budget` travel with the metrics rather than
+    staying behind in `metrics.json`, because every surface that publishes the numbers -- the
+    resume cache, `run_result.json`, `validation_runs.csv`, the report and the bundle manifest
+    -- has to be able to say that a run trained 2 of its 20 epochs.
+    """
     validation = metrics["validation"]
+    rows = metrics.get("partition_rows") or {}
     return {
         "split_seed": int(split_seed),
+        # Carried for the same reason as the epoch counts: a ranking metric is only the cut it
+        # names while the partition is longer than that cut, and the report is where somebody
+        # reads `P@50` without ever seeing how many rows it ranked.
+        "partition_rows": {str(k): int(v) for k, v in rows.items()},
         "model_seed": int(model_seed),
         "model": metrics["model"],
         "selection_metric": metrics["selection_metric"],
@@ -560,8 +753,11 @@ def _visible_row(
         "best_validation_score": float(metrics["best_validation_score"]),
         "minutes": float(minutes),
         "run_dir": str(run_dir),
-        "checkpoint": str(run_dir / "best_checkpoint.pt"),
+        "checkpoint": str(run_dir / _checkpoint_name()),
         "fingerprint": fingerprint,
+        "stopped_early": metrics.get("stopped_early"),
+        "epochs_run": int(metrics.get("epochs_run", 0) or 0),
+        "epochs_budget": int(max_epochs or metrics.get("epochs_run", 0) or 0),
         "test_locked": True,
         "validation": {
             "mean": dict(validation["mean"]),
@@ -582,6 +778,15 @@ def _write_visible_metrics(run_dir: Path, row: dict[str, Any]) -> None:
 
 
 def _cached_row(run_dir: Path, fingerprint: str) -> dict[str, Any] | None:
+    """The finished run in *run_dir*, if it is this exact run and it really finished.
+
+    `colabsd_run.json` is written only after a run returns, so its presence used to be taken
+    as proof that the run was complete. It is not: a stop press inside the epoch loop ends
+    that loop and the run finalises normally, marker file and all, having trained two epochs
+    of the twenty that were asked for. Reusing that as the finished answer makes the obvious
+    remedy -- press Train again -- do nothing at all, so a run that records
+    `stopped_early: "interrupted"` is never a cache hit.
+    """
     marker = run_dir / "colabsd_run.json"
     if not marker.is_file():
         return None
@@ -591,12 +796,128 @@ def _cached_row(run_dir: Path, fingerprint: str) -> dict[str, Any] | None:
         return None
     if not isinstance(row, dict) or row.get("fingerprint") != fingerprint:
         return None
-    checkpoint = run_dir / "best_checkpoint.pt"
+    if row.get("stopped_early") == INTERRUPTED:
+        return None
+    checkpoint = run_dir / _checkpoint_name()
     if not checkpoint.is_file():
         return None
     row["run_dir"] = str(run_dir)
     row["checkpoint"] = str(checkpoint)
     return row
+
+
+def _checkpoint_name() -> str:
+    """`best_checkpoint.pt`, spelled once, where the engine spells it."""
+    from colabsd.engine.train_config import CHECKPOINT_NAME
+
+    return CHECKPOINT_NAME
+
+
+def _recorded_json(run_dir: Path, name: str) -> dict[str, Any] | None:
+    """One of a run directory's bookkeeping files, or None if it is absent or unreadable."""
+    path = run_dir / name
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _preserve_unfinished_checkpoint(run_dir: Path, name: str) -> list[str]:
+    """Move a cut-short run's weights aside before this run trains over them.
+
+    The per-epoch checkpoint exists so that a session which dies at hour two of three leaves
+    something behind. It only does if the obvious next action -- reconnect and press Train --
+    cannot destroy it, and that action retrains the same split and seed into the same
+    directory, whose very first improving epoch (epoch 0 always improves) writes over
+    `best_checkpoint.pt`. So anything that is not a finished run's own checkpoint is renamed
+    first, and nothing here ever deletes a file.
+    """
+    checkpoint = run_dir / _checkpoint_name()
+    if not checkpoint.is_file():
+        return []
+    blob = _checkpoint_header(checkpoint)
+    recorded = _recorded_json(run_dir, "colabsd_run.json")
+    if _finished_weights(blob, recorded):
+        # A finished run's own weights, superseded by a deliberate change of configuration.
+        return []
+    target = _free_path(run_dir, UNFINISHED_CHECKPOINT_NAME)
+    checkpoint.replace(target)
+    how_far = _how_far(blob, recorded or _recorded_json(run_dir, "metrics.json"))
+    return [
+        f"Run {name} did not finish{how_far}. Its weights were moved to `{target}` and it is being "
+        "retrained now; read them back with colabsd.train.recover_runs(output_dir), or keep them with "
+        "colabsd.bundle.save_bundle_from_checkpoint()."
+    ]
+
+
+def _checkpoint_header(path: Path) -> dict[str, Any] | None:
+    """What a checkpoint says about itself, or None when it cannot be read at all."""
+    import torch
+
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=True)
+    except (RuntimeError, ValueError, EOFError, AttributeError, OSError):
+        return None
+    return blob if isinstance(blob, dict) else None
+
+
+def _finished_weights(blob: dict[str, Any] | None, recorded: dict[str, Any] | None) -> bool:
+    """True only when the checkpoint on disk is the product of a run that ran to the end.
+
+    The checkpoint is asked first, because it is the file about to be overwritten and it says
+    what it is (`complete`, `stopped_early`). The run directory's `colabsd_run.json` can belong
+    to an *earlier* run of the same split and seed -- a finished one, followed by a session that
+    died half way through a re-run -- so trusting it alone would throw away exactly the weights
+    this exists to keep. A checkpoint that cannot be read at all is treated as unfinished:
+    moving a file aside costs nothing, and deleting it is irreversible.
+    """
+    if blob is None:
+        return False
+    if "complete" in blob or "stopped_early" in blob:
+        return bool(blob.get("complete", False)) and blob.get("stopped_early") != INTERRUPTED
+    # Written by a colabsd that recorded neither: fall back to the directory's own bookkeeping.
+    return recorded is not None and recorded.get("stopped_early") != INTERRUPTED
+
+
+def _how_far(blob: dict[str, Any] | None, recorded: dict[str, Any] | None) -> str:
+    """` (2 of 20 epochs)`, as far as the checkpoint and the run directory agree on it.
+
+    The checkpoint wins on how many epochs ran, because the bookkeeping beside it may belong to
+    an earlier run of the same split and seed; the budget is only quoted when the two agree
+    that they are describing the same run.
+    """
+    ran = (blob or {}).get("epochs_run") or (recorded or {}).get("epochs_run")
+    if not ran:
+        return ""
+    budget = (recorded or {}).get("epochs_budget")
+    same_run = (recorded or {}).get("epochs_run") == ran
+    return f" ({int(ran)} of {int(budget)} epochs)" if budget and same_run else f" ({int(ran)} epoch(s) trained)"
+
+
+def _free_path(directory: Path, name: str) -> Path:
+    """`name`, or `name_2`, `name_3`, ...: the first spelling that is not already taken."""
+    candidate = directory / name
+    stem, suffix = candidate.stem, candidate.suffix
+    index = 1
+    while candidate.exists():
+        index += 1
+        candidate = directory / f"{stem}_{index}{suffix}"
+    return candidate
+
+
+def _cut_short_warning(row: dict[str, Any], name: str) -> list[str]:
+    """Say, on the page and in `run_result.json`, that these numbers came from a short run."""
+    if row.get("stopped_early") != INTERRUPTED:
+        return []
+    ran, budget = int(row.get("epochs_run", 0) or 0), int(row.get("epochs_budget", 0) or 0)
+    return [
+        f"Run {name} was stopped by hand after {ran} of {budget} epochs. Its numbers are this "
+        "short run's, not the budget's; the next Train press retrains it rather than reusing it, "
+        "and moves these weights aside first."
+    ]
 
 
 def _validate_inputs(
@@ -739,6 +1060,10 @@ def _runtime_config(
         )
     config.setdefault("data", {})
     config.setdefault("protein", {})
+    # The engine names unnamed target columns after upstream's own study's four SlugCas9 PAMs.
+    # The library's condition columns are right here, and `metrics.json` is a file the docs send
+    # people to, so they are passed down rather than left to that default.
+    config["data"]["target_names"] = [str(column) for column in spec.condition_columns]
     # The looked-up training block is merged in last of the two, then the budget over both:
     # what the user set has to survive, and what they left alone is the lookup's.
     fixed = {**dict(config.get("fixed", {})), **fixed_best, **settings.as_fixed()}
@@ -877,6 +1202,11 @@ def _flatten_runs(rows: list[dict[str, Any]], condition_columns: list[str]) -> l
             "best_epoch": row.get("best_epoch"),
             "best_validation_score": row.get("best_validation_score"),
             "minutes": row.get("minutes"),
+            # A row of numbers is not readable without the run that produced them: 2 epochs of
+            # a 20-epoch budget is a different measurement from 20 of 20.
+            "epochs_run": row.get("epochs_run"),
+            "epochs_budget": row.get("epochs_budget"),
+            "stopped_early": row.get("stopped_early"),
         }
         for metric, value in row[partition]["mean"].items():
             record[f"{partition}_mean_{metric}"] = value

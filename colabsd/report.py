@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 
-from .bundle import BUDGET_KEY, budget_line, budget_of
+from .bundle import BUDGET_KEY, budget_line, budget_of, json_safe
 from .errors import ColabSDError
 from .train import UNLOCK_FILENAME, RunResult, read_unlock_count, summarize_across_runs
 
@@ -122,10 +123,13 @@ def build_report(
         )
 
     aggregated = _aggregate(records, conditions, TRACKED_METRICS)
+    cut_short = _cut_short_runs(run_result)
+    rows_by_partition = partition_rows(run_result)
     settings = budget_of(budget, run_result)
     unlock = _unlock_info(run_result, out_dir)
     shown = _shown_partition(partition, aggregated, unlock["count"])
     visible = _visible_partitions(unlock["count"], shown, "test" in aggregated)
+    truncated = truncated_metrics(rows_by_partition.get(shown, 0), TRACKED_METRICS)
 
     frame = _report_frame(model_label, aggregated, conditions, TRACKED_METRICS, visible)
     csv_path = out_dir / "report.csv"
@@ -142,6 +146,7 @@ def build_report(
         spec=spec,
         n_runs=len(records),
         budget=settings,
+        cut_short=cut_short,
     )
     png_path = out_dir / "report.png"
     figure.savefig(png_path, dpi=150, bbox_inches="tight", facecolor="white")
@@ -153,6 +158,13 @@ def build_report(
         "unlock_count": unlock["count"],
         "unlock_source": unlock["source"],
         BUDGET_KEY: settings,
+        # Which of these runs a person stopped, and how far it got. Empty for a run that was
+        # left alone, which is what makes a non-empty list worth reading.
+        "runs_stopped_early": cut_short,
+        "partition_rows": rows_by_partition,
+        # Which of the columns in report.csv are not the cut their name promises, on the
+        # partition this report shows. Empty when the partition is longer than every cut.
+        "truncated_metrics": truncated,
         "n_runs": {model_label: len(records)},
         "reported_partitions": list(visible),
         "sources": {
@@ -162,6 +174,45 @@ def build_report(
     json_path = out_dir / "report.json"
     json_path.write_text(json.dumps(_json_safe(summary), indent=2))
     return ReportPaths(csv=csv_path, png=png_path, json=json_path)
+
+
+def _cut_short_runs(run_result: RunResult | Any) -> list[dict]:
+    """The runs behind this report that a person stopped, with how far each one got.
+
+    `colabsd.train.finetune` carries `stopped_early` and `epochs_run` on every run it returns,
+    so a report over a run that was cut short can say so instead of publishing the numbers as
+    though the whole budget had been spent. A hand-built record that carries neither says
+    nothing, rather than claiming the run was complete.
+    """
+    cut_short = []
+    for index, raw in enumerate(_raw_records(run_result)):
+        if _lookup(raw, "stopped_early") != "interrupted":
+            continue
+        model_seed = _lookup(raw, "model_seed")
+        cut_short.append(
+            {
+                "split_seed": _lookup(raw, "split_seed"),
+                "model_seed": model_seed if model_seed is not None else _lookup(raw, "seed"),
+                "index": index,
+                "epochs_run": _lookup(raw, "epochs_run"),
+                "epochs_budget": _lookup(raw, "epochs_budget"),
+                "stopped_early": "interrupted",
+            }
+        )
+    return cut_short
+
+
+def _cut_short_line(cut_short: list[dict]) -> str:
+    """The one sentence the figure owes a reader whose run was stopped by hand."""
+    if not cut_short:
+        return ""
+    names = ", ".join(
+        f"split{entry['split_seed']}_seed{entry['model_seed']}"
+        + (f" ({entry['epochs_run']} of {entry['epochs_budget']} epochs)" if entry.get("epochs_run") else "")
+        for entry in cut_short[:3]
+    )
+    more = f" and {len(cut_short) - 3} more" if len(cut_short) > 3 else ""
+    return f"STOPPED EARLY BY HAND: {names}{more} — these are that shortened run's numbers"
 
 
 def _visible_partitions(unlock_count: int, shown: str, has_test: bool) -> tuple[str, ...]:
@@ -178,16 +229,13 @@ def _visible_partitions(unlock_count: int, shown: str, has_test: bool) -> tuple[
 
 
 def _json_safe(value: Any) -> Any:
-    """NaN and inf are not JSON; write them as null so `report.json` parses anywhere."""
-    if isinstance(value, dict):
-        return {key: _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, (float, np.floating)):
-        return float(value) if np.isfinite(value) else None
-    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
-        return int(value)
-    return value
+    """NaN and inf are not JSON; write them as null so `report.json` parses anywhere.
+
+    One implementation, in `colabsd.bundle`, because the bundle manifest and this report
+    publish the same numbers -- the single-run `sd` that is NaN by design among them -- and
+    two sanitisers that drift apart is exactly how one of the two ended up unreadable.
+    """
+    return json_safe(value)
 
 
 def _condition_names(spec: Any, run_result: RunResult | Any) -> list[str]:
@@ -286,6 +334,47 @@ def _run_key(record: dict) -> tuple:
     if record["split_seed"] is None and record["model_seed"] is None:
         return ("index", record["index"])
     return (record["split_seed"], record["model_seed"])
+
+
+def metric_cutoff(metric: str) -> int | None:
+    """The *k* in `NDCG@50` or `P@10`; `None` for a metric that ranks nothing.
+
+    `colabsd.engine.metrics` spells every ranking metric this way, so the number a column
+    promises is read off the column rather than written down a second time here.
+    """
+    _, at, tail = str(metric).partition("@")
+    return int(tail) if at and tail.isdigit() else None
+
+
+def truncated_metrics(n_rows: int, metrics: Sequence[str]) -> list[str]:
+    """Those of *metrics* whose cut-off is larger than the partition they rank.
+
+    `ndcg_k` and `precision_k` both score the top `min(k, n)`, so on a partition shorter than
+    *k* the column is not the cut it names: every row is inside it, and `P@50` on twelve rows
+    reads 1.0000 for a ranking no better than chance. This lives here rather than in the panel
+    because the archive publishes the same columns to a reader who never saw the panel.
+    """
+    rows = int(n_rows)
+    if rows <= 0:
+        return []
+    return [metric for metric in metrics if (metric_cutoff(metric) or 0) > rows]
+
+
+def partition_rows(run_result: Any) -> dict[str, int]:
+    """The smallest row count each partition had across the runs; empty when unrecorded.
+
+    Smallest rather than mean: a metric is misleading if it was truncated in *any* run that
+    went into the average.
+    """
+    counts: dict[str, list[int]] = {}
+    for record in getattr(run_result, "runs", None) or []:
+        rows = (record or {}).get("partition_rows") if isinstance(record, dict) else None
+        for name, value in (rows or {}).items():
+            try:
+                counts.setdefault(str(name), []).append(int(value))
+            except (TypeError, ValueError):
+                continue
+    return {name: min(values) for name, values in counts.items() if values}
 
 
 def _partition_payload(record: Any, partition: str) -> Any:
@@ -548,6 +637,7 @@ def _build_figure(
     spec: Any,
     n_runs: int,
     budget: Any = None,
+    cut_short: list[dict] | None = None,
 ) -> Figure:
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -610,12 +700,19 @@ def _build_figure(
         0.015,
         _footer(n_runs, unlock, spec, conditions)
         + "\n"
-        + _wrap_clauses(f"trained with: {budget_line(budget)}", FOOTER_WRAP),
+        + _wrap_clauses(f"trained with: {budget_line(budget)}", FOOTER_WRAP)
+        + _cut_short_suffix(cut_short),
         ha="center",
         va="bottom",
         fontsize=8.5,
     )
     return figure
+
+
+def _cut_short_suffix(cut_short: list[dict] | None) -> str:
+    """The stopped-early line, or nothing at all when every run ran its course."""
+    line = _cut_short_line(cut_short or [])
+    return f"\n{_wrap_clauses(line, FOOTER_WRAP)}" if line else ""
 
 
 #: Characters per line of the budget footer. A run with all four settings moved writes half as

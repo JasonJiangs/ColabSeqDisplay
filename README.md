@@ -91,6 +91,63 @@ validation numbers while the test partition is untouched. Its only blockers are 
 trained yet* and *the settings have changed since the run*. Press the same button after an unlock
 and the file is rewritten with the test numbers and the count.
 
+**`training_budget` is what a run was given, not always what it spent.** A run you stopped by hand
+is recorded as one: `report.json` carries `runs_stopped_early` naming each such run and the epochs
+it trained, `report.png`'s footer carries the same sentence (*STOPPED EARLY BY HAND: split1_seed11
+(2 of 20 epochs) — these are that shortened run's numbers*), `validation_runs.csv` gains
+`epochs_run`, `epochs_budget` and `stopped_early` columns, and `training_curve.csv` has one row per
+epoch actually trained. `performance.json` and `README.txt` currently report the budget only, so
+read `report.json` beside them when a run was cut short.
+
+**Four of the seven metrics in `report.csv` are ranking cuts, and a short partition makes them
+high rather than good.** `P@10`, `P@50`, `NDCG@10` and `NDCG@50` score the top `min(k, n)` of a
+partition of `n` rows, so a partition shorter than the cut puts every variant inside it. On the
+bundled example's 12 validation rows: `P@50` is **exactly 1.0000 for every possible model**,
+`P@10` cannot fall below **0.8** by arithmetic (two ten-element subsets of twelve overlap in at
+least eight), and over 5,000 random rankings of those rows `NDCG@50` stayed between 0.65 and 0.98
+and `NDCG@10` between 0.50 and 0.97. None of the four can be read as an absolute score on a
+partition that size — a `P@50` of 1.0000 is what no-skill scores — and `Spearman` and `R2` are the
+columns to quote instead. The panel's own results table shows only
+`Spearman`, `R2` and `NDCG@50`, and drops `NDCG@50` with a note when the partition is shorter than
+50 — `report.csv`, `report.json` and the bottom panel of `report.png` carry all seven regardless,
+and record no partition size, so say how many validation or test rows a number came from whenever
+you pass the archive on.
+
+## If the session dies, or you stop a run
+
+The best epoch's weights are already on disk:
+`colabsd_work/run/runs/<split>_<seed>/best_checkpoint.pt`, rewritten every time the validation
+score improves. They are not lost and they are not overwritten — the next Train press renames that
+file to `unfinished_checkpoint.pt` before the retry writes anything, numbering it if one is already
+there, and says so in the panel. Nothing is deleted.
+
+Two readers make them reachable without a live run. Import each by name — `import colabsd` alone
+does not bring its submodules with it:
+
+```python
+from colabsd.train import recover_runs
+from colabsd.bundle import save_bundle_from_checkpoint
+
+recover_runs("colabsd_work/run")
+# -> one record per checkpoint: status (finished / interrupted / unfinished), epochs_run,
+#    best epoch, best validation score, path, and describe() for one line of prose
+
+# `spec` and `best` describe the library and the hyperparameters the checkpoint was trained
+# with. After a lost session the panel rebuilds both: run the notebook's cell, press
+# **Check my library**, pick the same backbone, and take them off the wizard it returns.
+save_bundle_from_checkpoint(
+    "rescued_bundle.zip",
+    checkpoint="colabsd_work/run/runs/split1_seed11/best_checkpoint.pt",
+    spec=wizard.spec, best=wizard.best,
+)   # a loadable model_bundle.zip whose manifest records that it came from a run that was cut short
+```
+
+**A run that was stopped is never reused as a finished one.** *Reuse finished runs* treats a run
+directory as finished only when it holds a `colabsd_run.json` whose `stopped_early` is not
+`interrupted`, so pressing Train again retrains it instead of re-reporting its numbers; and until
+then every artefact carrying those numbers says what happened — see *`training_budget` is what a
+run was given* above.
+
 ---
 
 ## Backbones
@@ -123,7 +180,10 @@ Run `ESM2-8M` first as a sanity check on a new library before paying for a long 
 above are on screen. Every other adapter is still in the package, buildable as
 `create_adapter("ESMC-300M")`, and carries its `config/best/` entry; the panel lists all seven
 withheld backbones by name, each with the `withheld_reason` recorded for its family, and Predict
-loads a bundle from any of them.
+loads a bundle from any of the thirteen that have an adapter. The fourteenth is `METL`, tier
+`local_only`: `create_adapter("METL")` raises, so this package can neither train such a bundle nor
+score one, and the Predict notebook says so when the bundle is loaded rather than halfway through a
+screen.
 
 ## Configurations
 
@@ -190,10 +250,17 @@ finishes and are read only by the unlock cell.
 ## Requirements
 
 **Python ≥ 3.10**, and the dependencies `pyproject.toml` lists: `numpy>=1.26,<3`, `pandas>=2.1,<4`,
-`scipy>=1.11,<2`, `scikit-learn>=1.3,<2`, `matplotlib>=3.7,<4`, `tqdm>=4.66,<5`, `torch>=2.2,<3`,
+`scipy>=1.11,<2`, `scikit-learn>=1.3,<2`, `matplotlib>=3.7,<4`, `tqdm>=4.66,<5`, `torch>=2.6,<3`,
 `transformers>=4.40`, `huggingface_hub>=0.23`, `pyyaml>=6,<7`, `ipywidgets>=8,<9`, `ipython>=8`.
 Extras `[esmc]` and `[prott5]` serve withheld backbones; `[optuna]` and `[dev]` are declared too.
 Outside Colab, `pip install .`.
+
+**2.6 is the torch floor because of the weights, not the code.** Since CVE-2025-32434
+`transformers` refuses to `torch.load` a `pytorch_model.bin` on anything older, and SaProt
+publishes `.bin` rather than safetensors, so a SaProt backbone cannot be loaded below it — that is
+the first cause the panel's own "could not load" message names. Colab is already above the floor;
+an install elsewhere that pins torch lower will be asked to move it, and `pyproject.toml` records
+the same reason beside the pin.
 
 **GPU.** A free Colab T4 (16 GB) fits every offered backbone except `SaProt-1.3B`.
 `colabsd.structure` puts the ESMFold ceiling on a free T4 at **700 residues**, well above the

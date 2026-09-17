@@ -86,10 +86,16 @@ covered by a test.
    `_read_fasta_records` → `read_fasta_records`, and the `lru_cache`d protein database is
    reached through `load_database()` and cleared through `clear_database_cache()` instead
    of `_load_database.cache_clear`. Bodies are unchanged.
-3. **The default target names are explicit.** `evaluate_predictions` names the first four
-   unnamed targets after SlugCas9's four PAMs through a module-private table, which
-   surprises anyone whose conditions are not PAMs. Same names, same order, now the public
-   `DEFAULT_TARGET_NAMES` and `default_target_names()`.
+3. **The default target names are explicit, and a run supplies the real ones.**
+   `evaluate_predictions` names the first four unnamed targets after SlugCas9's four PAMs
+   through a module-private table, which surprises anyone whose conditions are not PAMs.
+   Same names, same order, now the public `DEFAULT_TARGET_NAMES` and
+   `default_target_names()` — and no longer what a run writes: `colabsd.train` puts the
+   user's condition columns into `config["data"]["target_names"]`, and `train_eval_config`
+   labels the per-target blocks of `metrics.json` and `locked_test/*/test_metrics.json` with
+   them through the colabsd-only `configured_target_names` and `relabel_per_target`. The
+   blocks are positionally and numerically identical; only the labels change, and a config
+   without the key keeps upstream's default. `evaluate_predictions` itself is untouched.
 4. **The protein database has no packaged fallback.** Upstream falls back to a
    `proteins.yaml` shipped in its repository — SlugCas9's record. `colabsd` ships no such
    file and synthesizes one per run, so `database_path` is required rather than silently
@@ -129,14 +135,26 @@ covered by a test.
    a cluster; a free Colab session is pre-empted without notice, and until this the whole
    run lived in memory — an hour of training ended as nothing. The value written is always
    the *best epoch so far*, never the latest, so a run that stops early yields the same
-   weights it would have exported had it stopped there on purpose.
+   weights it would have exported had it stopped there on purpose. `build_checkpoint` also
+   records `stopped_early` and `epochs_run` beside `complete`, so the file answers "did the
+   run that wrote me finish?" on its own — which is what `colabsd.train.recover_runs` and
+   `colabsd.train._preserve_unfinished_checkpoint` ask it before anything retrains over it.
 10. **A `KeyboardInterrupt` in the epoch loop ends it rather than propagating.** It is
    handled exactly like early stopping: the loop ends, the best epoch is restored,
    re-evaluated and written, and `metrics.json` records `stopped_early: "interrupted"`
    alongside `epochs_run`. This is the only way to stop a run from the notebook — the panel
    trains synchronously inside a widget callback, so no second widget's handler can fire
-   while it is in there, and Colab's own interrupt is what reaches it. An interrupt before
-   the first epoch finishes raises, because there is nothing to keep.
+   while it is in there, and Colab's own interrupt is what reaches it.
+11. **A stop press *outside* the epoch loop raises one class the panel can catch.** The
+   post-loop half of `train_eval_config` — the final validation and test passes and the
+   artefact writes — is the colabsd-only `_finalise_run`, wrapped so that a
+   `KeyboardInterrupt` there rewrites the checkpoint with `complete: False,
+   stopped_early: "interrupted"` and then raises the colabsd-only
+   `TrainingStopped(RuntimeError)`, whose message names the run, the epochs it trained,
+   where its weights are and what to do next. The pre-first-epoch interrupt raises the same
+   class. Upstream lets `KeyboardInterrupt` escape, which is correct for a cluster job and
+   wrong here: `KeyboardInterrupt` is not an `Exception`, so the panel's guard could not see
+   it and a stop press killed the click with no message at all.
 
 Three upstream quirks were **kept on purpose**, because changing them would move a
 guard or a number: `create_split` still caches on the output directory alone (`colabsd.data`
@@ -152,13 +170,28 @@ Equality is asserted, not assumed. `tests/test_engine_lora.py`,
 `tests/test_engine_train_config.py` import both the vendored module and the original and
 run them side by side on real input — the bundled 124-variant MG8 PETase library, all 28
 shipped configs, a full LoRA fine-tune — asserting equal outputs rather than equal source.
+`tests/test_engine_fidelity.py` compares the two source trees definition by definition, so
+a departure that is not one of the numbered ones above fails the build rather than the
+reader's expectations. Four names in `colabsd/engine/train_config.py` are compared against
+nothing because they are ours and have no upstream counterpart: `TrainingStopped`,
+`_finalise_run`, `configured_target_names` and `relabel_per_target`. `evaluate_split` and
+every other shared definition in that module are still held to upstream byte for byte, after
+the normalisation the test describes.
 
-Those comparisons need the research checkout. They locate it by importing `seqdisplay_opt`
-and then by the `SEQDISPLAY_OPT_ROOT` environment variable, and **skip cleanly when neither
-is available**, so the suite is green for a user who has only this repository. On a bare
-clone every test passes and the skips are exactly these comparisons plus four that want
-HuggingFace weights; with a checkout reachable, around sixty more tests run and only the
-four weight-dependent ones skip. To run them:
+**Those files are not in the published distribution.** What is published at
+<https://github.com/JasonJiangs/ColabSeqDisplay> is what a notebook runs — the `colabsd`
+package, the two Colab notebooks, the 28 configs, the bundled example and this
+documentation — so a clone of it has no `tests/` directory and no `scripts/`, and
+`python -m pytest tests/` in one exits with `file or directory not found: tests/`. Both live
+in the development tree the distribution is extracted from; ask the authors for it if you
+want to run the comparisons rather than read about them.
+
+They also need the research checkout. They locate it by importing `seqdisplay_opt` and then
+by the `SEQDISPLAY_OPT_ROOT` environment variable, and **skip cleanly when neither is
+available**, so the suite is green for somebody who has the development tree but not the
+research one: the skips are then exactly these comparisons plus the ones that want
+HuggingFace weights. With a checkout reachable, around sixty more tests run. In the
+development tree:
 
 ```bash
 SEQDISPLAY_OPT_ROOT=/path/to/SequenceDisplay-Workflow-Optimization python -m pytest tests/ -q
@@ -175,8 +208,9 @@ checkout and the environment variable when it is missing rather than raising a b
 `ModuleNotFoundError`. It also stages the protein record in *both* shapes, because
 upstream's own validator reaches the pooled residues through a `regions` mapping.
 
-It is not part of the product. The notebooks, `colabsd`, the 28 shipped configs and the
-test suite are all standalone; this one developer script is the documented exception.
+It is not part of the product, and — like `tests/` — not part of what is published. The
+notebooks, `colabsd` and the 28 shipped configs are standalone; this one developer script is
+the documented exception, and it lives in the development tree.
 
 ## Data and hyperparameters
 

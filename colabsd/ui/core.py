@@ -628,7 +628,11 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("use_drive", "storage", _always),
     FieldRule("drive_folder", "storage", _drive),
     FieldRule("output_dir", "storage", _advanced),
-    FieldRule("show_advanced", "run", _always),
+    # In the data section, not the run section: it is the switch for every advanced field on
+    # the form, and three of those are in the data section itself. A run section that only
+    # appears once the library has loaded cannot hold the checkbox a library needs in order to
+    # load -- which is what a three-letter-code CSV needs.
+    FieldRule("show_advanced", "data", _data_section),
     FieldRule("run_button", "run", _always),
 )
 
@@ -1213,7 +1217,15 @@ def drive_widgets(*, folder: str = "ColabSeqDisplay") -> dict[str, Any]:
     import ipywidgets
 
     checkbox = ipywidgets.Checkbox(value=False, description="Save to Google Drive", indent=False)
-    text = ipywidgets.Text(value=folder, description="Drive folder:", style={"description_width": "initial"})
+    # `continuous_update=False`: a wizard remounts Drive when this changes, so the value has to
+    # arrive once the name is finished (Enter, or leaving the box) rather than once per
+    # keystroke -- otherwise "MyProject" would make a folder for every prefix of itself.
+    text = ipywidgets.Text(
+        value=folder,
+        description="Drive folder:",
+        style={"description_width": "initial"},
+        continuous_update=False,
+    )
     set_display(text, False)
     return {"use_drive": checkbox, "drive_folder": text}
 

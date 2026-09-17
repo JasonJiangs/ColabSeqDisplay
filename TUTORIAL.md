@@ -12,6 +12,7 @@ is and what its numbers are worth is in [`README.md`](README.md), in particular
 
 **Contents** — [Before you start](#before-you-start) · [Part 1](#part-1--the-bundled-example) ·
 [Part 2](#part-2--your-own-protein) · [Part 3](#part-3--scoring-new-variants) ·
+[A run that was stopped](#a-run-that-was-stopped-or-a-session-that-died) ·
 [Troubleshooting](#troubleshooting) · [Working directory](#what-ends-up-in-the-working-directory) ·
 [If you report a result](#if-you-report-a-result)
 
@@ -90,18 +91,23 @@ behind it and shows a red banner instead: `ESM2-8M · PROVISIONAL — hyperparam
 placeholder, performance unknown` (see
 [Reading the PROVISIONAL warning](#reading-the-provisional-warning)). None of those is editable.
 
-**Stopping early, and what survives.** `best_checkpoint.pt` is rewritten in the run folder every
-time the validation score improves, so a session that is pre-empted or disconnected leaves the best
-epoch it reached rather than nothing. To stop a run deliberately, press Colab's own ▪ — the panel
-keeps that best epoch, scores it, writes the bundle and the archive as usual, and the report records
-`stopped_early: interrupted`. The panel has no stop button of its own: training holds the kernel
-while it runs, so no widget here could answer a click until it finished.
+**Stopping early, and what survives.** `best_checkpoint.pt` is rewritten in
+`colabsd_work/run/runs/<split>_<seed>/` every time the validation score improves, so a session that
+is pre-empted or disconnected leaves the best epoch it reached rather than nothing — and the next
+Train press does not destroy it: that file is renamed to `unfinished_checkpoint.pt` before the retry
+writes anything, and the panel prints where it went. To stop a run deliberately, press Colab's own ▪
+— stopped inside an epoch, the panel keeps that best epoch, scores it and writes the artefacts;
+stopped while the run is finishing up, it ends there and the panel prints where the weights are.
+The panel has no stop button of its own: training holds the kernel while it runs, so no widget here
+could answer a click until it finished. What a shortened run leaves behind, and how to read it back,
+is [below](#a-run-that-was-stopped-or-a-session-that-died).
 
 **Three boxes under that table are yours**, prefilled from the same entry: *Epochs, at most* (20),
 *Give up after this many epochs with no gain* (3), and *Sequences on the GPU at once (memory)* (8).
 The third is the one to lower if training dies with CUDA out of memory — it is how much has to fit
-on the card, while `effective_batch_size` (16, in the table, not editable) is what the optimiser
-averages over and gradient accumulation holds it there either way. A box you move says `changed ·
+on the card, while `effective_batch_size` (32 for the default `ESM2-35M`; read it off the table,
+it is not editable and it differs per backbone) is what the optimiser averages over, and gradient
+accumulation holds it there either way. A box you move says `changed ·
 20 looked up` beside itself, the row above it reads `20 → 40`, and the estimate in step 4 re-prices
 the run. A budget that could not train is refused before the button: no epochs, a patience longer
 than the run, a micro-batch that does not divide the effective batch or is bigger than your
@@ -122,9 +128,12 @@ flight, and when an epoch closes the batch count gives way to that epoch's valid
 (`epoch 3/20 · val 0.7412 · loss 0.171`). One quiet stretch is expected, before the first batch
 line: `0/1 runs finished · starting`, while the backbone is downloaded and loaded — minutes for a
 650M checkpoint on a fresh runtime. Keep the tab open: closing it disconnects the runtime, and a
-disconnected runtime stops training. If it is interrupted, press again — a finished run is reused
-only when its fingerprint (model, hyperparameters, the three budget boxes, mutated sites, split,
-and a hash of your data) is identical.
+disconnected runtime stops training. If it is interrupted, press again: a run that was cut short is
+never reused as a finished one, so Train retrains it and moves its weights aside first. A run that
+*did* finish is reused only when its fingerprint is identical — model, the adapter actually built
+from it (its HuggingFace id, its dtype and, for SaProt, the wild-type 3Di string), hyperparameters,
+the three budget boxes, mutated sites, split, and a hash of your data. Fetch a better structure,
+re-derive the 3Di and press Train and you get a new run rather than the old structure's numbers.
 
 ### Step 7 — what came back
 
@@ -141,14 +150,24 @@ split and the initialisation, not GPU arithmetic. Twelve rows also drop `NDCG@50
 with a note saying why: every variant falls inside a cut of 50, so the column cannot mean what its
 name promises. `report.csv` in the performance archive carries it anyway.
 
+**The same is true of `P@10`, `P@50` and `NDCG@10`, which the panel never shows you at all.**
+`report.csv`, `report.json` and the bottom panel of `report.png` publish all four ranking cuts for
+every run, and each scores the top `min(k, n)` of an `n`-row partition. On 12 validation
+rows `P@50` is **exactly 1.0000 whatever the model predicts** — two twelve-element subsets of
+twelve are the same set — and `P@10` cannot go below **0.8**; over 5,000 random rankings of those
+rows `NDCG@50` stayed between 0.65 and 0.98 and `NDCG@10` between 0.50 and 0.97. A `P@50` of
+1.0000 in this example's archive is arithmetic, not performance. Quote `Spearman` (and `R2`) from a
+partition this short, and say how many rows it had — the archive does not record that.
+
 ### Step 8 — the two exports
 
 Both buttons refuse for the same two reasons and no others: **nothing has been trained in this
 session**, or **the settings have changed since this model was trained**.
 
 **`model_bundle.zip`** is written, loaded straight back, and described from the file rather than
-from the form — `ESM2-35M · 19 mutated sites · PROVISIONAL hyperparameters · 20 epochs,
-micro-batch 8 (as looked up) · 1 conditions · test unlocked 0x · written <timestamp>`, where the
+from the form — `ESM2-35M · 19 mutated sites · tuned hyperparameters · 20 epochs,
+micro-batch 8 (as looked up) · 1 conditions · test unlocked 0x · written <timestamp>`, where
+`tuned` becomes `PROVISIONAL` for a backbone with no study behind it, and the
 budget clause reads `(budget set by hand)` if you moved any of the three boxes. It holds **the single best-validation run**, not an ensemble,
 so with 3 × 3 seeds the ± in your report describes a family of runs and the bundle is one member of
 it; and it needs the training checkpoint on disk, so export before you clear `colabsd_work/`.
@@ -158,8 +177,8 @@ it; and it needs the training checkpoint on disk, so export before you clear `co
 | member | what it holds |
 |---|---|
 | `report.csv` | one row per partition × condition, `source` naming the model: `n_runs`, then `_mean` and `_sd` for R2, Pearson, Spearman, P@10, P@50, NDCG@10, NDCG@50 — plus a `mean` row across conditions |
-| `report.png` | the chosen metric per condition, every tracked metric averaged over them, error bars ±1 sd across runs, a title naming the partition and a badge giving the unlock count |
-| `report.json` | `unlock_count`, `unlock_source`, `shown_partition`, `reported_partitions`, `n_runs`, `sources` |
+| `report.png` | the chosen metric per condition, every tracked metric averaged over them, error bars ±1 sd across runs, a title naming the partition and a badge giving the unlock count; the footer gains a line for a run that was stopped early (*STOPPED EARLY BY HAND: split1_seed11 (2 of 20 epochs) — these are that shortened run's numbers*) and carries none when nobody stopped one |
+| `report.json` | `unlock_count`, `unlock_source`, `shown_partition`, `reported_partitions`, `n_runs`, `sources`, and `runs_stopped_early` — one entry per run you stopped by hand, with the epochs it trained and the epochs it was given |
 | `performance.json` | the manifest: partition, unlock count and verdict, model, hyperparameter status, the `training_budget` the run was given and which of it you set, conditions, runs, seeds, `colabsd` version, your notes |
 | `training_curve.png` | training loss (MSE) and validation Spearman against epoch, one line per run, with the epoch each run kept circled |
 | `training_curve.csv` | every point that figure plots — `split_seed`, `model_seed`, `epoch`, `train_loss_mse`, `val_spearman`, `is_best` — so it can be checked or redrawn |
@@ -167,6 +186,15 @@ it; and it needs the training checkpoint on disk, so export before you clear `co
 
 Every member carries a sha256 and reading the archive back verifies it. Report files land in
 `colabsd_work/report/`, the archive in `colabsd_work/` itself.
+
+**One caveat if you stopped the run.** `performance.json` and `README.txt` report the
+`training_budget` the run was *given* — `max_epochs 20` — and not what it spent, so in the same zip
+a headline saying 20 epochs can sit beside a `training_curve.csv` with two rows. What actually ran
+is in `report.json`'s `runs_stopped_early` (an empty list for a run nobody stopped, which is what
+makes a non-empty one worth reading), in the footer of `report.png`, and — outside the archive — in
+the `epochs_run`, `epochs_budget` and `stopped_early` columns of
+`colabsd_work/run/validation_runs.csv`. Read those before quoting the budget as the training
+length.
 
 ### Step 9 — score some variants
 
@@ -311,6 +339,57 @@ them.
 
 ---
 
+## A run that was stopped, or a session that died
+
+Free Colab runtimes are pre-empted, tabs get closed, and long runs get stopped on purpose. None of
+that costs you the training.
+
+**The weights are already on disk.** `best_checkpoint.pt` under
+`colabsd_work/run/runs/<split>_<seed>/` is rewritten every time the validation score improves, so
+whatever epoch was best when the run ended is there. It is also safe from the obvious next action:
+the next Train press into the same run directory renames it to `unfinished_checkpoint.pt` *before*
+the retry's first epoch writes anything — numbered if one is already there — and prints a line
+saying where it went. Nothing in this package deletes a checkpoint.
+
+**See what survived.** In a cell of your own, below the panel — importing by name, because
+`import colabsd` alone does not bring its submodules with it:
+
+```python
+from colabsd.train import recover_runs
+
+for run in recover_runs("colabsd_work/run"):
+    print(run.describe())
+# split1_seed11 · interrupted after 2 epoch(s) · best epoch 1 · validation Spearman 0.2857 · …
+```
+
+Each record carries `status` (`finished`, `interrupted`, or `unfinished` — a run that vanished
+without writing its bookkeeping), `epochs_run`, `best_epoch`, `best_validation_score` and the path.
+
+**Turn one into a model you can score with**, without a finished run behind it:
+
+```python
+from colabsd.bundle import save_bundle_from_checkpoint
+
+save_bundle_from_checkpoint(
+    "colabsd_work/rescued_bundle.zip",
+    checkpoint="colabsd_work/run/runs/split1_seed11/unfinished_checkpoint.pt",
+    spec=wizard.spec, best=wizard.best,      # the panel's own, after step 1 has run
+)
+```
+
+The bundle loads in the Predict notebook like any other, and its manifest records that it came from
+a run that was cut short.
+
+**Or just press Train again.** A run that was stopped is never handed back as a finished one:
+*Reuse finished runs* counts a run directory as finished only when it holds a `colabsd_run.json`
+whose `stopped_early` is not `interrupted`, so the retry actually retrains. Until it does, every
+artefact carrying the short run's numbers says so — the run row, `validation_runs.csv`,
+`report.json`, the footer of `report.png` and the bundle manifest's `training_status` block all
+read *trained 2 of 20 epochs, stopped early by hand* rather than publishing the 20-epoch budget as
+though it had been spent.
+
+---
+
 ## Troubleshooting
 
 Every failure raises an error whose message says what to do. The ones worth knowing in advance:
@@ -324,7 +403,7 @@ Every failure raises an error whose message says what to do. The ones worth know
 | **the panel freezes and nothing responds** | A `files.upload()` picker is open somewhere on the page; Colab's upload blocks the kernel. **Cancel upload** releases it. |
 | a backbone you used before is missing from the dropdown | Only ESM2 and SaProt are offered. The note under the dropdown names the seven that are not and why; their adapters are still in the package, and a bundle built from one still loads and scores in Predict. |
 | `does not fit a free T4 … Switch to an L4 or A100` | `SaProt-1.3B` is the only offered backbone that does not fit a free T4. Pick a smaller one, or an L4/A100 runtime with `dtype = float16`. |
-| CUDA out of memory part-way through training | The message says which box to lower: *Sequences on the GPU at once (memory)* in step 3, prefilled at 8. Halve it — gradient accumulation keeps the effective batch at 16, so this costs speed and not score. If it is already 1, the backbone does not fit this card: pick a smaller one, or an L4/A100 with `dtype = float16`. After an OOM the failed run's tensors usually still hold GPU memory, so **Runtime ▸ Restart** is the reliable retry. |
+| CUDA out of memory part-way through training | The message says which box to lower: *Sequences on the GPU at once (memory)* in step 3, prefilled at 8. Halve it — gradient accumulation keeps the effective batch where the entry set it (32 for the default `ESM2-35M`, 16 for the other ESM2 entries; the panel's own note prints the number), so this costs speed and not score. If it is already 1, the backbone does not fit this card: pick a smaller one, or an L4/A100 with `dtype = float16`. After an OOM the failed run's tensors usually still hold GPU memory, so **Runtime ▸ Restart** is the reliable retry. |
 | `<file> has N residues but the WT sequence has M`, or `wt_3di is N characters but the wild-type sequence is M residues` | The 3Di string does not cover the same chain as your wild type. Usually chain selection: put the right id in *Chain to read*. Otherwise a structure with missing or extra residues — an AlphaFold or ESMFold model of the exact wild-type sequence always matches. |
 | `<file> contains 2 chains: A (N residues), B (M residues). Pass chain="A"` | Foldseek produced one 3Di string per chain. Name your protein's chain in *Chain to read*. `has no chain 'X'` means the id you gave is not in the file. |
 | `<file> is a different protein from the WT: N of M residues disagree` | The chain you selected is not the protein your library mutates. Pick the right chain, or fold the wild-type sequence itself. A handful of disagreements is reported, not refused — read that line, it names the positions. |
@@ -346,7 +425,7 @@ Every failure raises an error whose message says what to do. The ones worth know
 | `Could not download foldseek from <url>` | The runtime cannot reach that host. Upload a ready-made 3Di text file instead, or install foldseek yourself and set `FOLDSEEK_BIN`. |
 | `foldseek found no 3Di descriptor in <file>` | The file has no protein backbone atoms, or is a minimal mmCIF foldseek cannot parse — converting it to `.pdb` fixes the second case. |
 | `ESMFold ran out of GPU memory on N residues` | Fetch the AlphaFold model (<https://alphafold.ebi.ac.uk>) or fold it once at <https://esmatlas.com/resources?action=fold>, and upload the `.pdb`. |
-| the runtime disconnects during training | Press Train again with *Reuse finished runs* ticked; a finished run is reused only when its fingerprint is identical. Tick **Save to Google Drive** and keep the tab open next time. |
+| the runtime disconnects during training | Press Train again with *Reuse finished runs* ticked: a finished run is reused only when its fingerprint is identical, and a run that was cut short is retrained rather than reused — its weights are moved to `unfinished_checkpoint.pt` first, and the panel says so. To read them instead of retraining, see [A run that was stopped](#a-run-that-was-stopped-or-a-session-that-died). Tick **Save to Google Drive** and keep the tab open next time. |
 
 ---
 
@@ -358,6 +437,9 @@ colabsd_work/                            (/content/colabsd_work/ in Colab)
 ├── wt_3di.txt                           written by step 3, if that step existed
 ├── run/                                 (named in step 5)
 │   ├── runs/split1_seed11/              per-run checkpoints and visible metrics
+│   │   ├── best_checkpoint.pt          the best epoch so far, rewritten as the run improves
+│   │   ├── unfinished_checkpoint.pt    a cut-short run's weights, moved here before a retrain
+│   │   └── colabsd_run.json            written last; its absence means the run never finished
 │   ├── locked_test/split1_seed11/       the test partition, until you unlock it
 │   ├── unlock.json                      the unlock counter and its history
 │   ├── run_result.json                  the run, as the report reads it

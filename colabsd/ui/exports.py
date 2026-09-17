@@ -106,10 +106,22 @@ def number(value: Any) -> str:
     return "not recorded" if not math.isfinite(as_float) else f"{as_float:.4f}"
 
 
-def unlock_verdict(unlock_count: int) -> str:
-    """What a test number means, given how many times the partition has now been read."""
+def unlock_verdict(unlock_count: int, partition: str = "test") -> str:
+    """What the counter means for the numbers in *this* archive.
+
+    The count is a fact about the run directory, but what it implies depends on which
+    partition the archive publishes. Said unconditionally, "this number means what a held-out
+    number is supposed to mean" appeared in validation archives — four lines under a headline
+    that was the validation Spearman, and directly contradicting the top-level verdict.
+    """
+    about_test = str(partition) == "test"
     if unlock_count <= 0:
         return "The test partition has not been read in this run directory."
+    if not about_test:
+        return (
+            f"The test partition of this run directory has been read {unlock_count}x, but the numbers in "
+            "this archive are validation numbers and are not affected by that."
+        )
     if unlock_count == 1:
         return (
             "Read once, after the choices were made. This number means what a held-out number is supposed "
@@ -171,6 +183,15 @@ class PerformanceFacts:
     split_seeds: tuple[int, ...] = ()
     model_seeds: tuple[int, ...] = ()
     selection_metric: str = ""
+    #: One entry per run that did not spend its epoch budget, as `colabsd.report` recorded it.
+    #: The archive is what a colleague opens, so it has to say that these are a shortened run's
+    #: numbers; report.json alone carrying it left README.txt and performance.json quoting the
+    #: budget as though it had been spent.
+    runs_stopped_early: tuple[dict[str, Any], ...] = ()
+    #: Columns in `report.csv` that are not the cut their name promises on this partition,
+    #: and how many rows it holds. `P@50` over twelve rows is 1.0000 for any ranking at all.
+    truncated_metrics: tuple[str, ...] = ()
+    partition_rows: int = 0
     run_created_utc: str = ""
     notes: str | None = None
     created_utc: str = ""
@@ -197,6 +218,30 @@ class PerformanceFacts:
     @property
     def test_untouched(self) -> bool:
         return self.unlock_count <= 0
+
+    def truncation_line(self) -> str:
+        """Which columns rank more rows than the partition holds, and why that reads as 1.0."""
+        names = ", ".join(self.truncated_metrics)
+        rows = self.partition_rows
+        counted = f"{rows} row" if rows == 1 else f"{rows} rows"
+        return (
+            f"{names} — this partition is {counted}, shorter than the cut those names promise, so every "
+            "variant falls inside it and the number is near 1 for any ranking at all"
+        )
+
+    def stopped_early_line(self) -> str:
+        """One line naming every run somebody cut short, and how far it got.
+
+        The archive's headline is the mean over the runs it names, so a reader who is not told
+        that one of them trained 2 of its 20 epochs reads an under-trained number as a result.
+        """
+        parts = []
+        for entry in self.runs_stopped_early:
+            where = f"split {entry.get('split_seed', '?')} · seed {entry.get('model_seed', '?')}"
+            ran, budget = entry.get("epochs_run"), entry.get("epochs_budget")
+            spent = f"{ran} of {budget} epochs" if ran is not None and budget is not None else "cut short"
+            parts.append(f"{where} ({spent})")
+        return ", ".join(parts) + " — these numbers include a run that was stopped by hand"
 
     def headline_line(self) -> str:
         """The metric on show, mean +/- sd, over however many runs."""
@@ -291,6 +336,11 @@ def performance_facts(
     from colabsd.bundle import utc_now
 
     partition = str(report_summary.get("shown_partition") or "validation")
+    cut_short = tuple(
+        dict(entry) for entry in (report_summary.get("runs_stopped_early") or ()) if isinstance(entry, Mapping)
+    )
+    truncated = _strings(report_summary.get("truncated_metrics") or ())
+    shown_rows = int((report_summary.get("partition_rows") or {}).get(partition, 0) or 0)
     counted = int(report_summary.get("unlock_count") or 0)
     remembered = int(_attr(run_result, "unlock_count") or 0)
     model_name = str(_attr(run_result, "model_name", "model") or _headline_source(report_summary, "this model"))
@@ -302,6 +352,9 @@ def performance_facts(
         provisional = _attr(best, "is_provisional")
     return PerformanceFacts(
         partition=partition,
+        runs_stopped_early=cut_short,
+        truncated_metrics=truncated,
+        partition_rows=shown_rows,
         reported_partitions=_strings(report_summary.get("reported_partitions") or (partition,)),
         unlock_count=max(counted, remembered),
         unlock_source=str(report_summary.get("unlock_source") or "not recorded"),
@@ -358,11 +411,16 @@ def manifest_payload(facts: PerformanceFacts, files: Mapping[str, Mapping[str, A
         "reported_partitions": list(facts.reported_partitions),
         "describes_test_partition": facts.describes_test,
         "verdict": partition_verdict(facts.partition, facts.unlock_count),
+        # Which runs did not spend their budget. Empty means every run ran to its own end --
+        # either the epoch ceiling or early stopping -- and nobody cut it short.
+        "runs_stopped_early": [dict(entry) for entry in facts.runs_stopped_early],
+        "partition_rows": facts.partition_rows,
+        "truncated_metrics": list(facts.truncated_metrics),
         # 2. How many times was the test set read?
         "unlock": {
             "count": facts.unlock_count,
             "source": facts.unlock_source,
-            "verdict": unlock_verdict(facts.unlock_count),
+            "verdict": unlock_verdict(facts.unlock_count, facts.partition),
         },
         "headline": {
             "metric": facts.metric,
@@ -416,6 +474,11 @@ def facts_from_manifest(manifest: Mapping[str, Any]) -> PerformanceFacts:
     provenance = _mapping(manifest.get("provenance"))
     return PerformanceFacts(
         partition=str(manifest.get("partition") or "validation"),
+        runs_stopped_early=tuple(
+            dict(entry) for entry in (manifest.get("runs_stopped_early") or ()) if isinstance(entry, Mapping)
+        ),
+        truncated_metrics=_strings(manifest.get("truncated_metrics") or ()),
+        partition_rows=int(manifest.get("partition_rows") or 0),
         reported_partitions=_strings(manifest.get("reported_partitions")),
         unlock_count=int(unlock.get("count") or 0),
         unlock_source=str(unlock.get("source") or "not recorded"),
@@ -520,6 +583,8 @@ def readme_text(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]])
         f"  headline           {facts.headline_line()}",
         f"  conditions         {', '.join(facts.conditions) or 'not recorded'}",
         f"  repeated runs      {facts.n_runs}  ({seeds})",
+        *( [f"  stopped early      {facts.stopped_early_line()}"] if facts.runs_stopped_early else [] ),
+        *( [f"  not a real cut     {facts.truncation_line()}"] if facts.truncated_metrics else [] ),
         f"  library size       {str(facts.n_sequences) + ' sequences' if facts.n_sequences else 'not recorded'}",
         "",
         _wrap(partition_verdict(facts.partition, facts.unlock_count)),

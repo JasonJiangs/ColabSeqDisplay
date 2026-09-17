@@ -57,6 +57,17 @@ def one_to_three_letter() -> dict[str, str]:
     return {one: three for three, one in THREE_TO_ONE.items()}
 
 
+class MinCountIgnoredWarning(UserWarning):
+    """`min_count` was asked for but there was no column to filter on, so nothing was dropped.
+
+    A `UserWarning` subclass rather than a bare one so a caller that wants to put this on a
+    screen can ask for exactly this -- `warnings.catch_warnings(record=True)` plus
+    `warnings.simplefilter("always", MinCountIgnoredWarning)` -- instead of sifting every
+    warning numpy, torch and pandas raise during a load. It stays a `UserWarning`, so code
+    that already catches that keeps working.
+    """
+
+
 class LibraryError(DataError, ValueError):
     """The variant table does not match its `LibrarySpec`.
 
@@ -157,7 +168,7 @@ def _apply_min_count(frame: pd.DataFrame, spec: LibrarySpec, min_count: int, pat
             f"min_count={min_count!r} was ignored: {path} has no '{column}' column, so all {len(frame)} variants "
             f"were kept. Its columns are {list(frame.columns)}; set LibrarySpec(count_column=...) to the read-count "
             "column, or pass min_count=0 to say you meant to keep every variant.",
-            UserWarning,
+            MinCountIgnoredWarning,
             stacklevel=3,
         )
         return frame
