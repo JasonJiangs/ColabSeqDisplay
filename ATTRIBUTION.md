@@ -121,6 +121,22 @@ covered by a test.
    checkout. All 28 shipped entries set the pooling explicitly and none declares a protein,
    so no file on disk parses differently; what changes is that a config which omits the
    block is told so instead of being resolved against somebody else's protein.
+9. **The checkpoint is written as the run goes, not only at the end.** Upstream builds the
+   checkpoint dict once, after the loop, and `torch.save`s it. Here `build_checkpoint` is a
+   function called twice: every time the validation score improves, and once more when the
+   run finishes with `complete: True`. It goes through `write_checkpoint_atomically`, which
+   writes to a sibling temp file and `os.replace`s it over the destination. Upstream runs on
+   a cluster; a free Colab session is pre-empted without notice, and until this the whole
+   run lived in memory — an hour of training ended as nothing. The value written is always
+   the *best epoch so far*, never the latest, so a run that stops early yields the same
+   weights it would have exported had it stopped there on purpose.
+10. **A `KeyboardInterrupt` in the epoch loop ends it rather than propagating.** It is
+   handled exactly like early stopping: the loop ends, the best epoch is restored,
+   re-evaluated and written, and `metrics.json` records `stopped_early: "interrupted"`
+   alongside `epochs_run`. This is the only way to stop a run from the notebook — the panel
+   trains synchronously inside a widget callback, so no second widget's handler can fire
+   while it is in there, and Colab's own interrupt is what reaches it. An interrupt before
+   the first epoch finishes raises, because there is nothing to keep.
 
 Three upstream quirks were **kept on purpose**, because changing them would move a
 guard or a number: `create_split` still caches on the output directory alone (`colabsd.data`

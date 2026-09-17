@@ -90,6 +90,13 @@ behind it and shows a red banner instead: `ESM2-8M · PROVISIONAL — hyperparam
 placeholder, performance unknown` (see
 [Reading the PROVISIONAL warning](#reading-the-provisional-warning)). None of those is editable.
 
+**Stopping early, and what survives.** `best_checkpoint.pt` is rewritten in the run folder every
+time the validation score improves, so a session that is pre-empted or disconnected leaves the best
+epoch it reached rather than nothing. To stop a run deliberately, press Colab's own ▪ — the panel
+keeps that best epoch, scores it, writes the bundle and the archive as usual, and the report records
+`stopped_early: interrupted`. The panel has no stop button of its own: training holds the kernel
+while it runs, so no widget here could answer a click until it finished.
+
 **Three boxes under that table are yours**, prefilled from the same entry: *Epochs, at most* (20),
 *Give up after this many epochs with no gain* (3), and *Sequences on the GPU at once (memory)* (8).
 The third is the one to lower if training dies with CUDA out of memory — it is how much has to fit
@@ -154,6 +161,8 @@ it; and it needs the training checkpoint on disk, so export before you clear `co
 | `report.png` | the chosen metric per condition, every tracked metric averaged over them, error bars ±1 sd across runs, a title naming the partition and a badge giving the unlock count |
 | `report.json` | `unlock_count`, `unlock_source`, `shown_partition`, `reported_partitions`, `n_runs`, `sources` |
 | `performance.json` | the manifest: partition, unlock count and verdict, model, hyperparameter status, the `training_budget` the run was given and which of it you set, conditions, runs, seeds, `colabsd` version, your notes |
+| `training_curve.png` | training loss (MSE) and validation Spearman against epoch, one line per run, with the epoch each run kept circled |
+| `training_curve.csv` | every point that figure plots — `split_seed`, `model_seed`, `epoch`, `train_loss_mse`, `val_spearman`, `is_best` — so it can be checked or redrawn |
 | `README.txt` | the same answers in prose, for whoever opens the zip and will not read JSON |
 
 Every member carries a sha256 and reading the archive back verifies it. Report files land in

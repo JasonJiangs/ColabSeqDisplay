@@ -77,7 +77,9 @@ provenance. No backbone weights
 (re-fetched by name). The only file Predict needs.
 
 **`performance_report.zip` — the numbers, and what they are.** `report.csv`, `report.png` and
-`report.json` as `colabsd.report.build_report` writes them, plus `performance.json` for a machine
+`report.json` as `colabsd.report.build_report` writes them, `training_curve.png` and
+`training_curve.csv` — the training loss (MSE) and validation Spearman against epoch, drawn and as
+data, from each run's own per-epoch log — plus `performance.json` for a machine
 and `README.txt` for a person, generated from one object so they cannot disagree. Both name the
 partition (`partition`, `describes_test_partition`, a badge in `report.png`), the unlock count with
 a sentence saying what it is worth (`unlock.count`, `unlock.source`, `unlock.verdict`), the

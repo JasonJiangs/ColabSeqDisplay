@@ -55,8 +55,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -294,6 +295,81 @@ def predict(
     return torch.cat(preds, dim=0).numpy().astype(np.float32)
 
 
+#: The file a run's weights live in, written every time the validation score improves and
+#: once more when the run finishes. Named here because `colabsd.train` and `colabsd.bundle`
+#: both reach for it, and a second spelling drifting from this one is a bundle that cannot
+#: find the weights it is made of.
+CHECKPOINT_NAME = "best_checkpoint.pt"
+
+
+def build_checkpoint(
+    *,
+    adapter: SequenceAdapter,
+    split_seed: int,
+    seed: int,
+    params: Mapping[str, Any],
+    matched: Any,
+    objective_name: str,
+    objective_metric: str,
+    best_epoch: int,
+    best_score: float,
+    best_metric_summary: Mapping[str, float],
+    best_lora_state: Mapping[str, torch.Tensor],
+    best_head_state: Mapping[str, torch.Tensor],
+    scaler: LabelScaler,
+    pooling: str,
+    mutation_positions_1based: Any,
+    source_trial: Any = None,
+    complete: bool = False,
+) -> dict[str, Any]:
+    """Everything needed to rebuild the trained model, for the epoch holding the record.
+
+    Built in one place because it is written twice: once per improving epoch, so that a
+    session that dies leaves something behind, and once at the end with `complete=True`.
+    A reader that finds `complete: False` has the weights of a run that was cut short --
+    they are real and loadable, and its `metrics.json` and `predictions.npz` are missing.
+    """
+    payload: dict[str, Any] = {
+        "model_name": adapter.model_name,
+        "split_seed": split_seed,
+        "seed": seed,
+        "params": dict(params),
+        "matched_lora_modules": matched,
+        "lora_target_modules": LORA_TARGET_MODULES,
+        "selection_objective": objective_name,
+        "selection_metric": objective_metric,
+        "best_epoch": best_epoch,
+        "best_validation_score": best_score,
+        "best_validation_metrics": dict(best_metric_summary),
+        "best_validation_r2": best_metric_summary.get("R2"),
+        "best_validation_spearman": best_metric_summary.get("Spearman"),
+        "lora_state_dict": dict(best_lora_state),
+        "head_state_dict": dict(best_head_state),
+        "label_scaler": {"mean": scaler.mean.tolist(), "std": scaler.std.tolist()},
+        "pooling": pooling,
+        "mutation_positions_1based": mutation_positions_1based,
+        "complete": complete,
+    }
+    if source_trial is not None:
+        payload["source_trial"] = asdict(source_trial)
+    return payload
+
+
+def write_checkpoint_atomically(payload: dict[str, Any], path: Path) -> None:
+    """`torch.save` to a sibling temp file, then rename over *path*.
+
+    The point of writing a checkpoint every time the score improves is to survive a session
+    that ends without warning. A plain `torch.save` straight onto the destination turns a
+    crash *during* the write into a truncated file where the last good one used to be --
+    which would make this feature the cause of the loss it exists to prevent. `os.replace`
+    is atomic on POSIX, so the file at `path` is always one complete checkpoint or the
+    previous one.
+    """
+    temporary = path.with_name(path.name + ".partial")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
 def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Return only the LoRA A/B matrices, detached on the CPU."""
     return {
@@ -416,60 +492,104 @@ def train_eval_config(
     best_metric_summary: dict[str, float] | None = None
     patience = 0
     log_rows: list[dict[str, Any]] = []
+    stopped_early: str | None = None
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(max_epochs):
-        train_loss = train_epoch(
+    def snapshot() -> dict[str, Any]:
+        """The checkpoint as it stands, for the epoch that currently holds the record."""
+        return build_checkpoint(
             adapter=adapter,
-            model=model,
-            head=head,
-            optimizer=optimizer,
-            sequences=sequences,
-            scaled_targets=y_scaled,
-            train_indices=train_idx,
-            micro_batch_size=micro_batch_size,
-            accumulation_steps=grad_accum,
-            seed=seed + epoch,
-            device=device,
-            max_grad_norm=float(fixed.get("max_grad_norm", 1.0)),
-            on_batch=epoch_batch_callback(on_batch, epoch, max_epochs),
-        )
-
-        _, val_metrics = evaluate_split(
-            adapter=adapter,
-            model=model,
-            head=head,
-            sequences=sequences,
-            targets=targets,
-            indices=val_idx,
+            split_seed=split_seed,
+            seed=seed,
+            params=params,
+            matched=matched,
+            objective_name=objective_name,
+            objective_metric=objective_metric,
+            best_epoch=best_epoch,
+            best_score=best_score,
+            best_metric_summary=best_metric_summary or {},
+            best_lora_state=best_lora_state or {},
+            best_head_state=best_head_state or {},
             scaler=scaler,
-            batch_size=micro_batch_size,
-            device=device,
+            pooling=str(fixed["pooling"]),
+            mutation_positions_1based=mutation_positions_1based,
+            source_trial=source_trial,
         )
-        metric_summary = summarize_metrics(val_metrics)
-        score = metric_summary[objective_metric]
-        row = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "objective": score,
-            **validation_log_row(metric_summary),
-        }
-        log_rows.append(row)
-        if on_epoch is not None:
-            # An epoch closes on the only number that decides anything -- the validation score
-            # this epoch is kept or discarded on -- so it is reported even though `on_batch` has
-            # been reporting the loss all the way through the epoch that produced it.
-            on_epoch(epoch, max_epochs, float(score), float(train_loss))
-        if score > best_score:
-            best_score = score
-            best_epoch = epoch
-            best_lora_state = lora_state_dict(model)
-            best_head_state = clone_head_state(head)
-            best_metric_summary = dict(metric_summary)
-            patience = 0
-        else:
-            patience += 1
-        if patience >= patience_limit:
-            break
+
+    try:
+        for epoch in range(max_epochs):
+            train_loss = train_epoch(
+                adapter=adapter,
+                model=model,
+                head=head,
+                optimizer=optimizer,
+                sequences=sequences,
+                scaled_targets=y_scaled,
+                train_indices=train_idx,
+                micro_batch_size=micro_batch_size,
+                accumulation_steps=grad_accum,
+                seed=seed + epoch,
+                device=device,
+                max_grad_norm=float(fixed.get("max_grad_norm", 1.0)),
+                on_batch=epoch_batch_callback(on_batch, epoch, max_epochs),
+            )
+
+            _, val_metrics = evaluate_split(
+                adapter=adapter,
+                model=model,
+                head=head,
+                sequences=sequences,
+                targets=targets,
+                indices=val_idx,
+                scaler=scaler,
+                batch_size=micro_batch_size,
+                device=device,
+            )
+            metric_summary = summarize_metrics(val_metrics)
+            score = metric_summary[objective_metric]
+            row = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "objective": score,
+                **validation_log_row(metric_summary),
+            }
+            log_rows.append(row)
+            if on_epoch is not None:
+                # An epoch closes on the only number that decides anything -- the validation score
+                # this epoch is kept or discarded on -- so it is reported even though `on_batch` has
+                # been reporting the loss all the way through the epoch that produced it.
+                on_epoch(epoch, max_epochs, float(score), float(train_loss))
+            if score > best_score:
+                best_score = score
+                best_epoch = epoch
+                best_lora_state = lora_state_dict(model)
+                best_head_state = clone_head_state(head)
+                best_metric_summary = dict(metric_summary)
+                patience = 0
+                # On disk the moment it becomes the best, not at the end of the run. A free
+                # Colab session is pre-empted without notice, and until this line the whole
+                # run lived in memory: an hour of training ended as nothing. Written only on
+                # an improvement, so what survives is the epoch that would have been exported
+                # anyway -- never the latest, which may be worse than one already passed.
+                write_checkpoint_atomically(snapshot(), output_dir / CHECKPOINT_NAME)
+            else:
+                patience += 1
+            if patience >= patience_limit:
+                stopped_early = "patience"
+                break
+
+    except KeyboardInterrupt:
+        # Colab's own stop button, and the only one that can reach a training loop: the
+        # panel runs this synchronously inside a widget callback, so no second widget's
+        # handler can fire while it is here. Interrupting is treated exactly like early
+        # stopping -- the epoch loop ends, the best epoch so far is what gets restored,
+        # re-evaluated and written -- and the run says which of the two ended it.
+        stopped_early = "interrupted"
+        if best_lora_state is None:
+            raise RuntimeError(
+                "Interrupted before the first epoch finished, so there is no checkpoint to keep. "
+                "Lower `max_epochs` or let one epoch complete."
+            ) from None
 
     if best_lora_state is None or best_head_state is None or best_metric_summary is None:
         raise RuntimeError("Training finished without a best checkpoint.")
@@ -500,32 +620,26 @@ def train_eval_config(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "model_name": adapter.model_name,
-        "split_seed": split_seed,
-        "seed": seed,
-        "params": params,
-        "matched_lora_modules": matched,
-        "lora_target_modules": LORA_TARGET_MODULES,
-        "selection_objective": objective_name,
-        "selection_metric": objective_metric,
-        "best_epoch": best_epoch,
-        "best_validation_score": best_score,
-        "best_validation_metrics": best_metric_summary,
-        "best_validation_r2": best_metric_summary["R2"],
-        "best_validation_spearman": best_metric_summary["Spearman"],
-        "lora_state_dict": best_lora_state,
-        "head_state_dict": best_head_state,
-        "label_scaler": {
-            "mean": scaler.mean.tolist(),
-            "std": scaler.std.tolist(),
-        },
-        "pooling": fixed["pooling"],
-        "mutation_positions_1based": mutation_positions_1based,
-    }
-    if source_trial is not None:
-        checkpoint["source_trial"] = asdict(source_trial)
-    torch.save(checkpoint, output_dir / "best_checkpoint.pt")
+    checkpoint = build_checkpoint(
+        adapter=adapter,
+        split_seed=split_seed,
+        seed=seed,
+        params=params,
+        matched=matched,
+        objective_name=objective_name,
+        objective_metric=objective_metric,
+        best_epoch=best_epoch,
+        best_score=best_score,
+        best_metric_summary=best_metric_summary,
+        best_lora_state=best_lora_state,
+        best_head_state=best_head_state,
+        scaler=scaler,
+        pooling=str(fixed["pooling"]),
+        mutation_positions_1based=mutation_positions_1based,
+        source_trial=source_trial,
+        complete=True,
+    )
+    write_checkpoint_atomically(checkpoint, output_dir / CHECKPOINT_NAME)
     np.savez_compressed(
         output_dir / "predictions.npz",
         validation_indices=np.asarray(val_idx, dtype=np.int64),
@@ -554,6 +668,11 @@ def train_eval_config(
         "best_validation_score": best_score,
         "best_validation_r2": best_metric_summary["R2"],
         "best_validation_spearman": best_metric_summary["Spearman"],
+        # Why the epoch loop ended: `patience` for early stopping, `interrupted` for a
+        # KeyboardInterrupt, absent when it simply ran out of epochs. A reader comparing two
+        # runs needs to know which of them was cut short by a person.
+        "stopped_early": stopped_early,
+        "epochs_run": len(log_rows),
         "validation": {
             "mean_R2": validation_summary["R2"],
             "mean_Pearson": validation_summary["Pearson"],

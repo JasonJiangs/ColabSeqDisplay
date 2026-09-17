@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from colabsd import __version__
+from colabsd import __version__, curves
 from colabsd.bundle import (
     BUDGET_KEY,
     budget_changes_line,
@@ -81,6 +81,8 @@ MEMBER_PURPOSE: dict[str, str] = {
     "report.csv": "every tracked metric for every condition, mean +/- sd across the repeated runs",
     "report.png": "the figure: the spread across the repeated runs, and the unlock count",
     "report.json": "what build_report recorded about the figure it drew",
+    curves.CURVE_CSV_NAME: "training loss (MSE) and validation Spearman, one row per epoch per run",
+    curves.CURVE_PNG_NAME: "the same two curves drawn, with the epoch each run kept circled",
 }
 
 
@@ -910,6 +912,15 @@ class PerformanceExport:
         return notices(self.facts)
 
 
+def _curve_label(run_result: Any) -> str:
+    """The backbone the curves belong to, when the run knows it."""
+    for attribute in ("adapter_name", "model_name"):
+        value = getattr(run_result, attribute, None)
+        if value:
+            return str(value)
+    return ""
+
+
 def export_performance(
     *,
     work_dir: str | Path,
@@ -951,6 +962,16 @@ def export_performance(
     written = runners.build_report(run_result, spec, **options)
 
     paths = report_members(written)
+    # The curves are drawn from each run's own `training_log.json`, which `build_report` does
+    # not read: the report is about the finished model, these are about how it got there. A
+    # run with no logs to read -- one rebuilt by hand, or recovered from an interrupted
+    # session -- simply contributes no curve, and the archive is written without them.
+    drawn = curves.write_training_curves(run_result, out_dir, model_label=_curve_label(run_result))
+    # Through `extra_files`, not by adding to `paths`: `write_performance_archive` runs
+    # `report_paths` back through `report_members`, which keeps only the three the report
+    # itself writes, so anything added here by filename would be silently dropped.
+    extra = {path.name: path for path in (drawn.csv, drawn.png) if path is not None}
+
     summary_path = paths.get("report.json")
     try:
         summary = json.loads(summary_path.read_text()) if summary_path and summary_path.is_file() else {}
@@ -963,7 +984,9 @@ def export_performance(
     facts = performance_facts(
         summary, run_result=run_result, best=best, spec=spec, notes=notes, budget=settings
     )
-    archive = write_performance_archive(work / archive_name, facts=facts, report_paths=paths)
+    archive = write_performance_archive(
+        work / archive_name, facts=facts, report_paths=paths, extra_files=extra
+    )
     if download:
         runners.download(archive)
     return PerformanceExport(path=archive, facts=facts, report_paths=paths, downloaded=download)
