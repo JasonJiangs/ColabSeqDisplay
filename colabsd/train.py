@@ -8,7 +8,7 @@ metric dictionaries into a table the report can render.
 Locked-test discipline
 ----------------------
 `train_eval_config` always evaluates the test partition at the end of a run and
-writes it next to the validation numbers. `finetune` moves every test artefact
+writes it next to the validation numbers. `finetune` moves every test artifact
 into `output_dir/locked_test/` the moment a run finishes, so nothing a notebook
 touches -- neither `RunResult` nor `runs/<run>/metrics.json` nor
 `runs/<run>/predictions.npz` -- carries test information. Reading it back is
@@ -21,7 +21,7 @@ runtime -- so `runs/<split>_<seed>/` has to say which of the two it holds. One r
 obeyed by both the writer and the reader:
 
 * A run is **finished** only when it holds a `colabsd_run.json` whose `stopped_early`
-  is not `"interrupted"`. That file is written last, after the test artefacts are
+  is not `"interrupted"`. That file is written last, after the test artifacts are
   locked, so a run that died before it never counts as finished.
 * A **cut short** run -- a stop press (`stopped_early: "interrupted"`), or a session
   that vanished mid-epoch and left nothing but `best_checkpoint.pt` -- is never reused
@@ -135,6 +135,9 @@ class TrainingEvent:
     loss: float
     metric: str
     score: float | None = None
+    #: The epoch's MSE on the validation split, in the same scaled space as `loss`. Epoch
+    #: events only; NaN when the engine is older than this field.
+    val_loss: float | None = None
     step: int | None = None
     n_batches: int | None = None
     elapsed_s: float = 0.0
@@ -477,7 +480,7 @@ def finetune(
         return result
     except KeyboardInterrupt:
         # The stop button, landing between one run's last epoch and the next run's first --
-        # in the artefact locking, the bookkeeping or the aggregation, all of which are
+        # in the artifact locking, the bookkeeping or the aggregation, all of which are
         # outside `train_eval_config`'s own reach. Re-raised as an exception the notebook's
         # guard can catch, because a `KeyboardInterrupt` here goes straight past `except
         # Exception` and kills the run with an empty log and a frozen progress line.
@@ -788,7 +791,7 @@ def _strip_test_from_metrics_json(run_dir: Path) -> None:
 
 
 def _lock_interrupted_artifacts(run_dir: Path, locked_run_dir: Path, condition_columns: list[str]) -> None:
-    """Quarantine test artefacts left behind by a run that died before they were locked."""
+    """Quarantine test artifacts left behind by a run that died before they were locked."""
     path = run_dir / "metrics.json"
     if not path.is_file():
         return
@@ -1069,7 +1072,7 @@ def _clean_split(split: dict[str, list[int]], n: int, split_seed: int) -> dict[s
         if shared:
             raise DataError(
                 f"Split seed {split_seed} puts {len(shared)} rows (for example {shared[:5]}) in both {left} and "
-                f"{right}. That leaks the held-out data into training and makes every number optimistic: "
+                f"{right}. That leaks the held-out data into training and makes every number optimiztic: "
                 "rebuild the splits with colabsd.data.make_splits()."
             )
     return cleaned
@@ -1354,7 +1357,7 @@ def _pooled_positions(adapter: Any, spec: LibrarySpec, config: dict[str, Any]) -
     if recorded != expected:
         raise ConfigError(
             f"The protein record lists {len(recorded)} mutated residues (0-based {recorded[:5]}) but this "
-            f"library varies {len(expected)} (0-based {expected[:5]}). Every artefact would record "
+            f"library varies {len(expected)} (0-based {expected[:5]}). Every artifact would record "
             "coordinates the model never averaged: rewrite the record with "
             "colabsd.protein_db.write_protein_record(spec, out_dir) for this spec."
         )
@@ -1463,9 +1466,11 @@ def _run_reporters(
             )
         )
 
-    def report_epoch(epoch: int, max_epochs: int, score: float, loss: float) -> None:
+    def report_epoch(
+        epoch: int, max_epochs: int, score: float, loss: float, val_loss: float = float("nan")
+    ) -> None:
         at = emit(f"epoch {epoch + 1}/{max_epochs} · val {score:.4f} · loss {loss:.3f}")
-        announce("epoch", epoch, max_epochs, loss, at, score=float(score))
+        announce("epoch", epoch, max_epochs, loss, at, score=float(score), val_loss=float(val_loss))
 
     def report_batch(epoch: int, max_epochs: int, step: int, n_batches: int, loss: float) -> None:
         if step < n_batches and time.time() - sent_at < PROGRESS_MIN_INTERVAL_S:

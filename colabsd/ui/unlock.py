@@ -381,7 +381,7 @@ def report_html(
     block and never two. The budget the run was given goes in the same block for the same
     reason: it is what somebody would need in order to get this number again.
     """
-    # One unlock is the number this design is for; any other count is coloured like a warning.
+    # One unlock is the number this design is for; any other count is colored like a warning.
     count_color = theme.SEVERITY_COLOR["stop"] if unlock_count != 1 else "inherit"
     body = "".join(
         "<tr>"

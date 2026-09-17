@@ -9,7 +9,7 @@ sequence (`colabsd.ui.core.needs_structure`).
 Nothing ships a 3Di string, so every route starts from something the user provides — a
 structure file, a 3Di file, a pasted string — or from ESMFold, offered last and at a stated
 risk. The exception is a string this session already made: it stays in the session and is
-offered back rather than recomputed (`session_artefact`).
+offered back rather than recomputed (`session_artifact`).
 
 Every decision is a pure function of a `colabsd.ui.core.WizardState`; `ThreeDiSection` is the
 thin ipywidgets layer above them and owns no rule.
@@ -36,7 +36,7 @@ THREE_DI_FILENAME = "wt_3di.txt"
 
 
 @dataclass(frozen=True)
-class Artefact:
+class Artifact:
     """The wild-type 3Di string this session made, and the protein it describes.
 
     `describes` is what decides whether it may be reused at all: one protein's structure
@@ -55,25 +55,25 @@ class Artefact:
         return f"Reuse the one made earlier in this session ({self.describes}{tail}) — nothing to compute"
 
 
-def session_artefact(state: core.WizardState, artefact: Artefact | None) -> Artefact | None:
+def session_artifact(state: core.WizardState, artifact: Artifact | None) -> Artifact | None:
     """The session's 3Di string, when it still describes the wild type on screen.
 
-    Length is what decides it, for the reason `Artefact` gives.
+    Length is what decides it, for the reason `Artifact` gives.
     """
-    if artefact is None:
+    if artifact is None:
         return None
-    if artefact.length and state.wt_length and artefact.length != int(state.wt_length):
+    if artifact.length and state.wt_length and artifact.length != int(state.wt_length):
         return None
-    return artefact
+    return artifact
 
 
-def written_artefact(path: Path, three_di: str) -> Artefact:
+def written_artifact(path: Path, three_di: str) -> Artifact:
     """Register the 3Di string this step just wrote, so re-reading the library is free.
 
     `on_check_library` drops the attached 3Di, because a re-read library may be a different
     protein. When it is the same one, this makes the answer a click rather than an ESMFold run.
     """
-    return Artefact(
+    return Artifact(
         path=Path(path),
         describes=f"your {len(three_di):,d}-residue wild type",
         length=len(three_di),
@@ -87,15 +87,15 @@ def written_artefact(path: Path, three_di: str) -> Artefact:
 # ----------------------------------------------------------------------------------------
 
 
-def three_di_choices(state: core.WizardState, artefact: Artefact | None = None) -> list[tuple[str, str]]:
+def three_di_choices(state: core.WizardState, artifact: Artifact | None = None) -> list[tuple[str, str]]:
     """Where the wild-type 3Di string can come from, for this library.
 
     The reuse line is offered only when there is something to reuse; ESMFold comes last and
     says what it costs.
     """
     choices: list[tuple[str, str]] = [("Not chosen yet", "none")]
-    if artefact is not None:
-        choices.append((artefact.label, "session"))
+    if artifact is not None:
+        choices.append((artifact.label, "session"))
     choices += [
         ("Upload a structure of my wild type (.pdb / .cif) and read the shape off it", "upload_structure"),
         ("Upload a 3Di text file I already have", "upload_3di"),
@@ -114,7 +114,7 @@ def three_di_choices(state: core.WizardState, artefact: Artefact | None = None) 
 def notices(
     state: core.WizardState,
     *,
-    artefact: Artefact | None = None,
+    artifact: Artifact | None = None,
     has_gpu: bool | None = None,
 ) -> list[Message]:
     """Every message this step earns, in reading order.
@@ -125,7 +125,7 @@ def notices(
     if not core.needs_structure(state):
         return []
     out: list[Message] = []
-    if state.three_di_source == "session" and artefact is None:
+    if state.three_di_source == "session" and artifact is None:
         out.append(
             Message(
                 "three_di_reuse_gone",
@@ -135,12 +135,12 @@ def notices(
             )
         )
     computing = state.three_di_source in ("upload_structure", "esmfold")
-    if artefact is not None and computing and not state.wt_3di_length:
+    if artifact is not None and computing and not state.wt_3di_length:
         out.append(
             Message(
                 "three_di_reuse_available",
                 "info",
-                f"A 3Di string for {artefact.describes} is already here ({artefact.path.name}): pick the "
+                f"A 3Di string for {artifact.describes} is already here ({artifact.path.name}): pick the "
                 "reuse line above and this step is done. Compute one only if you want a different structure "
                 "of the same wild type.",
             )
@@ -204,13 +204,13 @@ def output_files(state: core.WizardState, *, work_dir: str | Path = core.DEFAULT
     ]
 
 
-def three_di_blockers(state: core.WizardState, artefact: Artefact | None = None) -> list[str]:
+def three_di_blockers(state: core.WizardState, artifact: Artifact | None = None) -> list[str]:
     """What stops the get-the-3Di button, each said as the thing to go and fix."""
     source = state.three_di_source
     problems: list[str] = []
     if source in {"none", ""}:
         problems.append("Choose where the 3Di string should come from first.")
-    if source == "session" and artefact is None:
+    if source == "session" and artifact is None:
         problems.append(
             "There is no 3Di string here to reuse for this protein. Upload a structure of your own wild type, "
             "or a 3Di file you already have."
@@ -354,13 +354,13 @@ class ThreeDiSection:
             self.fields["esmfold_risk_accepted"],
         ]
 
-    def sync(self, state: core.WizardState, artefact: Artefact | None) -> str | None:
+    def sync(self, state: core.WizardState, artifact: Artifact | None) -> str | None:
         """Rebuild the source list for what is actually available; return a forced value.
 
         Re-reading a different library has to take the reuse choice away rather than leave a
         dead option selected.
         """
-        choices = three_di_choices(state, artefact)
+        choices = three_di_choices(state, artifact)
         values = [value for _, value in choices]
         widget = self.fields["three_di_source"]
         if tuple(widget.options) == tuple(choices):
@@ -376,19 +376,19 @@ class ThreeDiSection:
         backend: Any,
         *,
         wt_sequence: str,
-        artefact: Artefact | None,
+        artifact: Artifact | None,
         work_dir: Path,
         has_gpu: bool,
     ) -> str:
         """Produce the 3Di string this run will be trained with. Raises with what to fix."""
-        problems = three_di_blockers(state, artefact)
+        problems = three_di_blockers(state, artifact)
         if problems:
             raise ValueError(" ".join(problems))
         length = len(wt_sequence)
         source = state.three_di_source
         if source == "session":
-            assert artefact is not None  # three_di_blockers refused this above
-            return backend.load_three_di(artefact.path, expected_length=length)
+            assert artifact is not None  # three_di_blockers refused this above
+            return backend.load_three_di(artifact.path, expected_length=length)
         if source == "paste":
             return backend.validate_three_di(str(state.get("three_di_text") or ""), length)
         if source == "upload_3di":

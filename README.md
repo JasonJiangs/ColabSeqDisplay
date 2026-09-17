@@ -7,7 +7,7 @@ it scored per condition and how far the repeated runs spread, a test partition t
 until you deliberately open it, and two `.zip` files: the model, and the performance analysis that
 says which partition its numbers came from.
 
-**Version 0.1.0 · MIT licence · [tutorial](TUTORIAL.md) · [status](#status)**
+**Version 0.1.0 · MIT license · [tutorial](TUTORIAL.md) · [status](#status)**
 
 | | Open it | What it does |
 |---|---|---|
@@ -79,7 +79,7 @@ provenance. No backbone weights
 **`performance_report.zip` — the numbers, and what they are.** `report.csv`, `report.png` and
 `report.json` as `colabsd.report.build_report` writes them, `training_curve.png` and
 `training_curve.csv` — the training loss (MSE) and validation Spearman against epoch, drawn and as
-data, from each run's own per-epoch log, and the same two curves the panel draws under the
+data, from each run's own per-epoch log, and the same three curves the panel draws under the
 progress line while the run is going — plus `performance.json` for a machine
 and `README.txt` for a person, generated from one object so they cannot disagree. Both name the
 partition (`partition`, `describes_test_partition`, a badge in `report.png`), the unlock count with
@@ -146,7 +146,7 @@ save_bundle_from_checkpoint(
 **A run that was stopped is never reused as a finished one.** *Reuse finished runs* treats a run
 directory as finished only when it holds a `colabsd_run.json` whose `stopped_early` is not
 `interrupted`, so pressing Train again retrains it instead of re-reporting its numbers; and until
-then every artefact carrying those numbers says what happened — see *`training_budget` is what a
+then every artifact carrying those numbers says what happened — see *`training_budget` is what a
 run was given* above.
 
 ---
@@ -224,7 +224,7 @@ does not offer their backbone — `ESMC-300M`, `ProtT5-XL`, `ESMDance` and `METL
 
 **Fixed training settings**, identical in every file: 20 maximum epochs, early stopping with
 patience 3, MSE loss, targets z-scored on the training split, gradient accumulation derived from
-the effective batch size, no test evaluation during optimisation. The first two, and the
+the effective batch size, no test evaluation during optimization. The first two, and the
 micro-batch that accumulation is made of, are what the panel prefills into its three editable
 boxes; the rest are fixed for everyone.
 
@@ -240,7 +240,7 @@ evaluation:
   model_seeds: [11, 22, 33]
 ```
 
-`split_seeds` choose the partition of rows, `model_seeds` the initialisation of the LoRA adapters
+`split_seeds` choose the partition of rows, `model_seeds` the initialization of the LoRA adapters
 and the head; training takes the first `n_split_seeds` and `n_model_seeds` of each, so the default
 single run is always split seed 1 with model seed 11. Splits are **8:1:1** — 99 training / 12
 validation / 13 test rows per seed for the bundled example — cached under
@@ -282,7 +282,7 @@ GPU first.
 | Benchmark ρ in the [configuration table](#configurations) | produced by the seqdisplay-opt study on NVIDIA B200-class GPUs, nine runs per model over three splits × three seeds. A single default Colab run reports `nan` for the standard deviation |
 | The hyperparameters those ρ selected | selected on the benchmark protein, with the same mutated-site read-out a run here uses. How they transfer to *your* protein has not been measured. Four of the 14 reachable entries have no study behind them at all and stay provisional: `Ankh-large`, `ESM2-8M`, `ESMC-600M`, `SeqDance` |
 | `colabsd/engine/` | a copy of the seqdisplay-opt code the notebooks reach, not a shared library; the search machinery that *produces* a tuned configuration stayed with the original study. [`ATTRIBUTION.md`](ATTRIBUTION.md) lists what was copied, what was left behind, and the deliberate departures |
-| Determinism | fixing a seed fixes the split and the initialisation; it does not make GPU training bit-reproducible across cards, drivers or library versions |
+| Determinism | fixing a seed fixes the split and the initialization; it does not make GPU training bit-reproducible across cards, drivers or library versions |
 | Predictions | rank variants; they do not measure them |
 
 ---
@@ -304,7 +304,7 @@ measured them on a 16,424-variant SlugCas9 5NNK library; **that library is not r
 here**, and anyone reusing those values should cite the study as their source:
 *[reference to be added on publication — see the Acknowledgement below]*. The MG8 PETase
 measurements are from *[reference or accession to be added on publication]*. All files under
-`examples/` are covered by this repository's MIT licence (see [`LICENSE`](LICENSE)), which permits
+`examples/` are covered by this repository's MIT license (see [`LICENSE`](LICENSE)), which permits
 redistribution and reuse with attribution.
 
 This software generates no experimental data of its own. All outputs of a run — splits,
@@ -326,9 +326,9 @@ runtime's `colabsd_work/` directory, from where the notebook also offers the exp
 ## Code availability
 
 ColabSeqDisplay **version 0.1.0** is openly available at
-<https://github.com/JasonJiangs/ColabSeqDisplay> under the **MIT licence** (OSI-approved; full
+<https://github.com/JasonJiangs/ColabSeqDisplay> under the **MIT license** (OSI-approved; full
 terms in [`LICENSE`](LICENSE)), and runs in Google Colab from the badges above. Citation metadata —
-title, version, authors, licence and archive DOI — are in [`CITATION.cff`](CITATION.cff), which
+title, version, authors, license and archive DOI — are in [`CITATION.cff`](CITATION.cff), which
 GitHub renders as a ready-made reference; it holds a placeholder DOI until the archive is deposited
 and names every value to be filled in then.
 
@@ -336,15 +336,15 @@ and names every value to be filled in then.
 ColabSeqDisplay from it alone, the engine it runs is `colabsd/engine/` inside the package, and the
 setup cell of each notebook names this one repository. [`ATTRIBUTION.md`](ATTRIBUTION.md) records
 where that engine came from, what was taken and what was changed, module by module, and states what
-anyone redistributing this software should read first: the upstream project carries no licence file
+anyone redistributing this software should read first: the upstream project carries no license file
 of its own, so the terms covering the code in `colabsd/engine/` and the values in `config/best/`
-are not stated anywhere and should be confirmed with its authors. This repository's own MIT licence
+are not stated anywhere and should be confirmed with its authors. This repository's own MIT license
 covers the code written here.
 
 *And for the same manuscript's code statement:*
 
 > **Code availability.** ColabSeqDisplay v0.1.0, the no-code Colab workflow used in this
-> study, is openly available under the MIT licence at
+> study, is openly available under the MIT license at
 > https://github.com/JasonJiangs/ColabSeqDisplay and archived at [DOI]. It is a front end for
 > the fine-tuning protocol of [seqdisplay-opt reference]; the parts of that protocol the
 > workflow runs are included in the repository under `colabsd/engine/` and attributed

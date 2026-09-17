@@ -64,8 +64,8 @@ PARTITION_ALIASES: dict[str, str] = {
 # down and prints the true value on the clipped bar instead.
 UNBOUNDED_METRIC_CLIP = -1.0
 
-#: One series, so one bar style. Grey rather than a colour: the figure has to survive being
-#: printed or pasted into a greyscale document.
+#: One series, so one bar style. Gray rather than a color: the figure has to survive being
+#: printed or pasted into a grayscale document.
 BAR_COLOR = "#2f2f2f"
 
 

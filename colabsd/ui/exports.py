@@ -129,7 +129,7 @@ def unlock_verdict(unlock_count: int, partition: str = "test") -> str:
         )
     return (
         f"This is read number {unlock_count} of the same test partition. Choices made after the first read "
-        "were informed by it, so treat this as an optimistic estimate, not a held-out one."
+        "were informed by it, so treat this as an optimiztic estimate, not a held-out one."
     )
 
 
@@ -144,7 +144,7 @@ def partition_verdict(partition: str, unlock_count: int) -> str:
         )
     return (
         f"These are validation numbers, but the test partition of this run directory has already been read "
-        f"{unlock_count}x. A later test report from here is an optimistic estimate rather than a held-out one."
+        f"{unlock_count}x. A later test report from here is an optimiztic estimate rather than a held-out one."
     )
 
 
@@ -549,7 +549,7 @@ def _budget_lines(facts: PerformanceFacts) -> list[str]:
         lines.append(f"  {name:<26} {value:<6} {BUDGET_MEANINGS[name]}  [{source}]")
     lines.append(
         f"  {'gradient_accumulation':<26} {int(settings.gradient_accumulation):<6} "
-        "micro-batches per optimiser step  [derived]"
+        "micro-batches per optimizer step  [derived]"
     )
     return [
         *lines,
@@ -636,7 +636,7 @@ def notices(facts: PerformanceFacts) -> list[Message]:
                     "archive_test_read_repeatedly",
                     "warning",
                     f"**Test** numbers from read number {facts.unlock_count} of the same partition: an "
-                    "optimistic estimate, not a held-out one. `performance.json` carries the count with them.",
+                    "optimiztic estimate, not a held-out one. `performance.json` carries the count with them.",
                 )
             )
         else:

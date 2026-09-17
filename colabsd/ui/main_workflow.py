@@ -397,7 +397,7 @@ DISPLAY_ONLY: frozenset[str] = frozenset({"hyperparameters", "esmfold_note", "ex
 
 #: The three looked-up settings this panel hands back to the user, in the order they are
 #: asked. A subset of `colabsd.bestconfig.BUDGET_FIELDS`, which also holds
-#: `effective_batch_size`: that one is the batch the optimiser averages over, a study selected
+#: `effective_batch_size`: that one is the batch the optimizer averages over, a study selected
 #: it against a held-out score, and gradient accumulation makes it up out of whatever micro
 #: batch the card can hold. So it stays looked up, and what a user can move is time and memory.
 BUDGET_KEYS: tuple[str, ...] = ("max_epochs", "early_stopping_patience", "micro_batch_size")
@@ -438,9 +438,11 @@ PROGRESS_STYLE = (
 #: How wide the live training curve is drawn on the page. The figure itself is 10 x 6.6 inches
 #: whatever the dpi (`colabsd.curves.build_curve_figure`), so this is the browser scaling one
 #: fixed picture rather than a second size the figure has to be drawn at: the screen and
-#: `training_curve.png` stay the same drawing. 760 px is a little under the width Colab gives
-#: an output cell, so the image never becomes the thing that makes the page scroll sideways.
-CURVE_IMAGE_WIDTH_PX = 760
+#: `training_curve.png` stay the same drawing. The figure is three panels side by side, so it
+#: is wide and short: 760 px gave each panel 250 and squeezed the axis labels into each other.
+#: 1080 px is about what Colab gives an output cell on a laptop, and `max_width: 100%` below
+#: shrinks it on anything narrower rather than making the page scroll sideways.
+CURVE_IMAGE_WIDTH_PX = 1080
 
 #: What the log says when the *last* redraw of a run -- the one drawn after `finetune` has
 #: already returned -- would not draw. The cause is appended to it. Every redraw *during* the
@@ -550,7 +552,7 @@ def visible_sections(state: core.WizardState) -> list[str]:
 def numbered_titles(state: core.WizardState) -> dict[str, str]:
     """Every section's heading, numbered by where it actually falls on this page.
 
-    A step this configuration does not need is absent, not greyed out, so the numbers close
+    A step this configuration does not need is absent, not grayed out, so the numbers close
     up behind it: an ESM2 run has no preparation step, and its hyperparameters are step 3.
     """
     shown = visible_sections(state)
@@ -670,7 +672,7 @@ def preparation_messages(
     state: core.WizardState,
     *,
     runtime: core.Runtime | None = None,
-    artefact: prep.Artefact | None = None,
+    artifact: prep.Artifact | None = None,
 ) -> list[core.Message]:
     """`prepare_workflow.notices` for this state, with the machine filled in.
 
@@ -679,7 +681,7 @@ def preparation_messages(
     """
     return prep.notices(
         state,
-        artefact=prep.session_artefact(state, artefact),
+        artifact=prep.session_artifact(state, artifact),
         has_gpu=None if runtime is None else bool(runtime.has_gpu),
     )
 
@@ -690,12 +692,12 @@ def messages(
     runtime: core.Runtime | None = None,
     status: core.ConfigStatus | None = None,
     root: str | Path | None = None,
-    artefact: prep.Artefact | None = None,
+    artifact: prep.Artifact | None = None,
 ) -> list[core.Message]:
     """Every message this state earns, worst first: `core`'s, preparation's, and this page's."""
     collected = list(core.messages_for(state, runtime=runtime, status=status, root=root))
     collected += extra_messages(state)
-    collected += preparation_messages(state, runtime=runtime, artefact=artefact)
+    collected += preparation_messages(state, runtime=runtime, artifact=artifact)
     if runtime is not None and not runtime.has_gpu and has_bundle(state):
         collected.append(
             core.Message(
@@ -1052,7 +1054,7 @@ def hyperparameter_html(view: HyperparameterView) -> str:
     if view.is_provisional:
         # `view.headline` is `BestConfig.describe()`, which is also `core.config_provisional`'s
         # text on the board below this table. Printing it here as well put the same sentence in
-        # two coloured boxes a few lines apart, so this banner says only what it alone can: the
+        # two colored boxes a few lines apart, so this banner says only what it alone can: the
         # numbers directly under it were not selected. Where they came from is the provenance
         # line, and what to do about it is core's message.
         banner = theme.message_html(
@@ -1091,7 +1093,7 @@ def no_hyperparameters_html(backbone: str, status: core.ConfigStatus | None) -> 
     )
 
 
-#: The one word beside a box that has been moved off the lookup, coloured like a warning
+#: The one word beside a box that has been moved off the lookup, colored like a warning
 #: rather than a failure: a budget set by hand is allowed, and only has to be visible.
 BUDGET_TAG_STYLE = f"color:{theme.SEVERITY_COLOR['warning']};font-size:90%;margin-left:8px"
 
@@ -1219,7 +1221,7 @@ def budget_note(budget: TrainingBudget) -> str:
     """The line that keeps the two batch sizes apart, under the boxes that confuse them.
 
     There are two and they do different jobs: the one on the form is how many sequences sit on
-    the card at once, and the one in the table above it is the batch the optimiser averages
+    the card at once, and the one in the table above it is the batch the optimizer averages
     over, which gradient accumulation makes up out of the first. Someone who has just hit an
     out-of-memory error needs the first; someone who reads "batch size" as the second would
     otherwise change it and see no difference but the speed.
@@ -1238,7 +1240,7 @@ def budget_note(budget: TrainingBudget) -> str:
     else:
         made_of = f", {accumulation} × {budget.micro_batch_size}" if accumulation > 1 else ", one pass"
     return (
-        "**Sequences on the GPU at once (`micro_batch_size`) is memory, not optimisation.** Gradient "
+        "**Sequences on the GPU at once (`micro_batch_size`) is memory, not optimization.** Gradient "
         f"accumulation still trains in batches of {budget.effective_batch_size} (`effective_batch_size`"
         f"{made_of}), so lowering it for an out-of-memory error changes what fits on the card and not what "
         "is learned."
@@ -1594,7 +1596,7 @@ class MainWizard:
         self.frame: Any = None
         self.sequences: list[str] | None = None
         self.targets: Any = None
-        self.session_three_di: prep.Artefact | None = None
+        self.session_three_di: prep.Artifact | None = None
         self.best: Any = None
         self.adapter: Any = None
         self.splits: Any = None
@@ -2228,10 +2230,10 @@ class MainWizard:
         status = self._config_status()
         self._sync_seed_limits()
         self._sync_budget()
-        artefact = self.artefact()
-        self._sync_structure(artefact)
+        artifact = self.artifact()
+        self._sync_structure(artifact)
         self.plan = core.plan(self.state, runtime=self.runtime, status=status)
-        items = messages(self.state, runtime=self.runtime, status=status, artefact=artefact)
+        items = messages(self.state, runtime=self.runtime, status=status, artifact=artifact)
 
         visible = section_visibility(self.state)
         core.apply_field_visibility(self._visibility_targets(), self.state)
@@ -2292,18 +2294,18 @@ class MainWizard:
         self.budget_note.value = theme.note_html(budget_note(budget)) if budget.known else ""
         core.set_display(self.budget_note, budget.known)
 
-    def artefact(self) -> prep.Artefact | None:
+    def artifact(self) -> prep.Artifact | None:
         """The 3Di string this session made, when it still describes the wild type on screen."""
-        return prep.session_artefact(self.state, self.session_three_di)
+        return prep.session_artifact(self.state, self.session_three_di)
 
-    def _sync_structure(self, artefact: prep.Artefact | None) -> None:
+    def _sync_structure(self, artifact: prep.Artifact | None) -> None:
         """Rebuild step 3 from step 2: the source list, the note, and what it will write.
 
         The source list is built rather than written down because a choice that does not
         apply must not be on screen at all -- "reuse the one this session made" is not
-        greyed out after the library has changed under it, it is absent.
+        grayed out after the library has changed under it, it is absent.
         """
-        forced = self.three_di.sync(self.state, artefact)
+        forced = self.three_di.sync(self.state, artifact)
         if forced is not None:
             self.state.three_di_source = forced
         self.three_di.note.value = theme.note_html(prep.section_note(self.state))
@@ -2516,7 +2518,7 @@ class MainWizard:
             self.state,
             self.backend,
             wt_sequence=self.spec.wt_sequence,
-            artefact=self.artefact(),
+            artifact=self.artifact(),
             work_dir=work_dir(self.state),
             has_gpu=self._has_gpu(),
         )
@@ -2531,7 +2533,7 @@ class MainWizard:
         target = work_dir(self.state) / prep.THREE_DI_FILENAME
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(three_di + "\n")
-        self.session_three_di = prep.written_artefact(target, three_di)
+        self.session_three_di = prep.written_artifact(target, three_di)
         length = len(self.spec.wt_sequence)
         self._say(
             "structure",

@@ -16,7 +16,7 @@ beside it is the same numbers in the form a reader can check, re-draw or paste i
 tool. `curve_frame` is what both are made of, so they cannot disagree.
 
 One line per run. A default run is one line; a 3 x 3 evaluation is nine, and the spread between
-them at the same epoch is the thing the aggregate report can only summarise afterwards.
+them at the same epoch is the thing the aggregate report can only summarize afterwards.
 
 The same two panels are also drawn *during* a run, into the panel's image widget, from events
 instead of from files -- `LiveCurveState` accumulates, `live_curve_png` draws, and
@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:  # pragma: no cover - import cost, not behaviour
+if TYPE_CHECKING:  # pragma: no cover - import cost, not behavior
     import pandas as pd
     from matplotlib.figure import Figure
 
@@ -96,10 +96,18 @@ def run_label(split_seed: Any, model_seed: Any) -> str:
 
     One function because the two runs of a training press reach the figure by two different
     roads -- `curve_frame` off the finished logs, `LiveCurveState` off the events while they
-    are still arriving -- and a label that differed between them would colour and legend the
+    are still arriving -- and a label that differed between them would color and legend the
     same run twice.
     """
     return f"split {split_seed} · seed {model_seed}"
+
+
+def _as_float(value: Any) -> float:
+    """A number, or NaN for the absent key of a log written before it was recorded."""
+    try:
+        return float("nan") if value is None else float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def curve_frame(run_result: Any) -> pd.DataFrame:
@@ -127,6 +135,13 @@ def curve_frame(run_result: Any) -> pd.DataFrame:
                     "run": run_label(split_seed, model_seed),
                     "epoch": epoch,
                     "train_loss_mse": entry.get("train_loss"),
+                    # The same MSE on the partition the model did not train on. A log written
+                    # before this existed has no such key, and the column is then all-NaN,
+                    # which the figure reads as "that panel has nothing to draw".
+                    # NaN rather than None for a log written before this key existed, because
+                    # `LiveCurveState.frame()` produces NaN and the two frames are held to the
+                    # same columns *and* the same dtypes.
+                    "val_loss_mse": _as_float(entry.get("val_loss")),
                     f"val_{CURVE_METRIC.lower()}": entry.get(_METRIC_COLUMN),
                     "objective": entry.get("objective"),
                     "is_best": epoch is not None and epoch == best_epoch,
@@ -136,52 +151,52 @@ def curve_frame(run_result: Any) -> pd.DataFrame:
 
 
 #: One hue per split seed, lightness per model seed inside it. A 3 x 3 evaluation is nine
-#: curves that lie almost on top of each other, and a nine-colour cycle says only "these are
+#: curves that lie almost on top of each other, and a nine-color cycle says only "these are
 #: different"; grouping the hue says *which* of the two seeds a spread belongs to, which is
 #: the question somebody plotting nine runs actually has.
 _SPLIT_HUES: tuple[str, ...] = ("#0d5c63", "#9b4a1f", "#3f3d8f", "#2f6b40", "#7a2d52")
 
-#: The single-run colour. Most runs are one run, and one line needs no palette at all.
+#: The single-run color. Most runs are one run, and one line needs no palette at all.
 _SOLO = "#0d5c63"
 
 
-def _lighten(hex_colour: str, amount: float) -> tuple[float, float, float]:
-    """Mix *hex_colour* toward white by *amount* in [0, 1)."""
-    value = hex_colour.lstrip("#")
+def _lighten(hex_color: str, amount: float) -> tuple[float, float, float]:
+    """Mix *hex_color* toward white by *amount* in [0, 1)."""
+    value = hex_color.lstrip("#")
     rgb = tuple(int(value[index : index + 2], 16) / 255 for index in (0, 2, 4))
     return tuple(channel + (1.0 - channel) * amount for channel in rgb)
 
 
-def curve_colours(frame: pd.DataFrame) -> dict[str, tuple[float, float, float] | str]:
-    """A colour per run label: hue from the split seed, lightness from the model seed."""
+def curve_colors(frame: pd.DataFrame) -> dict[str, tuple[float, float, float] | str]:
+    """A color per run label: hue from the split seed, lightness from the model seed."""
     runs = list(dict.fromkeys(frame["run"]))
     if len(runs) == 1:
         return {runs[0]: _SOLO}
 
     splits = list(dict.fromkeys(frame["split_seed"]))
-    colours: dict[str, tuple[float, float, float] | str] = {}
+    colors: dict[str, tuple[float, float, float] | str] = {}
     for name in runs:
         part = frame[frame["run"] == name]
         split = part["split_seed"].iloc[0]
         seeds = list(dict.fromkeys(frame[frame["split_seed"] == split]["model_seed"]))
         hue = _SPLIT_HUES[splits.index(split) % len(_SPLIT_HUES)]
         step = seeds.index(part["model_seed"].iloc[0])
-        colours[name] = _lighten(hue, 0.0 if len(seeds) < 2 else 0.42 * step / (len(seeds) - 1))
-    return colours
+        colors[name] = _lighten(hue, 0.0 if len(seeds) < 2 else 0.42 * step / (len(seeds) - 1))
+    return colors
 
 
-def _figure_colours(
+def _figure_colors(
     frame: pd.DataFrame, batch_points: pd.DataFrame | None
 ) -> dict[str, tuple[float, float, float] | str]:
-    """A colour per run label covering both frames.
+    """A color per run label covering both frames.
 
     Mid-evaluation the two disagree about which runs exist: run 4 has batch points and no
-    closed epoch yet, so asking `curve_colours` for the epoch frame alone would leave its cloud
-    grey. Built from the union, a run keeps one colour from its first batch point to its last
+    closed epoch yet, so asking `curve_colors` for the epoch frame alone would leave its cloud
+    gray. Built from the union, a run keeps one color from its first batch point to its last
     epoch, which is what lets the eye follow it across a redraw.
     """
     if batch_points is None or not len(batch_points):
-        return curve_colours(frame) if len(frame) else {}
+        return curve_colors(frame) if len(frame) else {}
 
     import pandas as pd
 
@@ -190,7 +205,7 @@ def _figure_colours(
     if not parts:
         return {}
     combined = pd.concat(parts, ignore_index=True).drop_duplicates(subset="run", keep="first")
-    return curve_colours(combined)
+    return curve_colors(combined)
 
 
 #: Below this many points a run's batch cloud is drawn larger and darker: at twenty points
@@ -297,9 +312,12 @@ def build_curve_figure(
     from matplotlib.figure import Figure
     from matplotlib.ticker import MaxNLocator
 
-    figure = Figure(figsize=(10.0, 6.6))
+    # Side by side, not stacked: the two losses are read against each other -- that comparison
+    # is the whole reason the validation one exists -- and a reader cannot compare two curves
+    # they have to scroll between. Sharing the epoch axis keeps the three at one scale.
+    figure = Figure(figsize=(15.0, 4.4))
     FigureCanvasAgg(figure)
-    top, bottom = figure.subplots(2, 1, sharex=True, gridspec_kw={"hspace": 0.13})
+    top, middle, bottom = figure.subplots(1, 3, sharex=True, gridspec_kw={"wspace": 0.22})
 
     live = batch_points is not None and len(batch_points) > 0
     metric_column = f"val_{metric_label.lower()}"
@@ -307,29 +325,34 @@ def build_curve_figure(
     # A live frame that has not seen an epoch close yet has no metric column to read, and
     # neither has one whose run selects on something this call was not told about.
     has_metric = bool(runs) and metric_column in frame.columns
-    colours = _figure_colours(frame, batch_points)
+    # An all-NaN column is a log written before the validation loss was recorded; pandas keeps
+    # the column, so presence alone is not the question.
+    has_val_loss = bool(runs) and "val_loss_mse" in frame.columns and frame["val_loss_mse"].notna().any()
+    colors = _figure_colors(frame, batch_points)
     style = {"marker": "o", "markersize": 2.6, "linewidth": 1.3}
 
     for name in runs:
         part = frame[frame["run"] == name].sort_values("epoch")
-        colour = colours[name]
+        color = colors[name]
         # An epoch axis a reader counts from 1, matching the panel's "epoch 3/20" line. The
         # log counts from 0 because that is the loop variable.
         epochs = part["epoch"] + 1
-        top.plot(epochs, part["train_loss_mse"], color=colour, **style)
+        top.plot(epochs, part["train_loss_mse"], color=color, **style)
+        if has_val_loss:
+            middle.plot(epochs, part["val_loss_mse"], color=color, **style)
         if not has_metric:
             continue
-        bottom.plot(epochs, part[metric_column], label=name, color=colour, **style)
+        bottom.plot(epochs, part[metric_column], label=name, color=color, **style)
         kept = part[part["is_best"]]
         if len(kept):
-            # The exported epoch, in the line's own colour so it reads as part of that curve
+            # The exported epoch, in the line's own color so it reads as part of that curve
             # rather than as a separate series. A heavy black ring did the opposite.
             bottom.scatter(
                 kept["epoch"] + 1,
                 kept[metric_column],
                 s=58,
                 facecolors="white",
-                edgecolors=[colour],
+                edgecolors=[color],
                 linewidths=1.8,
                 zorder=5,
             )
@@ -338,7 +361,7 @@ def build_curve_figure(
     if live:
         for name in dict.fromkeys(batch_points["run"]):
             part = batch_points[batch_points["run"] == name]
-            colour = colours.get(name, _SOLO)
+            color = colors.get(name, _SOLO)
             # Small, faint and under the epoch line: at a couple of hundred points a run the
             # cloud reads as texture with a direction, not as a series to follow point by
             # point, and solid markers at that density smear over the curve they surround.
@@ -349,7 +372,7 @@ def build_curve_figure(
                 part["epoch"] + 1,
                 part["train_loss_mse"],
                 s=7.0 if sparse else 3.4,
-                color=[colour],
+                color=[color],
                 alpha=0.55 if sparse else 0.3,
                 linewidths=0,
                 zorder=1,
@@ -361,7 +384,7 @@ def build_curve_figure(
                 [head["epoch"] + 1],
                 [head["train_loss_mse"]],
                 s=22,
-                color=[colour],
+                color=[color],
                 edgecolors="white",
                 linewidths=0.8,
                 zorder=4,
@@ -369,7 +392,7 @@ def build_curve_figure(
             if name not in runs:
                 # A run whose first epoch has not closed has no line to put in the legend, and
                 # an unlabelled cloud in a nine-run evaluation belongs to nobody.
-                bottom.plot([], [], label=name, color=colour, **style)
+                bottom.plot([], [], label=name, color=color, **style)
 
         limits = _loss_limits(frame, batch_points)
         if limits is not None:
@@ -405,22 +428,36 @@ def build_curve_figure(
         )
 
     top.set_ylabel("training loss (MSE)", fontsize=10.5)
+    middle.set_ylabel("validation loss (MSE)", fontsize=10.5)
+    if not has_val_loss:
+        # A run from before the validation loss was recorded. The panel stays, so the three
+        # are always in the same places, and says why it is empty rather than looking broken.
+        middle.text(
+            0.5, 0.5, "not recorded\nfor this run", transform=middle.transAxes,
+            ha="center", va="center", fontsize=9.5, alpha=0.55,
+        )
     title = "Training curves" + (f" — {model_label}" if model_label else "")
     # Read off `.attrs` rather than off `live`, so a live figure whose batch reports never
     # arrived still says which epoch of how many it is drawn at. The archive's frames carry
     # none of them and its title is unchanged.
     progress = _progress_suffix(frame, batch_points)
-    top.set_title(f"{title} · {progress}" if progress else title, fontsize=12.5, pad=10)
-    bottom.set_ylabel(f"validation {metric_label}", fontsize=10.5)
-    bottom.set_xlabel("epoch", fontsize=10.5)
-    for axis in (top, bottom):
+    figure.suptitle(f"{title} · {progress}" if progress else title, fontsize=12.5, y=0.99)
+    # Which panel decides. Side by side, the validation loss sits between the training loss
+    # and the score, and the obvious reading is that the middle one is what early stopping
+    # watches. It is not: the run keeps the epoch with the best validation *score*, and the
+    # loss panels are diagnosis. Saying so on the axis is cheaper than a note nobody reads.
+    bottom.set_ylabel(f"validation {metric_label}  (selects the epoch)", fontsize=10.5)
+    for axis in (top, middle, bottom):
+        # Every panel carries the label: side by side they are three plots a reader scans
+        # across, not one stack with a shared foot.
+        axis.set_xlabel("epoch", fontsize=10.5)
         axis.grid(True, alpha=0.22, linewidth=0.6)
         axis.set_axisbelow(True)
         for side in ("top", "right"):
             axis.spines[side].set_visible(False)
         axis.tick_params(labelsize=9.5)
-    # Epochs are whole numbers; the default locator was offering 2.5 and 7.5.
-    bottom.xaxis.set_major_locator(MaxNLocator(integer=True))
+        # Epochs are whole numbers; the default locator was offering 2.5 and 7.5.
+        axis.xaxis.set_major_locator(MaxNLocator(integer=True))
     if live:
         # The first epoch is a whole unit of the axis rather than the left edge of it, so a run
         # 70% of the way through epoch 1 is drawn 70% of the way to the first tick. Autoscale
@@ -457,7 +494,10 @@ def build_curve_figure(
                 labels,
                 title=kept_note,
                 loc="upper center",
-                bbox_to_anchor=(0.5, 0.055),
+                # Below the x-labels, not on top of them. Three panels side by side are much
+                # shorter than the two stacked ones this anchor was chosen for, so 0.055 of the
+                # figure height landed the legend on the middle panel's "epoch".
+                bbox_to_anchor=(0.5, -0.02),
                 ncol=min(5, len(handles)),
                 fontsize=8.5,
                 frameon=False,
@@ -674,7 +714,15 @@ class LiveCurveState:
         loss = float(getattr(event, "loss", float("nan")))
         if kind == "epoch":
             score = getattr(event, "score", None)
-            run.epochs.append((epoch, loss, None if score is None else float(score)))
+            val_loss = getattr(event, "val_loss", None)
+            run.epochs.append(
+                (
+                    epoch,
+                    loss,
+                    None if score is None else float(score),
+                    float("nan") if val_loss is None else float(val_loss),
+                )
+            )
             return True
 
         step, n_batches = getattr(event, "step", None), getattr(event, "n_batches", None)
@@ -704,10 +752,10 @@ class LiveCurveState:
         rows: list[dict[str, Any]] = []
         for run in self._runs.values():
             best_index, best_score = None, float("-inf")
-            for index, (_, _, score) in enumerate(run.epochs):
+            for index, (_, _, score, _) in enumerate(run.epochs):
                 if score is not None and score > best_score:
                     best_index, best_score = index, score
-            for index, (epoch, loss, score) in enumerate(run.epochs):
+            for index, (epoch, loss, score, val_loss) in enumerate(run.epochs):
                 value = float("nan") if score is None else score
                 rows.append(
                     {
@@ -716,12 +764,18 @@ class LiveCurveState:
                         "run": run.label,
                         "epoch": epoch,
                         "train_loss_mse": loss,
+                        "val_loss_mse": val_loss,
                         column: value,
                         "objective": value,
                         "is_best": index == best_index,
                     }
                 )
-        columns = ["split_seed", "model_seed", "run", "epoch", "train_loss_mse", column, "objective", "is_best"]
+        # The archive's `curve_frame` emits these in this order; the two must match column for
+        # column or the live picture and the exported one are two different drawings.
+        columns = [
+            "split_seed", "model_seed", "run", "epoch",
+            "train_loss_mse", "val_loss_mse", column, "objective", "is_best",
+        ]
         return self._stamped(pd.DataFrame(rows, columns=columns))
 
     def batch_frame(self) -> pd.DataFrame:

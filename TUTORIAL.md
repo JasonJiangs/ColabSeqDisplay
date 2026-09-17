@@ -96,7 +96,7 @@ placeholder, performance unknown` (see
 is pre-empted or disconnected leaves the best epoch it reached rather than nothing — and the next
 Train press does not destroy it: that file is renamed to `unfinished_checkpoint.pt` before the retry
 writes anything, and the panel prints where it went. To stop a run deliberately, press Colab's own ▪
-— stopped inside an epoch, the panel keeps that best epoch, scores it and writes the artefacts;
+— stopped inside an epoch, the panel keeps that best epoch, scores it and writes the artifacts;
 stopped while the run is finishing up, it ends there and the panel prints where the weights are.
 The panel has no stop button of its own: training holds the kernel while it runs, so no widget here
 could answer a click until it finished. What a shortened run leaves behind, and how to read it back,
@@ -106,7 +106,7 @@ is [below](#a-run-that-was-stopped-or-a-session-that-died).
 *Give up after this many epochs with no gain* (3), and *Sequences on the GPU at once (memory)* (8).
 The third is the one to lower if training dies with CUDA out of memory — it is how much has to fit
 on the card, while `effective_batch_size` (32 for the default `ESM2-35M`; read it off the table,
-it is not editable and it differs per backbone) is what the optimiser averages over, and gradient
+it is not editable and it differs per backbone) is what the optimizer averages over, and gradient
 accumulation holds it there either way. A box you move says `changed ·
 20 looked up` beside itself, the row above it reads `20 → 40`, and the estimate in step 4 re-prices
 the run. A budget that could not train is refused before the button: no epochs, a patience longer
@@ -137,8 +137,11 @@ re-derive the 3Di and press Train and you get a new run rather than the old stru
 
 **A figure appears under that line with the first batch report** — at least three seconds after
 the press, and otherwise as soon as there is a point to plot, so it arrives at the end of that
-quiet stretch rather than during it. It is redrawn as the run proceeds: training loss (MSE) on top,
-validation Spearman below, one line per run, with a sample of the batch losses overlaid faintly on
+quiet stretch rather than during it. It is redrawn as the run proceeds: three panels side by side
+— training loss (MSE), the same MSE on the validation split, and validation Spearman — one line
+per run. Only the third decides anything: the run keeps the epoch whose Spearman is best, and the
+two losses are there to show *why* it stopped where it did. A validation loss that turns up while
+the training loss keeps falling is over-fitting, visible before the score has finished saying so, with a sample of the batch losses overlaid faintly on
 the loss panel, spread across the whole run — so a run that is not converging says so before its
 first epoch closes, rather than only at the end of it. The sample is capped so the panel stays
 readable: a twenty-epoch run at a hundred batches an epoch sends two thousand losses and plots
@@ -157,7 +160,7 @@ figure cannot be drawn at all, the run keeps going and says in the log why it lo
 ### Step 7 — what came back
 
 What the fine-tuned model scored on validation: the macro average over conditions, then a table of
-Spearman, R2 and NDCG@50 per condition. Test artefacts move to `run/locked_test/` as each run
+Spearman, R2 and NDCG@50 per condition. Test artifacts move to `run/locked_test/` as each run
 finishes; nothing you can read here carries test information.
 
 **`± nan` is deliberate**, not a bug: one run cannot show reproducibility, so the standard
@@ -165,7 +168,7 @@ deviation is undefined rather than zero. Raise the seed counts in step 4 before 
 
 **Read this example's numbers as a shape, not a target.** Its validation partition is 12 rows, and
 a rank correlation over 12 rows moves a long way for a small change — fixing the seeds fixes the
-split and the initialisation, not GPU arithmetic. Twelve rows also drop `NDCG@50` from the table,
+split and the initialization, not GPU arithmetic. Twelve rows also drop `NDCG@50` from the table,
 with a note saying why: every variant falls inside a cut of 50, so the column cannot mean what its
 name promises. `report.csv` in the performance archive carries it anyway.
 
@@ -233,7 +236,7 @@ not evidence.
 notebook asks you to make, and the one a referee is most likely to probe.
 
 **What is locked.** Everything in the panel above reports validation. The training loop evaluates
-the test partition at the end of each run — and the notebook immediately moves every test artefact
+the test partition at the end of each run — and the notebook immediately moves every test artifact
 into `run/locked_test/` and replaces the test block of the visible metrics with a sentence naming
 the one function that can read it back. That includes the performance archive from step 8, which is
 why you can have it first.
@@ -402,7 +405,7 @@ a run that was cut short.
 **Or just press Train again.** A run that was stopped is never handed back as a finished one:
 *Reuse finished runs* counts a run directory as finished only when it holds a `colabsd_run.json`
 whose `stopped_early` is not `interrupted`, so the retry actually retrains. Until it does, every
-artefact carrying the short run's numbers says so — the run row, `validation_runs.csv`,
+artifact carrying the short run's numbers says so — the run row, `validation_runs.csv`,
 `report.json`, the footer of `report.png` and the bundle manifest's `training_status` block all
 read *trained 2 of 20 epochs, stopped early by hand* rather than publishing the 20-epoch budget as
 though it had been spent.
@@ -483,7 +486,7 @@ manifest; none of it has to be reconstructed afterwards.
 
 | state this | where it comes from |
 |---|---|
-| the tool, its version and its licence | `colabsd <version>` on the first line of the setup cell, and `colabsd_version` in `performance.json`; version, licence and archive DOI in `CITATION.cff` (see [Code availability](README.md#code-availability)) |
+| the tool, its version and its license | `colabsd <version>` on the first line of the setup cell, and `colabsd_version` in `performance.json`; version, license and archive DOI in `CITATION.cff` (see [Code availability](README.md#code-availability)) |
 | the backbone, and the mutated sites its embeddings are averaged over | step 2's summary, the `model` block of `performance.json`, and the bundle's description line |
 | whether the hyperparameters were tuned or a placeholder | step 3's banner; `hyperparameters.status` in `performance.json` and the same flag in the bundle manifest |
 | epochs, patience and the two batch sizes the run was given, and which of them you set | step 3's boxes; `training_budget` in `performance.json`, `report.json` and the bundle manifest, and the table under *WHAT THE RUN WAS GIVEN* in `README.txt` |
@@ -497,7 +500,7 @@ Three sentences worth writing down verbatim:
 - **`n_runs = 1` means one draw.** Quote the number without a ±, and say it is a single split seed
   and a single model seed.
 - **A provisional configuration is a lower bound.** Say which of the two it was.
-- **A validation-only performance archive is a reportable artefact.** It states that the test
+- **A validation-only performance archive is a reportable artifact.** It states that the test
   partition was never read, and the archive is what lets a reader tell that apart from a test number
   obtained after five looks.
 

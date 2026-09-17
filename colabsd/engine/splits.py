@@ -9,7 +9,7 @@ these produce. See ``ATTRIBUTION.md``.
 
 ``create_split`` caches on the output directory alone: an existing
 ``indices.pt`` is returned without checking that it was built for the same
-``n``. That is upstream behaviour and is kept; ``colabsd.data.make_splits``
+``n``. That is upstream behavior and is kept; ``colabsd.data.make_splits``
 guards against a stale cache on our side.
 """
 

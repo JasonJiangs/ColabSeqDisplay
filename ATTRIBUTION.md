@@ -65,7 +65,7 @@ protein-region tables they resolve through.
 ## What we changed while copying, and why
 
 Fidelity is the rule for `colabsd/engine/`: the tuned configurations in `config/best/`
-were selected against upstream's exact code, so a silent behavioural drift would
+were selected against upstream's exact code, so a silent behavioral drift would
 invalidate them. Every departure below is deliberate, recorded in the module header, and
 covered by a test.
 
@@ -75,7 +75,7 @@ covered by a test.
    `ValueError: invalid literal for int() with base 10: 'auto'` — while `train_eval_config`
    resolves the very same `"auto"` correctly. Both now go through one helper,
    `resolve_micro_batch_size`, which applies the trainer's rule. This is a **bug fix**, not
-   a behaviour change for anything that already worked: all 28 shipped configs set the
+   a behavior change for anything that already worked: all 28 shipped configs set the
    field explicitly, and a 28-file field-for-field comparison shows none of them parses
    differently than it did upstream.
 2. **Names we depend on are public.** They are this package's API now rather than another
@@ -102,7 +102,7 @@ covered by a test.
    pooling a different protein, and a relative path resolves against the working directory
    rather than against upstream's checkout root.
 5. **Imports are lazy where they were eager**, so that importing `colabsd.engine.pooling`
-   or `colabsd.engine.formats` does not pull in `torch`. No behaviour depends on it.
+   or `colabsd.engine.formats` does not pull in `torch`. No behavior depends on it.
 6. **There is one pooling, so nothing dispatches on a name.** Upstream registers five
    `PoolingStrategy` classes and `pool(name, ...)` looks one up, each resolving a named
    region of a protein through `POOLING_REGIONS`. This pipeline averages the embeddings at
@@ -111,7 +111,7 @@ covered by a test.
    lists `mutated_positions_1based` instead of a `regions` mapping, and
    `config_space.pooling_positions_0based` reads those positions rather than the pooling's
    name. `mutation_site_mean` survives as a *label* — the `config/best/` filename suffix
-   and the string every artefact records — not as a choice.
+   and the string every artifact records — not as a choice.
 7. **The training loop can report where it is.** `train_epoch` takes an optional
    `on_batch(step, n_batches, running_loss)` callback and `train_eval_config` takes
    `on_epoch` and `on_batch`, all defaulting to `None`. An epoch on a real backbone is
@@ -147,7 +147,7 @@ covered by a test.
    while it is in there, and Colab's own interrupt is what reaches it.
 11. **A stop press *outside* the epoch loop raises one class the panel can catch.** The
    post-loop half of `train_eval_config` — the final validation and test passes and the
-   artefact writes — is the colabsd-only `_finalise_run`, wrapped so that a
+   artifact writes — is the colabsd-only `_finalise_run`, wrapped so that a
    `KeyboardInterrupt` there rewrites the checkpoint with `complete: False,
    stopped_early: "interrupted"` and then raises the colabsd-only
    `TrainingStopped(RuntimeError)`, whose message names the run, the epochs it trained,
@@ -176,7 +176,7 @@ reader's expectations. Four names in `colabsd/engine/train_config.py` are compar
 nothing because they are ours and have no upstream counterpart: `TrainingStopped`,
 `_finalise_run`, `configured_target_names` and `relabel_per_target`. `evaluate_split` and
 every other shared definition in that module are still held to upstream byte for byte, after
-the normalisation the test describes.
+the normalization the test describes.
 
 **Those files are not in the published distribution.** What is published at
 <https://github.com/JasonJiangs/ColabSeqDisplay> is what a notebook runs — the `colabsd`
@@ -240,10 +240,10 @@ through `colabsd`'s own path end to end, and it is labelled as an illustration w
 appears. That run's numbers, and the single timed forward pass
 `colabsd.ui.core.TIMED_PASS` records, are this repository's own.
 
-## Licence
+## License
 
-**The upstream project carries no licence file.** There is no `LICENSE`, `COPYING` or
-licence declaration in its repository or its `pyproject.toml`, so the terms under which
+**The upstream project carries no license file.** There is no `LICENSE`, `COPYING` or
+license declaration in its repository or its `pyproject.toml`, so the terms under which
 its code may be copied, modified or redistributed are not stated anywhere. This is a
 factual note about the state of that repository, not a legal opinion.
 

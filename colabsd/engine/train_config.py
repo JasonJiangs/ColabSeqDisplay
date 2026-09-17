@@ -15,7 +15,7 @@ See ``ATTRIBUTION.md``.
 
 Left behind: everything Optuna. Upstream's two modules also build and read study
 databases (``run_model_study``, ``load_top_trials``, ``train_one_trial``, trial
-pruning and the per-trial artefact writer), take an exclusive ``fcntl`` lock so
+pruning and the per-trial artifact writer), take an exclusive ``fcntl`` lock so
 two HPC workers cannot share a study, and expose two ``argparse`` command lines.
 ColabSeqDisplay runs *one* already-chosen configuration out of ``config/best/``,
 so none of that is reachable from a notebook and none of it is here.
@@ -53,7 +53,7 @@ in ``tests/test_engine_train_config.py``:
    no notebook and no stop button: a ``KeyboardInterrupt`` anywhere in this function is its
    caller's problem. colabsd runs inside a widget callback whose guard catches ``Exception``,
    which ``KeyboardInterrupt`` is not, so an interrupt during the final evaluation or the
-   artefact writes killed the run with no message at all. The epoch loop still absorbs one
+   artifact writes killed the run with no message at all. The epoch loop still absorbs one
    (that is early stopping by hand); everything after it records the cut-short run on disk and
    re-raises it as :class:`TrainingStopped`, which every guard can see.
 6. **The per-target metric names come from the config.** Upstream names the first four target
@@ -97,9 +97,10 @@ AUTO_MICRO_BATCH_SIZE = 4
 # The three validation objectives a best-config may select on.
 SELECTION_OBJECTIVES = ("mean_validation_r2", "mean_validation_pearson", "mean_validation_spearman")
 
-#: ``on_epoch(epoch, max_epochs, validation_score, train_loss)`` -- one epoch has closed.
+#: ``on_epoch(epoch, max_epochs, validation_score, train_loss, validation_loss)`` -- one
+#: epoch has closed. `validation_loss` is the same MSE as `train_loss`, on the held-out split.
 #: ``epoch`` is 0-based, and the score is the objective named by ``study.objective``.
-EpochProgress = Callable[[int, int, float, float], None]
+EpochProgress = Callable[[int, int, float, float, float], None]
 
 #: ``on_batch(epoch, max_epochs, step, n_batches, running_loss)`` -- where inside the epoch the
 #: fine-tune has got to, and its training loss so far. Called once per micro-batch, which is
@@ -112,7 +113,7 @@ class TrainingStopped(RuntimeError):
 
     A `KeyboardInterrupt` inside the epoch loop is early stopping by hand: the loop ends and
     the run finishes normally, marked `stopped_early: "interrupted"`. One that lands after it
-    -- during the final validation and test passes, or while the artefacts are being written --
+    -- during the final validation and test passes, or while the artifacts are being written --
     cannot be absorbed that way, because the numbers those passes were going to produce do not
     exist. The weights of the best epoch are still on disk, so the run is recorded as cut short
     and this is raised. It derives from `RuntimeError`, i.e. from `Exception`, because the panel
@@ -472,8 +473,14 @@ def evaluate_split(
     scaler: LabelScaler,
     batch_size: int,
     device: torch.device,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Predict one partition, undo the label z-score and score it per target."""
+) -> tuple[np.ndarray, dict[str, Any], float]:
+    """Predict one partition, undo the label z-score and score it per target.
+
+    The third return is the mean squared error against the *scaled* targets: the training
+    loss's own quantity, so the two can be read on one axis. Returned separately rather than
+    put in `metrics`, whose keys are target names -- a float under a non-target key there would
+    reach `summarize_metrics` as a condition called "loss".
+    """
     pred_scaled = predict(
         adapter=adapter,
         model=model,
@@ -485,7 +492,13 @@ def evaluate_split(
     )
     pred = scaler.inverse(pred_scaled)
     metrics = evaluate_predictions(targets[indices], pred)
-    return pred, metrics
+    # The same quantity `train_epoch` minimizes, on the partition it did not see. It has to be
+    # computed HERE, from `pred_scaled`, because the training loss is MSE against the z-scored
+    # targets while everything below `scaler.inverse` is on the assay's own scale. A validation
+    # MSE taken after the inverse would be a different number in a different unit, and drawing
+    # the two on one axis -- which is the whole point of having both -- would be a lie.
+    loss = float(np.mean((scaler.transform(targets[indices]) - pred_scaled) ** 2))
+    return pred, metrics, loss
 
 
 def train_eval_config(
@@ -604,7 +617,7 @@ def train_eval_config(
                 on_batch=epoch_batch_callback(on_batch, epoch, max_epochs),
             )
 
-            _, val_metrics = evaluate_split(
+            _, val_metrics, val_loss = evaluate_split(
                 adapter=adapter,
                 model=model,
                 head=head,
@@ -620,6 +633,10 @@ def train_eval_config(
             row = {
                 "epoch": epoch,
                 "train_loss": train_loss,
+                # The same quantity on the partition the model did not train on, in the same
+                # scaled space. Together the two are the only thing in this log that shows
+                # over-fitting while it is happening rather than afterwards.
+                "val_loss": val_loss,
                 "objective": score,
                 **validation_log_row(metric_summary),
             }
@@ -628,7 +645,7 @@ def train_eval_config(
                 # An epoch closes on the only number that decides anything -- the validation score
                 # this epoch is kept or discarded on -- so it is reported even though `on_batch` has
                 # been reporting the loss all the way through the epoch that produced it.
-                on_epoch(epoch, max_epochs, float(score), float(train_loss))
+                on_epoch(epoch, max_epochs, float(score), float(train_loss), float(val_loss))
             if score > best_score:
                 best_score = score
                 best_epoch = epoch
@@ -698,7 +715,7 @@ def train_eval_config(
             source_trial=source_trial,
         )
     except KeyboardInterrupt:
-        # A second stop press, landing in the final evaluation or the artefact writes. The
+        # A second stop press, landing in the final evaluation or the artifact writes. The
         # epoch loop is over and its numbers are gone, so this run cannot be finished; what it
         # can do is leave the best epoch's weights saying exactly that, and raise something the
         # notebook's guard can catch. `colabsd.train.finetune` writes no `colabsd_run.json` for
@@ -768,7 +785,7 @@ def _finalise_run(
     output_dir: Path,
     source_trial: SourceTrial | None,
 ) -> dict[str, Any]:
-    """Restore the best epoch, score both partitions and write the run's artefacts.
+    """Restore the best epoch, score both partitions and write the run's artifacts.
 
     Split out of :func:`train_eval_config` so that a stop press landing in here is caught in
     one place: everything this function does is after the point where a run can still be
@@ -776,7 +793,7 @@ def _finalise_run(
     """
     load_lora_state_dict(model, best_lora_state, device)
     load_head_state(head, best_head_state, device)
-    val_predictions, val_metrics = evaluate_split(
+    val_predictions, val_metrics, _ = evaluate_split(
         adapter=adapter,
         model=model,
         head=head,
@@ -787,7 +804,7 @@ def _finalise_run(
         batch_size=micro_batch_size,
         device=device,
     )
-    test_predictions, test_metrics = evaluate_split(
+    test_predictions, test_metrics, _ = evaluate_split(
         adapter=adapter,
         model=model,
         head=head,

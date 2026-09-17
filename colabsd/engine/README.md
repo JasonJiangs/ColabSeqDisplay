@@ -6,7 +6,7 @@ the method `colabsd` runs: LoRA injection, the training loop, pooling, the metri
 regression head and the split protocol. Every module here opens with a header naming the
 upstream file it came from and what was changed on the way in.
 [`ATTRIBUTION.md`](../../ATTRIBUTION.md) collects those headers, and records that the
-upstream project ships no licence file.
+upstream project ships no license file.
 
 It lives here so that ColabSeqDisplay is one installable package. Before this, `colabsd`
 imported a second, unpublished repository, the notebooks asked for two locations, and the
@@ -30,7 +30,7 @@ So:
   side-by-side test against the original, and an entry in `ATTRIBUTION.md`.
 - **Fix bugs upstream-first where you can.** What is fixed here (the `micro_batch_size:
   auto` crash in the config loader) is listed in `ATTRIBUTION.md` and is worth sending back.
-- **New behaviour does not belong here.** Everything that makes this runnable from a
+- **New behavior does not belong here.** Everything that makes this runnable from a
   notebook — HuggingFace loading, CSV handling, best-config lookup,
   orchestration, reporting, bundles — lives outside this directory and is ours to change
   freely.
@@ -43,12 +43,12 @@ compare their outputs on real input, rather than comparing source.
 
 `tests/test_engine_fidelity.py` closes three gaps in that argument. It pins `create_split`
 to the study's *recorded* index lists (`results/selection/split/seed_*/indices.pt`), which
-are the artefacts `config/best/` was selected on and hold even if upstream's source later
+are the artifacts `config/best/` was selected on and hold even if upstream's source later
 changes; it runs `inject_lora` against real HuggingFace attention naming (`EsmModel`,
 `T5EncoderModel`, built from a small config with no weights and no network) rather than a
 toy module tree; and it compares every shared definition at AST level, with docstrings,
-annotations, formatting and the deliberate renames normalised away, so an undocumented
-edit to a body here fails even where no behavioural test reaches it. The bodies that
+annotations, formatting and the deliberate renames normalized away, so an undocumented
+edit to a body here fails even where no behavioral test reaches it. The bodies that
 `ATTRIBUTION.md` records as deliberate departures are its allow-list: adding one without
 recording it fails, and so does leaving one listed after it has been reverted.
 

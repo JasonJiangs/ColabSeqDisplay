@@ -81,7 +81,7 @@ TRAINING_STATUS_KEY = "training_status"
 LORA_NAME = "lora.pt"
 HEAD_NAME = "head.pt"
 
-#: What the hyperparameters behind a number are worth, in one word. Every artefact this
+#: What the hyperparameters behind a number are worth, in one word. Every artifact this
 #: package writes uses these two strings, so a reader who learns what "PROVISIONAL" means
 #: on a bundle already knows what it means on a performance archive.
 PROVISIONAL_STATUS = "PROVISIONAL"
@@ -94,7 +94,7 @@ def hyperparameter_status(is_provisional: bool) -> str:
 
 
 def utc_now() -> str:
-    """The timestamp every artefact written here is stamped with."""
+    """The timestamp every artifact written here is stamped with."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")  # noqa: UP017 -- datetime.UTC needs 3.11
 
 
@@ -138,7 +138,7 @@ def provenance_block(
 
 
 # ------------------------------------------------------------------------------------------
-# The training budget, in the one vocabulary every artefact writes it in.
+# The training budget, in the one vocabulary every artifact writes it in.
 # ------------------------------------------------------------------------------------------
 
 #: The manifest key the budget is recorded under, the same in the bundle manifest, the
@@ -149,7 +149,7 @@ BUDGET_KEY = "training_budget"
 #: for each in turn so that a caller can hand over whatever it has.
 BUDGET_ATTRIBUTES: tuple[str, ...] = ("budget", "budget_settings", BUDGET_KEY)
 
-#: What every artefact says when nothing recorded what the run was given. It is not a default:
+#: What every artifact says when nothing recorded what the run was given. It is not a default:
 #: a bundle written before `training_budget` existed has no record, and saying so is the only
 #: honest thing to print over it.
 BUDGET_NOT_RECORDED = "training budget not recorded"
@@ -161,7 +161,7 @@ def json_safe(value: Any) -> Any:
     NaN and +-inf are not JSON. Python's `json` writes them as the bare tokens `NaN`,
     `Infinity` and `-Infinity` and reads them back again, so nothing inside this package ever
     notices; every stricter parser -- `JSON.parse`, Go, Rust, a Python reader that passes
-    `parse_constant` -- rejects the file. A manifest is the one artefact written to be read by
+    `parse_constant` -- rejects the file. A manifest is the one artifact written to be read by
     somebody else's tools, and the single-run `sd` is NaN by design (one run shows no spread),
     so it is written as `null` and the writer refuses to emit the tokens at all.
     """
@@ -298,10 +298,10 @@ def _count(value: Any) -> int | None:
 
 
 def budget_payload(source: Any) -> dict[str, Any]:
-    """The budget record every artefact writes, out of whatever a caller carries it as.
+    """The budget record every artifact writes, out of whatever a caller carries it as.
 
     Accepts a `colabsd.bestconfig.BudgetSettings`, the mapping its `to_dict()` produced (an
-    artefact read back off disk), or something that is neither -- which records as `{}`. That
+    artifact read back off disk), or something that is neither -- which records as `{}`. That
     empty record is the point: "not recorded" is a fact a reader can act on, and writing the
     looked-up numbers for a run that may not have used them is exactly the lie this block
     exists to prevent.
@@ -319,7 +319,7 @@ def budget_payload(source: Any) -> dict[str, Any]:
     record: dict[str, Any] = dict(used)
     accumulation = _count(source.get("gradient_accumulation"))
     effective, micro = used["effective_batch_size"], used["micro_batch_size"]
-    # How many micro-batches make up one optimiser step. Kept as recorded when the source has
+    # How many micro-batches make up one optimizer step. Kept as recorded when the source has
     # it, because that is what the run actually did; derived only when it is absent.
     record["gradient_accumulation"] = accumulation or max(1, -(-effective // micro))
     record["chosen_by_user"] = [
@@ -347,7 +347,7 @@ def budget_of(*sources: Any) -> dict[str, Any]:
 
     Each source is tried both as a budget itself and as something carrying one under any of
     `BUDGET_ATTRIBUTES` -- so a caller hands over what it has, in the order it trusts it: an
-    explicit record, then the `RunResult` the artefact describes, then the wizard or
+    explicit record, then the `RunResult` the artifact describes, then the wizard or
     `BestConfig` the run was configured from. Nothing found records nothing.
     """
     for source in sources:
@@ -407,7 +407,7 @@ def budget_line(record: Any) -> str:
 
     The two batch sizes are named for the job each does, because that is the one thing a
     reader gets wrong: the micro-batch is what has to fit on the card, the effective batch is
-    what shapes the optimisation.
+    what shapes the optimization.
     """
     settings = budget_settings(record)
     if settings is None:
@@ -416,9 +416,9 @@ def budget_line(record: Any) -> str:
         [
             _plural(settings.max_epochs, "epoch"),
             f"patience {settings.early_stopping_patience}",
-            f"effective batch {settings.effective_batch_size} (optimisation)",
+            f"effective batch {settings.effective_batch_size} (optimization)",
             f"micro-batch {settings.micro_batch_size} on the GPU (memory)",
-            f"{_plural(settings.gradient_accumulation, 'micro-batch', 'micro-batches')} per optimiser step",
+            f"{_plural(settings.gradient_accumulation, 'micro-batch', 'micro-batches')} per optimizer step",
         ]
     ) + f" — {budget_changes_line(settings)}"
 

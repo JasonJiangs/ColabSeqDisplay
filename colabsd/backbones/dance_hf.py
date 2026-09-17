@@ -9,7 +9,7 @@ HuggingFace loading and the pooling path are ours.
 What is worth pooling differs between the two, and this is the trap:
 
 * SeqDance  — `feature="res_emb"`, the 480-dim hidden states of an ESM2-35M that
-  was re-initialised and retrained from scratch on dynamics.
+  was re-initialized and retrained from scratch on dynamics.
 * ESMDance  — `feature="res_pred"`, the **50-dim** output of `res_pred_nn`, the
   predicted per-residue dynamics properties. Its trunk is the frozen pretrained
   ESM2-35M, so the hidden states hold nothing that ESM2-35M does not already

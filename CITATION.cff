@@ -15,7 +15,7 @@
 # shape below), then paste the concept DOI into both fields and set the date.
 #
 # `version:` must stay equal to the version in pyproject.toml and colabsd/__init__.py.
-# `license:` must stay equal to the licence in LICENSE and pyproject.toml.
+# `license:` must stay equal to the license in LICENSE and pyproject.toml.
 
 cff-version: 1.2.0
 message: "If you use ColabSeqDisplay in your research, please cite it using the metadata in this file."

@@ -191,7 +191,7 @@ def upload_cancelled_text(what: str) -> str:
 def archive_kind(names: Sequence[str]) -> str:
     """What a zip's member list says the zip is: `model_bundle`, `performance_report`, `unknown`.
 
-    Compared on base names so a zip that nests its files under a folder is still recognised,
+    Compared on base names so a zip that nests its files under a folder is still recognized,
     which is what a user who unzipped and rezipped one hands over.
     """
     found = {PurePosixPath(str(name)).name.lower() for name in names if not str(name).endswith("/")}
@@ -614,7 +614,7 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "unlocked_repeatedly",
                 "warning",
                 f"This bundle's test set was unlocked **{facts.unlock_count} times**, so it is no longer "
-                "held out. Treat its reported numbers as optimistic.",
+                "held out. Treat its reported numbers as optimiztic.",
             )
         )
     if not facts.has_label_scaler:
@@ -707,7 +707,7 @@ def _row(label: str, value: str) -> str:
 
 def bundle_html(facts: BundleFacts) -> str:
     """What is in this bundle, in full, before anything is scored."""
-    # Only the answers worth arguing with are coloured; the rest inherits the notebook theme.
+    # Only the answers worth arguing with are colored; the rest inherits the notebook theme.
     status_color = theme.SEVERITY_COLOR["stop"] if facts.is_provisional else "inherit"
     unlock_color = theme.SEVERITY_COLOR["stop"] if facts.unlock_count == 0 else "inherit"
     readout = (

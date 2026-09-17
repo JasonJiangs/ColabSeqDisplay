@@ -30,7 +30,7 @@ PROVISIONAL = "provisional"
 #: The filename suffix of every reachable entry, `<model>_<ENTRY_SUFFIX>.yaml`. It is a fact
 #: about the files on disk, not a choice offered to anyone: the pipeline averages the
 #: embeddings at the mutated sites, so this is the only half of the directory that is read.
-#: It is the same label the engine records in every artefact, `colabsd.engine.pooling.
+#: It is the same label the engine records in every artifact, `colabsd.engine.pooling.
 #: POOLING_NAME`; `tests/test_bestconfig.py` asserts the two stay identical.
 ENTRY_SUFFIX = "mutation_site_mean"
 
@@ -58,13 +58,13 @@ BUDGET_FIELDS: tuple[str, ...] = (
 )
 
 #: What each budget field does, short enough for a form label or an error message. The two batch
-#: sizes are the thing a user gets wrong -- one is memory, the other is optimisation -- and this
+#: sizes are the thing a user gets wrong -- one is memory, the other is optimization -- and this
 #: is the one place the difference is written down, so every refusal and every panel repeats it
 #: in the same words.
 BUDGET_MEANINGS: dict[str, str] = {
     "max_epochs": "how many passes over the training set",
     "early_stopping_patience": "how many epochs without improvement before the run stops",
-    "effective_batch_size": "how many sequences one optimiser step averages over (optimisation)",
+    "effective_batch_size": "how many sequences one optimizer step averages over (optimization)",
     "micro_batch_size": "how many sequences go on the GPU at once (memory)",
 }
 
@@ -165,7 +165,7 @@ class BudgetSettings:
     `looked_up` is what the registry entry said, so a reader six months later can see both
     numbers; `chosen` names the fields the user set, whether or not they landed on the same
     value. `gradient_accumulation` is derived, never set: it is how many micro-batches make
-    up one optimiser step.
+    up one optimizer step.
     """
 
     max_epochs: int
@@ -308,7 +308,7 @@ def resolve_budget(
         early_stopping_patience=patience,
         effective_batch_size=effective,
         micro_batch_size=micro,
-        # How many micro-batches make one optimiser step, rounded up exactly as the trainer does.
+        # How many micro-batches make one optimizer step, rounded up exactly as the trainer does.
         gradient_accumulation=max(1, math.ceil(effective / micro)),
         chosen=user.chosen,
         looked_up=looked_up,

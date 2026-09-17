@@ -2,7 +2,7 @@
 
 ESM-C has no `transformers` port, so this is the one adapter that does not load
 its weights with `AutoModel`: the SDK names `esmc_300m` / `esmc_600m` resolve to
-the licence-gated HuggingFace repos `EvolutionaryScale/esmc-300m-2024-12` and
+the license-gated HuggingFace repos `EvolutionaryScale/esmc-300m-2024-12` and
 `EvolutionaryScale/esmc-600m-2024-12`. The SDK is imported lazily and a missing
 install raises an actionable error — note that the forbidden `fair-esm` package
 installs a *different* module under the same `esm` name, so "already installed"
@@ -122,7 +122,7 @@ class ESMCAdapter(HFAdapterBase):
         except OSError as exc:
             raise BackboneError(
                 f"Could not fetch the ESM-C weights for '{self.model_name}' ({self.hf_id}): {exc}. "
-                "The EvolutionaryScale repos are licence-gated: accept the licence on huggingface.co, run "
+                "The EvolutionaryScale repos are license-gated: accept the license on huggingface.co, run "
                 "`huggingface-cli login` in this runtime, then retry."
             ) from exc
         self._require_plain_attention(model)

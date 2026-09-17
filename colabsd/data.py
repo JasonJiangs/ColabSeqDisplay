@@ -326,7 +326,7 @@ def _require_columns(
 
 
 def _mangled_hint(frame: pd.DataFrame, missing: list[str]) -> str:
-    """Name the pandas duplicate-mangling artefacts, which is what a missing column usually is."""
+    """Name the pandas duplicate-mangling artifacts, which is what a missing column usually is."""
     labels = [str(label) for label in frame.columns]
     mangled = [label for label in labels for name in missing if label.startswith(f"{name}.") and label[-1].isdigit()]
     if not mangled:

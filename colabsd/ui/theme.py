@@ -6,7 +6,7 @@ deliberately no more.
 
 * `heading` — where you are in the form.
 * `note` — one or two sentences of plain language, aimed at a biologist.
-* `message(text, severity)` — inline and contextual, coloured by what ignoring
+* `message(text, severity)` — inline and contextual, colored by what ignoring
   it costs:
 
   ``info``
@@ -125,15 +125,15 @@ def heading_html(text: str, level: int = 3) -> str:
 
 
 def note_html(text: str) -> str:
-    """An explanation aimed at a biologist: quieter than the form, never grey-on-grey.
+    """An explanation aimed at a biologist: quieter than the form, never gray-on-gray.
 
-    `opacity` rather than a fixed grey, so it stays legible on the dark theme too.
+    `opacity` rather than a fixed gray, so it stays legible on the dark theme too.
     """
     return f'<div style="opacity:0.85;line-height:1.45;margin:2px 0 8px 0">{render_markdown(text)}</div>'
 
 
 def message_html(text: str, severity: str = "info") -> str:
-    """One contextual message, coloured and labelled by what ignoring it costs."""
+    """One contextual message, colored and labelled by what ignoring it costs."""
     check_severity(severity)
     color = SEVERITY_COLOR[severity]
     label = f"{SEVERITY_ICON[severity]} {SEVERITY_LABEL[severity]}:"

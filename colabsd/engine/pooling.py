@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
-#: The name every artefact records for this pooling: the `config/best/` filename
+#: The name every artifact records for this pooling: the `config/best/` filename
 #: suffix, `training.pooling` in a run config, and `pooling` in a bundle manifest.
 #: It is a label, not a choice -- there is one strategy.
 POOLING_NAME = "mutation_site_mean"

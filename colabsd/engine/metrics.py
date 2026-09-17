@@ -14,7 +14,7 @@ original whenever that checkout is present.
 
 Changed while copying: upstream names the first four unnamed targets after the four 5NNK
 PAMs through a module-private ``INDEX2PAM`` table, which surprises anyone whose conditions
-are not SlugCas9 PAMs. The behaviour is unchanged, but the table is now the public,
+are not SlugCas9 PAMs. The behavior is unchanged, but the table is now the public,
 documented ``DEFAULT_TARGET_NAMES`` and the naming rule is the public
 ``default_target_names``.
 """
