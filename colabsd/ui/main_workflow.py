@@ -8,8 +8,9 @@ browser.
 `WizardState`, the field-visibility rules, the contextual messages, runtime detection and
 the thin ipywidgets wrappers. This module owns what is specific to training: turning the
 form into a `LibrarySpec`, assembling the exact call into `colabsd.train.finetune`,
-presenting the looked-up hyperparameters, and the outlets that only exist once something
-has been trained — the results, the two exports, and a scored table.
+presenting the looked-up hyperparameters, drawing what the run is doing while it does it,
+and the outlets that only exist once something has been trained — the results, the two
+exports, and a scored table.
 
 **Preparation is part of this page.** It used to be a notebook of its own, which meant the
 backbone question — the one whose answer decides everything else — was asked twice, with a
@@ -39,12 +40,14 @@ Two deliberate differences from the ColabPLM notebooks we are otherwise copying:
 from __future__ import annotations
 
 import hashlib
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
 from typing import Any
 
+from colabsd import curves
 from colabsd.backbones.registry import BACKBONES
 from colabsd.spec import LibrarySpec
 from colabsd.ui import core, exports, theme
@@ -125,7 +128,11 @@ SECTION_NOTES: dict[str, str] = {
         "LoRA adapters on the attention projections plus a small head; the backbone stays frozen. Each run "
         "trains on the training split and early-stops on validation. **Validation numbers only** come back: "
         "the test partition is moved out of reach as each run finishes, and only the last cell of this "
-        "notebook can open it, which counts every unlock."
+        "notebook can open it, which counts every unlock.\n\n"
+        "While it trains, the loss and the validation score are drawn under the progress line and redrawn "
+        "every few seconds, with the loss of each batch inside the epoch under way overlaid faintly — so a "
+        "run that is not converging says so before its first epoch closes. They are the same two curves the "
+        "performance archive keeps as `training_curve.png`."
     ),
     "results": (
         "What the fine-tuned model scored on the **validation** partition of every run: the macro average "
@@ -426,6 +433,23 @@ PROGRESS_ROW_HEIGHT = "1.6em"
 PROGRESS_STYLE = (
     "font-family:monospace;font-variant-numeric:tabular-nums;white-space:nowrap;"
     f"overflow:hidden;text-overflow:ellipsis;height:{PROGRESS_ROW_HEIGHT};line-height:{PROGRESS_ROW_HEIGHT}"
+)
+
+#: How wide the live training curve is drawn on the page. The figure itself is 10 x 6.6 inches
+#: whatever the dpi (`colabsd.curves.build_curve_figure`), so this is the browser scaling one
+#: fixed picture rather than a second size the figure has to be drawn at: the screen and
+#: `training_curve.png` stay the same drawing. 760 px is a little under the width Colab gives
+#: an output cell, so the image never becomes the thing that makes the page scroll sideways.
+CURVE_IMAGE_WIDTH_PX = 760
+
+#: What the log says when the *last* redraw of a run -- the one drawn after `finetune` has
+#: already returned -- would not draw. The cause is appended to it. Every redraw *during* the
+#: run is guarded by `finetune` itself and warns in `colabsd.train`'s words instead; this
+#: sentence exists because by the time it is drawn there is no `finetune` left to do it.
+CURVE_FAILURE_WARNING = (
+    "The finished run could not be redrawn in the panel, so the curve above stops a little "
+    "short of the last epoch. The run itself is unaffected: the complete curves are in the "
+    "performance report as training_curve.png."
 )
 
 
@@ -908,6 +932,7 @@ def finetune_kwargs(
     best: Any,
     splits: dict[int, dict[str, list[int]]],
     progress: Callable[[int, int, str], None] | None = None,
+    on_event: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     """Exactly the call `colabsd.train.finetune` is about to receive.
 
@@ -916,6 +941,12 @@ def finetune_kwargs(
     ran with on the `RunResult`, and `colabsd.bundle` and `colabsd.ui.exports` write that
     record into the manifest and the performance archive. So the numbers on the form are the
     numbers that train and the numbers that are reported, through one object rather than three.
+
+    `progress` and `on_event` are the same two moments twice: a formatted line for the text row
+    and `colabsd.train.TrainingEvent` numbers for the figure. Both keys are always in the dict,
+    `None` included, because this function is the one place that says what a training press is
+    and a caller that silently trained without one of its two outputs would be a run whose
+    panel had gone quiet for no visible reason.
     """
     _, model_seeds = training_seeds(state, best)
     return {
@@ -929,6 +960,7 @@ def finetune_kwargs(
         "model_seeds": model_seeds,
         "budget": training_budget(state).overrides(),
         "progress": progress,
+        "on_event": on_event,
         "resume": bool(state.get("resume_finished_runs")),
     }
 
@@ -1579,6 +1611,15 @@ class MainWizard:
         self.trained_spec: LibrarySpec | None = None
         self.scores: Any = None
         self.plan: core.Plan | None = None
+        #: Everything the run under way has reported, in the shape the figure is drawn from.
+        #: It survives a whole training press -- all nine runs of a 3 x 3 evaluation -- and is
+        #: emptied only when the next press starts, so the picture accumulates the grid
+        #: instead of forgetting eight-ninths of it.
+        self.live = curves.LiveCurveState()
+        #: The two clocks `colabsd.curves.should_redraw` decides from, both `time.time()`.
+        #: `_curve_drawn_at` at 0.0 means nothing has been drawn for this press yet.
+        self._curve_started_at = 0.0
+        self._curve_drawn_at = 0.0
 
         self._build()
         self.refresh()
@@ -1822,10 +1863,20 @@ class MainWizard:
         # Reserved before anything is trained: the first progress line then appears in space
         # that is already there rather than pushing the log below it down the page.
         self.progress.layout.min_height = PROGRESS_ROW_HEIGHT
+        # One image for the whole session, built empty and hidden. `display:none` rather than
+        # a reserved row like the progress line above: the figure is 470 px tall, and a page
+        # that opened on half a screen of nothing would be a page that looks broken before it
+        # has been asked to do anything. It appears at the first redraw, roughly three seconds
+        # into a run, when there is finally something in it.
+        self.curve = self.w.Image(value=b"", format="png")
+        self.curve.layout.width = f"{CURVE_IMAGE_WIDTH_PX}px"
+        self.curve.layout.max_width = "100%"
+        core.set_display(self.curve, False)
         self._layout["run"] = [
             self.boards["run"].widget,
             self.fields["run_button"],
             self.progress,
+            self.curve,
             self.logs["run"],
         ]
 
@@ -2146,12 +2197,32 @@ class MainWizard:
     # -- refresh -----------------------------------------------------------------------
 
     def refresh(self) -> core.Plan:
-        """Re-apply every decision to the widgets. The only place `layout.display` is set."""
+        """Re-apply every decision to the widgets: the one place a *form* decides what is shown.
+
+        The live training curve is nearly the exception: it shows itself from `_draw_curve`,
+        because a refresh fires on every keystroke and that is not a rate at which a page should
+        decide anything about a run already under way. But it may not *outlive* the run it
+        describes. The results table and both exports disappear the moment the form stops
+        matching the run on screen; a curve left behind at full size under a hidden results
+        section is that run's picture presented as this form's.
+        """
         self._refreshing = True
         try:
             return self._refresh()
         finally:
             self._refreshing = False
+            self._hide_stale_curve()
+
+    def _hide_stale_curve(self) -> None:
+        """Take the curve off the page once its run no longer describes the form.
+
+        Hidden rather than blanked: the bytes stay, so going back to the settings that produced
+        it brings the same picture back without redrawing anything.
+        """
+        if not self.curve.value:
+            return
+        finished = bool(self.state.get("trained"))
+        core.set_display(self.curve, not finished or has_results(self.state))
 
     def _refresh(self) -> core.Plan:
         status = self._config_status()
@@ -2284,6 +2355,109 @@ class MainWizard:
         """
         self.progress.value = progress_html(done, total, label)
 
+    # -- the live training curve -------------------------------------------------------
+    #
+    # The progress line above says *that* the run is alive; these three say *how*. They are
+    # the same two moments -- an epoch closing, a batch passing -- arriving a second time as
+    # numbers instead of a sentence, because a sentence cannot be plotted and the label the
+    # line is built from is asserted character for character by the tests above.
+    #
+    # Everything expensive is somewhere else on purpose. `colabsd.curves.LiveCurveState` holds
+    # the points, `should_redraw` holds the timing policy as arithmetic over four floats, and
+    # `live_curve_png` holds matplotlib; this module never imports it, never owns a figure and
+    # so cannot leak one. What is left here is a widget assignment and an `if`.
+
+    def _curve_label(self) -> str:
+        """The backbone the live figure is titled with, and the archive's own title for it.
+
+        `colabsd.ui.exports` titles `training_curve.png` with the finished run's
+        `adapter_name`, which `colabsd.train` builds from exactly these two objects. Computing
+        it the same way here is what stops the picture on screen and the picture in the archive
+        from disagreeing about which model a reader is looking at -- while the run is still
+        going there is no `RunResult` to ask.
+        """
+        return str(getattr(self.adapter, "model_name", None) or getattr(self.best, "model", "") or "")
+
+    def _curve_event(self, event: Any) -> None:
+        """`colabsd.train.finetune`'s numeric channel: record it, redraw if it is worth it.
+
+        Three lines with no arithmetic in them, which is the point of `should_redraw` being a
+        pure function elsewhere: the policy is tested against a table of times, and the handler
+        that fires several times a second inside the training loop has nothing in it to get
+        wrong. `record` answers whether the drawing would even change -- a decimated batch
+        point changes nothing, and redrawing for one is 200 ms of the user's GPU hour spent on
+        an identical picture.
+
+        It does not catch. `finetune` guards this callback: the first exception ends the event
+        stream for the rest of the run, adds one line to `RunResult.warnings` and lets the
+        training finish. Catching here as well would turn a figure that cannot be drawn into a
+        figure that silently stopped updating, which nobody would ever report.
+        """
+        changed = self.live.record(event)
+        now = time.time()
+        if curves.should_redraw(
+            now=now, started_at=self._curve_started_at, last_drawn_at=self._curve_drawn_at, changed=changed
+        ):
+            self._draw_curve(now)
+
+    def _draw_curve(self, now: float | None = None) -> None:
+        """One redraw, unconditionally: the caller has already decided it is time.
+
+        `.value` is replaced. Not `display(fig)`, not `plt.show()`, not `clear_output` and
+        display: those append an image to the cell's output every time, so a forty-minute run
+        would end with seventy pictures of the same curve in the page and all seventy saved
+        into the `.ipynb`. Replacing the bytes of one widget leaves exactly one image of about
+        50 KB however many times it is redrawn.
+        """
+        self.curve.value = curves.live_curve_png(self.live, model_label=self._curve_label())
+        core.set_display(self.curve, True)
+        self._curve_drawn_at = time.time() if now is None else now
+
+    def _finish_curve(self) -> None:
+        """The last redraw of a press, drawn after the run has stopped -- however it stopped.
+
+        Throttled redraws stop wherever the last interval happened to fall, which on a long run
+        is up to a minute before the final epoch. Without this the picture left on the page
+        would be missing the end of the run it describes, and a reader comparing it with
+        `training_curve.png` in the archive would find two different stories about one run. It
+        runs after an interruption too, so a stopped run leaves behind the evidence that made
+        somebody stop it.
+
+        The `except` here is not a second guard on `finetune`'s path -- it is the only guard on
+        this one. `finetune` has returned by now, so a figure that will not draw would come out
+        of `on_train` and be reported by `_guard` as **That did not work**: a finished run,
+        with its weights on disk, presented to the user as a failed one.
+        """
+        try:
+            # From the run itself, not from the points this press happened to see. A press with
+            # *Reuse finished runs* ticked trains nothing, so no event ever fires, and the live
+            # state stays empty -- which used to blank the picture of the very run being
+            # reported. A partly-resumed 3 x 3 press was worse: it drew the one run it retrained
+            # under a title that reads as all nine. `curve_frame` reads every run's own
+            # `training_log.json` off disk, cached or not, and it is the same function the
+            # archive's `training_curve.png` is built from, so the page and the file cannot
+            # come out of a press telling two stories.
+            if self._draw_curve_from_run():
+                return
+            if self.live.has_points:
+                self._draw_curve()
+        except Exception as exc:  # noqa: BLE001 - the picture is the convenience, the model is the point
+            self.logs["run"].value += theme.message_html(
+                f"{CURVE_FAILURE_WARNING} ({type(exc).__name__}: {exc})", "warning"
+            )
+
+    def _draw_curve_from_run(self) -> bool:
+        """Redraw from the finished `RunResult`; False when it has no logs to read."""
+        if self.run is None:
+            return False
+        frame = curves.curve_frame(self.run)
+        if not len(frame):
+            return False
+        figure = curves.build_curve_figure(frame, model_label=self._curve_label())
+        self.curve.value = curves.figure_png(figure)
+        core.set_display(self.curve, True)
+        return True
+
     def _say(self, section: str, text: str) -> None:
         self.logs[section].value = theme.note_html(text)
 
@@ -2385,18 +2559,32 @@ class MainWizard:
         self.splits = self.backend.make_splits(
             len(self.sequences), split_seeds, split_dir(self.state, len(self.sequences))
         )
-        self.run = self.backend.finetune(
-            **finetune_kwargs(
-                self.state,
-                spec=self.spec,
-                sequences=self.sequences,
-                targets=self.targets,
-                adapter=self.adapter,
-                best=self.best,
-                splits=self.splits,
-                progress=self._progress,
+        # A press, not a run: the nine runs of a 3 x 3 evaluation draw into one accumulating
+        # figure, and only the next press empties it. Blanked and hidden first so that what is
+        # on the page always belongs to the run that is happening now -- the previous press's
+        # curve left on screen under a fresh progress line would be read as this one's.
+        self.live.reset()
+        self.curve.value = b""
+        core.set_display(self.curve, False)
+        self._curve_started_at, self._curve_drawn_at = time.time(), 0.0
+        try:
+            self.run = self.backend.finetune(
+                **finetune_kwargs(
+                    self.state,
+                    spec=self.spec,
+                    sequences=self.sequences,
+                    targets=self.targets,
+                    adapter=self.adapter,
+                    best=self.best,
+                    splits=self.splits,
+                    progress=self._progress,
+                    on_event=self._curve_event,
+                )
             )
-        )
+        finally:
+            # In a `finally` because a run stopped half way is exactly when its curve is worth
+            # looking at: the stop button leaves the picture that explains the press.
+            self._finish_curve()
         # Freeze what this run actually was. `self.best` follows the dropdown; the bundle
         # must not, or it records one backbone's hyperparameters beside another's weights.
         self.trained_best, self.trained_spec = self.best, self.spec

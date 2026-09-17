@@ -49,8 +49,8 @@ not a benchmark.
 
 Everything is seconds except the setup cell (a minute or two, most of it installing) and **step 6,
 training — an estimated 1 min on a T4 for the default backbone**. Step 6 says which batch of which
-epoch it is on while it trains, and reports the measured elapsed minutes at the end; that number is
-yours.
+epoch it is on while it trains, draws the loss and the validation score underneath as they arrive,
+and reports the measured elapsed minutes at the end; that number is yours.
 
 ### Step 1 — check the four lines it prints
 
@@ -121,7 +121,7 @@ and unlocking**, or you end up with two archives instead of one updated file.
 
 **Step 6 trains,** and the line under the button says what it is doing while it does it: `0/1 runs
 finished · run 1/1 · epoch 3/20 · batch 412/1643 · loss 0.183 · 2m14s`. It is rewritten a few times
-a second at most — a large library runs a thousand micro-batches to the epoch, and a redraw for
+a second at most — a large library runs a thousand micro-batches to the epoch, and a rewrite for
 every one of them would slow the run it is reporting on. The fraction on the left counts **finished
 runs**, so it holds still for the whole of a single run; everything after it belongs to the run in
 flight, and when an epoch closes the batch count gives way to that epoch's validation score
@@ -134,6 +134,25 @@ never reused as a finished one, so Train retrains it and moves its weights aside
 from it (its HuggingFace id, its dtype and, for SaProt, the wild-type 3Di string), hyperparameters,
 the three budget boxes, mutated sites, split, and a hash of your data. Fetch a better structure,
 re-derive the 3Di and press Train and you get a new run rather than the old structure's numbers.
+
+**A figure appears under that line with the first batch report** — at least three seconds after
+the press, and otherwise as soon as there is a point to plot, so it arrives at the end of that
+quiet stretch rather than during it. It is redrawn as the run proceeds: training loss (MSE) on top,
+validation Spearman below, one line per run, with a sample of the batch losses overlaid faintly on
+the loss panel, spread across the whole run — so a run that is not converging says so before its
+first epoch closes, rather than only at the end of it. The sample is capped so the panel stays
+readable: a twenty-epoch run at a hundred batches an epoch sends two thousand losses and plots
+about a hundred and twenty. Redraws are at least twelve seconds apart, stretching to at most
+one a minute as the run goes on, because each one costs roughly a tenth to a fifth of a second of
+the GPU hour you are paying for and the news in a curve thins out.
+
+**The output does not fill up with pictures.** It is one image whose bytes are replaced, not a
+new image per redraw: a forty-minute run redraws it about seventy times and the output still holds
+exactly one. It is the same figure as `training_curve.png` in the performance archive, drawn
+by the same function from the same numbers, so a screenshot of the panel and the file cannot tell
+two stories about one run — and because it is redrawn once more after the run ends however it
+ended, a run you stopped by hand still leaves behind the picture that made you stop it. If the
+figure cannot be drawn at all, the run keeps going and says in the log why it lost its picture.
 
 ### Step 7 — what came back
 
@@ -180,7 +199,7 @@ it; and it needs the training checkpoint on disk, so export before you clear `co
 | `report.png` | the chosen metric per condition, every tracked metric averaged over them, error bars ±1 sd across runs, a title naming the partition and a badge giving the unlock count; the footer gains a line for a run that was stopped early (*STOPPED EARLY BY HAND: split1_seed11 (2 of 20 epochs) — these are that shortened run's numbers*) and carries none when nobody stopped one |
 | `report.json` | `unlock_count`, `unlock_source`, `shown_partition`, `reported_partitions`, `n_runs`, `sources`, and `runs_stopped_early` — one entry per run you stopped by hand, with the epochs it trained and the epochs it was given |
 | `performance.json` | the manifest: partition, unlock count and verdict, model, hyperparameter status, the `training_budget` the run was given and which of it you set, conditions, runs, seeds, `colabsd` version, your notes |
-| `training_curve.png` | training loss (MSE) and validation Spearman against epoch, one line per run, with the epoch each run kept circled |
+| `training_curve.png` | training loss (MSE) and validation Spearman against epoch, one line per run, with the epoch each run kept circled — the figure step 6 drew while it trained |
 | `training_curve.csv` | every point that figure plots — `split_seed`, `model_seed`, `epoch`, `train_loss_mse`, `val_spearman`, `is_best` — so it can be checked or redrawn |
 | `README.txt` | the same answers in prose, for whoever opens the zip and will not read JSON |
 

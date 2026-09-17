@@ -37,6 +37,15 @@ obeyed by both the writer and the reader:
   `stopped_early`, `epochs_run` and `epochs_budget`, so `run_result.json`,
   `validation_runs.csv`, the report and the bundle manifest can all say "2 of 20 epochs"
   rather than publishing the budget as though it had been spent.
+
+Watching a run while it trains
+------------------------------
+Two callbacks, both optional, both fed from the same throttle and never from different
+numbers. `progress(done, total, label)` is the sentence a notebook prints; `on_event` is a
+`TrainingEvent` -- the same epoch close or batch tick with its numbers still numbers, for a
+caller that draws them (`colabsd.curves`). Neither is constructed when it was not asked for,
+so a run that passes neither trains exactly what it always did, and an `on_event` that raises
+costs the run its picture and nothing else.
 """
 
 from __future__ import annotations
@@ -85,6 +94,62 @@ LOCKED_WARNING = "Locked test partition. Read it through colabsd.train.unlock_te
 PROGRESS_MIN_INTERVAL_S = 0.25
 
 ProgressFn = Callable[[int, int, str], None]
+
+
+@dataclass(frozen=True)
+class TrainingEvent:
+    """One moment of a run, as numbers rather than as a sentence.
+
+    `progress(done, total, label)` says the same two things in words. A panel that wants to
+    *draw* what is happening cannot get them back out of that label -- which is asserted
+    character for character by the tests, so it cannot be widened either -- so this is a
+    second channel carrying the same two moments undigested. The channel is off unless it is
+    asked for: a caller that passes no `on_event` constructs none of these.
+
+    `kind` is `"epoch"` when an epoch has closed and `"batch"` while one is running. An epoch
+    event carries `score`, the validation number that epoch is kept or discarded on, and no
+    `step`; a batch event carries `step` and `n_batches` and no `score`.
+
+    Numbering follows the engine rather than the progress line. `epoch` is **0-based**, the
+    same number `training_log.json` records and `colabsd.curves.curve_frame` puts in its
+    `epoch` column, while the text line prints `epoch + 1`. `step` is the 1-based micro-batch,
+    so `step == n_batches` is the last batch of the epoch -- and because the engine's batch
+    loss is the epoch's running mean MSE, that last batch's `loss` *is* the epoch's
+    `train_loss`. A batch point drawn at `epoch - 1 + step / n_batches` therefore lands exactly
+    on that epoch's own marker when `step == n_batches`, on the same 0-based axis `curve_frame`
+    uses, and the first epoch's points span the width of one epoch before it closes.
+
+    `loss` is training MSE either way, `metric` names the validation metric `score` is measured
+    in (`RunResult.selection_metric`, e.g. `"Spearman"`), `run_index` is the 0-based index of
+    the run under way among `n_runs`, and `elapsed_s` is seconds since this run started -- the
+    clock the text line's `2m14s` is formatted from.
+    """
+
+    kind: str
+    run_index: int
+    n_runs: int
+    split_seed: int
+    model_seed: int
+    epoch: int
+    max_epochs: int
+    loss: float
+    metric: str
+    score: float | None = None
+    step: int | None = None
+    n_batches: int | None = None
+    elapsed_s: float = 0.0
+
+
+EventFn = Callable[[TrainingEvent], None]
+
+#: What `RunResult.warnings` -- and so the panel's log -- says when `on_event` raised. The
+#: cause is appended to it. Training is unaffected: the picture is the convenience, the model
+#: is the point.
+EVENT_FAILURE_WARNING = (
+    "The live training curve stopped updating because the callback watching this run raised. "
+    "Training itself was unaffected and the run finished normally; the same curves are in the "
+    "performance report as training_curve.png."
+)
 
 
 @dataclass
@@ -215,6 +280,7 @@ def finetune(
     model_seeds: Sequence[int] | None = None,
     budget: BudgetOverrides | dict[str, Any] | None = None,
     progress: ProgressFn | None = None,
+    on_event: EventFn | None = None,
     config: dict[str, Any] | None = None,
     resume: bool = True,
 ) -> RunResult:
@@ -225,6 +291,14 @@ def finetune(
     as a `colabsd.bestconfig.BudgetOverrides` or the same fields as a mapping. Anything left
     out keeps the looked-up value, and no other hyperparameter can be set this way. The result
     carries `budget`, which says what ran and which of it was the user's.
+
+    `on_event` is the same two moments `progress` reports -- an epoch closing, a batch
+    passing -- handed over as `TrainingEvent` numbers instead of a formatted line, for a caller
+    that draws them rather than printing them (`colabsd.curves`). It fires on the same throttle
+    as the text line and just after it, so a slow watcher cannot hold up the line that says the
+    run is alive. It is guarded: the first exception it raises ends the event stream for the
+    rest of this call and adds a `RunResult.warnings` line, never the run. A run that `resume`
+    reuses trains nothing and so reports nothing; its curve is in its `training_log.json`.
 
     `config` overrides the runtime config that would otherwise be built through
     `colabsd.protein_db`; `resume` reuses a *finished* run only when its fingerprint --
@@ -283,6 +357,9 @@ def finetune(
     rows: list[dict[str, Any]] = []
     run_dirs: list[Path] = []
     notes: list[str] = []
+    # One guard for the whole call, not one per run and not one per layer below this: a
+    # watcher that raised once will raise again on every event for the rest of the job.
+    watcher = _EventGuard(on_event)
     started = time.time()
     try:
         for split_seed in split_seeds:
@@ -318,7 +395,16 @@ def finetune(
                     _lock_interrupted_artifacts(run_dir, locked_dir / name, condition_columns)
                     notes.extend(_preserve_unfinished_checkpoint(run_dir, name))
                     t0 = time.time()
-                    on_epoch, on_batch = _run_reporters(progress, len(rows), total, t0)
+                    on_epoch, on_batch = _run_reporters(
+                        progress,
+                        len(rows),
+                        total,
+                        t0,
+                        on_event=watcher.sink(),
+                        split_seed=split_seed,
+                        model_seed=model_seed,
+                        metric=selection_metric,
+                    )
                     metrics = train_eval_config(
                         adapter=adapter,
                         sequences=sequences,
@@ -359,6 +445,7 @@ def finetune(
                 run_dirs.append(run_dir)
                 _notify(progress, len(rows), total, name)
 
+        notes.extend(watcher.warnings)
         aggregate = _aggregate(rows, condition_columns, partition="validation")
         result = RunResult(
             model_name=str(best.model),
@@ -1274,6 +1361,42 @@ def _pooled_positions(adapter: Any, spec: LibrarySpec, config: dict[str, Any]) -
     return expected
 
 
+class _EventGuard:
+    """`on_event`, wrapped so that a picture which will not draw cannot end a run.
+
+    Drawing one is matplotlib, a comm channel and a widget, in a notebook on somebody else's
+    machine: it can fail for reasons this package will never see, and none of them are worth an
+    hour of GPU time. The first exception ends the event stream for the rest of the `finetune`
+    call -- a watcher that raised once raises again every few seconds for the next forty
+    minutes -- and leaves one line in `RunResult.warnings` saying the curve stopped and the
+    training did not.
+
+    `Exception`, never `BaseException`: Colab's stop button arrives as a `KeyboardInterrupt`,
+    and one pressed while a redraw is on screen must still stop the run.
+    """
+
+    def __init__(self, on_event: EventFn | None) -> None:
+        self._on_event = on_event
+        self.warnings: list[str] = []
+
+    def sink(self) -> EventFn | None:
+        """Itself while there is still somebody to send to; None once there is not.
+
+        Read once per run, so a run that starts after the watcher broke builds the text-line
+        reporters alone and constructs no events at all.
+        """
+        return self if self._on_event is not None else None
+
+    def __call__(self, event: TrainingEvent) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event)
+        except Exception as exc:
+            self._on_event = None
+            self.warnings.append(f"{EVENT_FAILURE_WARNING} ({type(exc).__name__}: {exc})")
+
+
 def _elapsed(seconds: float) -> str:
     """`6m12s`, so a reader can tell a slow run from a stopped one."""
     minutes, secs = divmod(int(seconds), 60)
@@ -1285,6 +1408,11 @@ def _run_reporters(
     done: int,
     total: int,
     started: float,
+    *,
+    on_event: EventFn | None = None,
+    split_seed: int = 0,
+    model_seed: int = 0,
+    metric: str = "",
 ) -> tuple[EpochProgress | None, BatchProgress | None]:
     """Build the `(on_epoch, on_batch)` pair that turns one run's training into panel lines.
 
@@ -1297,27 +1425,56 @@ def _run_reporters(
     Batch lines are throttled to one per `PROGRESS_MIN_INTERVAL_S`, except the last batch of an
     epoch, which is always sent. A count that freezes at `batch 1600/1643` is what makes a
     working run look hung, which is the whole reason these lines exist.
+
+    `on_event` gets the same two moments as `TrainingEvent` numbers, on that same gate and
+    immediately *after* the line: the event may be a redraw that blocks for a tenth of a
+    second, and the line that says the run is alive should not wait for it. `split_seed`,
+    `model_seed` and `metric` are what the line spells out in words and an event cannot
+    reconstruct -- which run these numbers belong to, and what `score` is measured in.
     """
-    if progress is None:
+    if progress is None and on_event is None:
         return None, None
 
     where = f"run {done + 1}/{total}"
     sent_at = 0.0
 
-    def emit(detail: str) -> None:
+    def emit(detail: str) -> float:
         nonlocal sent_at
         sent_at = time.time()
         _notify(progress, done, total, f"{where} · {detail} · {_elapsed(sent_at - started)}")
+        return sent_at
+
+    def announce(kind: str, epoch: int, max_epochs: int, loss: float, at: float, **fields: Any) -> None:
+        if on_event is None:
+            return
+        on_event(
+            TrainingEvent(
+                kind=kind,
+                run_index=done,
+                n_runs=total,
+                split_seed=int(split_seed),
+                model_seed=int(model_seed),
+                epoch=int(epoch),
+                max_epochs=int(max_epochs),
+                loss=float(loss),
+                metric=metric,
+                elapsed_s=at - started,
+                **fields,
+            )
+        )
 
     def report_epoch(epoch: int, max_epochs: int, score: float, loss: float) -> None:
-        emit(f"epoch {epoch + 1}/{max_epochs} · val {score:.4f} · loss {loss:.3f}")
+        at = emit(f"epoch {epoch + 1}/{max_epochs} · val {score:.4f} · loss {loss:.3f}")
+        announce("epoch", epoch, max_epochs, loss, at, score=float(score))
 
     def report_batch(epoch: int, max_epochs: int, step: int, n_batches: int, loss: float) -> None:
         if step < n_batches and time.time() - sent_at < PROGRESS_MIN_INTERVAL_S:
             return
-        emit(f"epoch {epoch + 1}/{max_epochs} · batch {step}/{n_batches} · loss {loss:.3f}")
+        at = emit(f"epoch {epoch + 1}/{max_epochs} · batch {step}/{n_batches} · loss {loss:.3f}")
+        announce("batch", epoch, max_epochs, loss, at, step=int(step), n_batches=int(n_batches))
 
     return report_epoch, report_batch
+
 
 def _notify(progress: ProgressFn | None, done: int, total: int, label: str) -> None:
     if progress is not None:

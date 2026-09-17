@@ -79,7 +79,8 @@ provenance. No backbone weights
 **`performance_report.zip` — the numbers, and what they are.** `report.csv`, `report.png` and
 `report.json` as `colabsd.report.build_report` writes them, `training_curve.png` and
 `training_curve.csv` — the training loss (MSE) and validation Spearman against epoch, drawn and as
-data, from each run's own per-epoch log — plus `performance.json` for a machine
+data, from each run's own per-epoch log, and the same two curves the panel draws under the
+progress line while the run is going — plus `performance.json` for a machine
 and `README.txt` for a person, generated from one object so they cannot disagree. Both name the
 partition (`partition`, `describes_test_partition`, a badge in `report.png`), the unlock count with
 a sentence saying what it is worth (`unlock.count`, `unlock.source`, `unlock.verdict`), the
