@@ -46,7 +46,7 @@ LORA_PARAMETERS: tuple[str, ...] = (
 
 
 #: The training budget a user may set for themselves, in the order a form shows it. These are
-#: not modelling choices: they are how long the run is allowed to take and what fits on the card
+#: not modeling choices: they are how long the run is allowed to take and what fits on the card
 #: it runs on. Everything else in `LORA_PARAMETERS` stays looked up. `effective_batch_size` lives
 #: in a registry entry's `parameters:` block and the other three in its `training:` block; from a
 #: user's point of view they are one group, so this module resolves them together.

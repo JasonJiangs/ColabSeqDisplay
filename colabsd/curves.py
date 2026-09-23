@@ -18,7 +18,7 @@ tool. `curve_frame` is what both are made of, so they cannot disagree.
 One line per run. A default run is one line; a 3 x 3 evaluation is nine, and the spread between
 them at the same epoch is the thing the aggregate report can only summarize afterwards.
 
-The same two panels are also drawn *during* a run, into the panel's image widget, from events
+The same three panels are also drawn *during* a run, into the panel's image widget, from events
 instead of from files -- `LiveCurveState` accumulates, `live_curve_png` draws, and
 `should_redraw` decides how rarely. It is the same `build_curve_figure` either way, with the
 batch-level loss of the epoch under way overlaid on the loss panel, because a run that is not
@@ -110,11 +110,38 @@ def _as_float(value: Any) -> float:
         return float("nan")
 
 
+def exported_run(run_result: Any) -> tuple[int, int] | None:
+    """The `(split_seed, model_seed)` of the run whose weights a bundle would carry.
+
+    `colabsd.bundle.save_bundle_from_run` exports exactly one run -- `run_result.best_run()`,
+    the highest validation selection score -- and records it in the manifest as `source_run`.
+    The figure draws every run and rings the kept epoch of each, so without this it could only
+    say something true of all of them, and what it said instead ("the weights that were
+    exported") was true of one.
+
+    None when the runs do not say: a hand-built result, or one whose rows carry no score.
+    """
+    records = [
+        record
+        for record in _run_records(run_result)
+        if record.get("split_seed") is not None and record.get("model_seed") is not None
+    ]
+    if not records:
+        return None
+    scored = [record for record in records if record.get("best_validation_score") is not None]
+    if not scored:
+        return None
+    best = max(scored, key=lambda record: record["best_validation_score"])
+    return int(best["split_seed"]), int(best["model_seed"])
+
+
 def curve_frame(run_result: Any) -> pd.DataFrame:
     """Every epoch of every run, tidy: one row per (run, epoch).
 
-    `is_best` marks the epoch each run kept — the one whose weights were exported. Without it a
-    reader of the CSV cannot tell which point on the curve became the model.
+    `is_best` marks the epoch each run kept — the checkpoint that run wrote. Without it a reader
+    of the CSV cannot tell which point on the curve that run settled on. Which run's checkpoint
+    a bundle carries is a separate question, and `exported_run` is what answers it: with several
+    runs there are several rings and only one of them left the working directory.
     """
     import pandas as pd
 
@@ -290,8 +317,9 @@ def build_curve_figure(
     model_label: str = "",
     batch_points: pd.DataFrame | None = None,
     metric_label: str = CURVE_METRIC,
+    source_run: tuple[int, int] | None = None,
 ) -> Figure:
-    """Two stacked panels sharing an epoch axis: MSE on top, validation below.
+    """Three panels side by side on a shared epoch axis: training MSE, validation MSE, validation score.
 
     One function draws both `training_curve.png` and the live figure in the panel, because a
     second drawing function is how a screenshot and the archived file start disagreeing about
@@ -307,6 +335,11 @@ def build_curve_figure(
     A live caller may attach `epoch`, `max_epochs`, `run_index` and `n_runs` to either frame's
     `.attrs`, counted the way the events count them, and the title then says how far along the
     run was. Nothing else reads them and the archive's frames set none.
+
+    `source_run` is the `(split_seed, model_seed)` of the run a bundle built from these numbers
+    carries -- `colabsd.curves.exported_run`. Every run gets a ring, because every run did keep
+    that epoch, but only one of them was exported, and the note used to tell a nine-run reader
+    that all nine sets of weights had been. Left at None the note claims nothing about export.
     """
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -317,7 +350,13 @@ def build_curve_figure(
     # they have to scroll between. Sharing the epoch axis keeps the three at one scale.
     figure = Figure(figsize=(15.0, 4.4))
     FigureCanvasAgg(figure)
-    top, middle, bottom = figure.subplots(1, 3, sharex=True, gridspec_kw={"wspace": 0.22})
+    # Named for what each one draws rather than for where it sits. They were `top`, `middle`
+    # and `bottom` when the figure was a stack, and those names outlived the layout: the
+    # docstrings and comments that explain the figure went on putting the score underneath the
+    # loss, so a reader following the prose looked below for a panel that is to the right of it.
+    loss_panel, val_loss_panel, score_panel = figure.subplots(
+        1, 3, sharex=True, gridspec_kw={"wspace": 0.22}
+    )
 
     live = batch_points is not None and len(batch_points) > 0
     metric_column = f"val_{metric_label.lower()}"
@@ -337,17 +376,17 @@ def build_curve_figure(
         # An epoch axis a reader counts from 1, matching the panel's "epoch 3/20" line. The
         # log counts from 0 because that is the loop variable.
         epochs = part["epoch"] + 1
-        top.plot(epochs, part["train_loss_mse"], color=color, **style)
+        loss_panel.plot(epochs, part["train_loss_mse"], color=color, **style)
         if has_val_loss:
-            middle.plot(epochs, part["val_loss_mse"], color=color, **style)
+            val_loss_panel.plot(epochs, part["val_loss_mse"], color=color, **style)
         if not has_metric:
             continue
-        bottom.plot(epochs, part[metric_column], label=name, color=color, **style)
+        score_panel.plot(epochs, part[metric_column], label=name, color=color, **style)
         kept = part[part["is_best"]]
         if len(kept):
             # The exported epoch, in the line's own color so it reads as part of that curve
             # rather than as a separate series. A heavy black ring did the opposite.
-            bottom.scatter(
+            score_panel.scatter(
                 kept["epoch"] + 1,
                 kept[metric_column],
                 s=58,
@@ -368,7 +407,7 @@ def build_curve_figure(
             # Sparse is the opposite problem -- in the first minute the cloud *is* the figure,
             # twenty points of it, and drawn for the crowded case it was barely there.
             sparse = len(part) < _CLOUD_DENSE_POINTS
-            top.scatter(
+            loss_panel.scatter(
                 part["epoch"] + 1,
                 part["train_loss_mse"],
                 s=7.0 if sparse else 3.4,
@@ -380,7 +419,7 @@ def build_curve_figure(
             head = part.iloc[-1]
             # Where the run had got to at this redraw: the one mark that says the figure is of
             # something still moving rather than of something finished.
-            top.scatter(
+            loss_panel.scatter(
                 [head["epoch"] + 1],
                 [head["train_loss_mse"]],
                 s=22,
@@ -391,24 +430,24 @@ def build_curve_figure(
             )
             if name not in runs:
                 # A run whose first epoch has not closed has no line to put in the legend, and
-                # an unlabelled cloud in a nine-run evaluation belongs to nobody.
-                bottom.plot([], [], label=name, color=color, **style)
+                # an unlabeled cloud in a nine-run evaluation belongs to nobody.
+                score_panel.plot([], [], label=name, color=color, **style)
 
         limits = _loss_limits(frame, batch_points)
         if limits is not None:
             low, high, hidden = limits
-            top.set_ylim(low, high)
+            loss_panel.set_ylim(low, high)
         if not has_metric:
             # Before the first epoch closes there is no validation number in existence. Saying
             # so is the difference between "not yet" and "this run scores zero".
             # ...and the tick labels are dropped with it: an axis ranging -0.04 to 0.04 is a
             # scale invented by the autoscaler for an empty panel, and it reads as data.
-            bottom.set_yticks([])
-            bottom.text(
+            score_panel.set_yticks([])
+            score_panel.text(
                 0.5,
                 0.5,
                 f"validation {metric_label} appears when the first epoch closes",
-                transform=bottom.transAxes,
+                transform=score_panel.transAxes,
                 ha="center",
                 va="center",
                 fontsize=10,
@@ -416,24 +455,24 @@ def build_curve_figure(
             )
 
     if hidden:
-        top.text(
+        loss_panel.text(
             0.995,
             0.96,
             f"{hidden} batch point{'s' if hidden != 1 else ''} above the axis",
-            transform=top.transAxes,
+            transform=loss_panel.transAxes,
             ha="right",
             va="top",
             fontsize=8,
             alpha=0.6,
         )
 
-    top.set_ylabel("training loss (MSE)", fontsize=10.5)
-    middle.set_ylabel("validation loss (MSE)", fontsize=10.5)
+    loss_panel.set_ylabel("training loss (MSE)", fontsize=10.5)
+    val_loss_panel.set_ylabel("validation loss (MSE)", fontsize=10.5)
     if not has_val_loss:
         # A run from before the validation loss was recorded. The panel stays, so the three
         # are always in the same places, and says why it is empty rather than looking broken.
-        middle.text(
-            0.5, 0.5, "not recorded\nfor this run", transform=middle.transAxes,
+        val_loss_panel.text(
+            0.5, 0.5, "not recorded\nfor this run", transform=val_loss_panel.transAxes,
             ha="center", va="center", fontsize=9.5, alpha=0.55,
         )
     title = "Training curves" + (f" — {model_label}" if model_label else "")
@@ -443,11 +482,12 @@ def build_curve_figure(
     progress = _progress_suffix(frame, batch_points)
     figure.suptitle(f"{title} · {progress}" if progress else title, fontsize=12.5, y=0.99)
     # Which panel decides. Side by side, the validation loss sits between the training loss
-    # and the score, and the obvious reading is that the middle one is what early stopping
-    # watches. It is not: the run keeps the epoch with the best validation *score*, and the
-    # loss panels are diagnosis. Saying so on the axis is cheaper than a note nobody reads.
-    bottom.set_ylabel(f"validation {metric_label}  (selects the epoch)", fontsize=10.5)
-    for axis in (top, middle, bottom):
+    # and the score, and the obvious reading is that the panel in the center is what early
+    # stopping watches. It is not: the run keeps the epoch with the best validation *score*,
+    # and the loss panels are diagnosis. Saying so on the axis is cheaper than a note nobody
+    # reads.
+    score_panel.set_ylabel(f"validation {metric_label}  (selects the epoch)", fontsize=10.5)
+    for axis in (loss_panel, val_loss_panel, score_panel):
         # Every panel carries the label: side by side they are three plots a reader scans
         # across, not one stack with a shared foot.
         axis.set_xlabel("epoch", fontsize=10.5)
@@ -466,13 +506,20 @@ def build_curve_figure(
         if len(frame):
             right = max(right, float(frame["epoch"].max()) + 1.0)
         # The pad is what keeps the ring around the newest kept epoch -- which is usually the
-        # rightmost point there is -- from being drawn half outside the axes.
-        bottom.set_xlim(0.0, right + max(0.12, 0.03 * right))
+        # rightmost point there is -- from being drawn half outside the axes. Set on one panel
+        # and true of all three, because `sharex` ties them; the score panel is the one asked
+        # because the ring that needs the room is drawn on it.
+        score_panel.set_xlim(0.0, right + max(0.12, 0.03 * right))
 
     if runs or live:
         # Under the axes, never over the data: nine curves that converge leave no corner free,
         # and a legend that covers the interesting part of a plot is worse than no legend.
-        kept_note = "○ marks the epoch each run kept — the weights that were exported"
+        # What is true of every ring on the figure: each run kept that epoch and wrote that
+        # checkpoint. Which of those checkpoints left the working directory is a different
+        # claim, true of one run, and it is only made when the caller has said which.
+        kept_note = "○ marks the epoch each run kept — the checkpoint that run wrote"
+        if source_run is not None:
+            kept_note += f" · the bundle carries split seed {source_run[0]} / model seed {source_run[1]}"
         if live:
             # A different claim from the archive's, and the difference matters: this ring is
             # the checkpoint on disk at this instant, which the next epoch may replace.
@@ -482,9 +529,14 @@ def build_curve_figure(
             )
         elif progress:
             kept_note = "live · ○ the best epoch so far — the checkpoint on disk now"
-        handles, labels = bottom.get_legend_handles_labels()
+        handles, labels = score_panel.get_legend_handles_labels()
+        # One anchor for both branches. They were positioned independently and drifted: the
+        # legend was moved below the x-labels when the figure became three short panels and
+        # this one was not, so a single-run figure -- the common case -- printed its note
+        # across the center panel's "epoch" label.
+        note_y = -0.02
         if len(handles) < 2:
-            figure.text(0.5, 0.02, kept_note, ha="center", fontsize=8.5, alpha=0.7)
+            figure.text(0.5, note_y, kept_note, ha="center", fontsize=8.5, alpha=0.7)
         else:
             # The note is the legend's title rather than a second floating label: laid out as
             # part of the legend it cannot land on top of it, which is what happened when the
@@ -494,10 +546,7 @@ def build_curve_figure(
                 labels,
                 title=kept_note,
                 loc="upper center",
-                # Below the x-labels, not on top of them. Three panels side by side are much
-                # shorter than the two stacked ones this anchor was chosen for, so 0.055 of the
-                # figure height landed the legend on the middle panel's "epoch".
-                bbox_to_anchor=(0.5, -0.02),
+                bbox_to_anchor=(0.5, note_y),
                 ncol=min(5, len(handles)),
                 fontsize=8.5,
                 frameon=False,
@@ -525,7 +574,7 @@ def write_training_curves(run_result: Any, out_dir: str | Path, *, model_label: 
     frame.to_csv(csv_path, index=False)
 
     png_path = directory / CURVE_PNG_NAME
-    figure = build_curve_figure(frame, model_label=model_label)
+    figure = build_curve_figure(frame, model_label=model_label, source_run=exported_run(run_result))
     figure.savefig(png_path, dpi=150, bbox_inches="tight")
 
     return CurvePaths(
@@ -557,7 +606,7 @@ def write_training_curves(run_result: Any, out_dir: str | Path, *, model_label: 
 
 #: The live figure's resolution, and the first thing that looks like a speed lever and is not:
 #: between dpi 80 and 150 a nine-run redraw moves 202 -> 230 ms, because the cost is building
-#: the figure and laying it out, not rasterising it. 96 is chosen for the bytes that cross the
+#: the figure and laying it out, not rasterizing it. 96 is chosen for the bytes that cross the
 #: notebook's comm channel on every redraw -- 60 KB against 72 KB at 110 and 104 KB at 150.
 #: The archive keeps dpi 150: nothing about the exported file changes.
 LIVE_DPI = 96
@@ -627,9 +676,11 @@ class _LiveRun:
     split_seed: Any
     model_seed: Any
     label: str
-    #: (epoch, train_loss_mse, score) per closed epoch. `score` is None until an epoch closes
-    #: with one, which a well-formed epoch event always does.
-    epochs: list[tuple[int, float, float | None]] = field(default_factory=list)
+    #: (epoch, train_loss_mse, score, val_loss_mse) per closed epoch -- the three series the
+    #: figure draws, plus the epoch they sit at. `score` is None until an epoch closes with one,
+    #: which a well-formed epoch event always does; `val_loss_mse` is NaN when the event carried
+    #: none, so the validation-loss panel simply has no point there.
+    epochs: list[tuple[int, float, float | None, float]] = field(default_factory=list)
     #: (fractional epoch, train_loss_mse) per surviving batch report.
     batches: list[tuple[float, float]] = field(default_factory=list)
     #: One batch report in `stride` is kept. Doubles each time the cap is reached, so the
@@ -655,9 +706,9 @@ class LiveCurveState:
         #: Two is the floor: one point to halve toward and one to keep.
         self._cap = max(2, int(max_batch_points))
         #: The validation metric the events say this run is being selected on. It names the
-        #: frame's metric column and the figure's lower label, so a config selecting on R2 is
-        #: not drawn under a Spearman heading. Every shipped registry entry selects on
-        #: Spearman, which is why the default is the archive's own.
+        #: frame's metric column and the label on the figure's score panel, so a config
+        #: selecting on R2 is not drawn under a Spearman heading. Every shipped registry entry
+        #: selects on Spearman, which is why the default is the archive's own.
         self.metric: str = CURVE_METRIC
         self._runs: dict[tuple[Any, Any], _LiveRun] = {}
         self._where: dict[str, int] = {}

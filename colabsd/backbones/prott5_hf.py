@@ -12,11 +12,14 @@ repo ships `spiece.model` but no `tokenizer.json`, and the slow-to-fast conversi
 raises a bare `Exception("You're trying to run a `Unigram` model but you're file
 was trained with a different algorithm")` that `HFAdapterBase._guarded` would not
 even catch, so the slow tokenizer (`use_fast=False`) is mandatory — and with it
-the `sentencepiece` package, which `transformers` does not install by itself and
-which is not in this project's pyproject either. Without it both `use_fast`
-settings fail with `ValueError: Converting from Tiktoken failed`, which `_guarded`
-would report as a network or checkpoint-path problem, so the precheck below runs
-first and names the package instead. Unlike Ankh, this one really is mandatory.
+two packages `transformers` does not install by itself: `sentencepiece`, which
+reads the vocabulary, and `protobuf`, which the slow T5 tokenizer parses
+`spiece.model` through. Neither is a required dependency of this project; both
+are declared in its `prott5` extra. Without them both `use_fast` settings fail
+with `ValueError: Converting from Tiktoken failed`, which `_guarded` would report
+as a network or checkpoint-path problem, so the precheck below runs first and
+names whichever of the two is actually missing instead. Unlike Ankh, this one
+really is mandatory.
 
 Residue axis — the tokenizer appends `</s>` and prepends nothing, so a 33-residue
 sequence gives 34 tokens (checked against transformers 4.48). `HFAdapterBase`
@@ -40,7 +43,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from colabsd.backbones.base import HFAdapterBase
+from colabsd.backbones.base import HFAdapterBase, missing_t5_tokenizer_packages
 from colabsd.errors import BackboneError
 
 if TYPE_CHECKING:
@@ -60,15 +63,20 @@ class ProtT5Adapter(HFAdapterBase):
     def tokenizer(self) -> Any:
         """Return the slow sentencepiece tokenizer; the fast conversion fails for this repo."""
         if self._tokenizer is None:
-            from importlib.util import find_spec
-
             from transformers import AutoTokenizer
 
-            if find_spec("sentencepiece") is None:
+            # Two packages, not one, and the pair is spelled once in `base` because `ankh_hf` asks
+            # the same question from the other end. A runtime that had `sentencepiece` and not
+            # `protobuf` fell through this precheck into the loader's generic five-cause error,
+            # which names neither, so a reader was told to clear their HuggingFace cache over a
+            # missing pip package. Both are asked for here, so the message names what is missing.
+            missing = missing_t5_tokenizer_packages()
+            if missing:
+                packages = " ".join(missing)
                 raise BackboneError(
-                    f"'{self.model_name}' reads a T5 sentencepiece vocabulary, and transformers cannot even "
-                    "import its tokenizer class without the `sentencepiece` package. Run "
-                    "`pip install sentencepiece` and restart the runtime."
+                    f"'{self.model_name}' reads a T5 sentencepiece vocabulary, and transformers cannot "
+                    f"build its tokenizer without {' and '.join(f'`{name}`' for name in missing)}. Run "
+                    f"`pip install {packages}` and restart the runtime."
                 )
             self._tokenizer = self._guarded(
                 lambda: AutoTokenizer.from_pretrained(self.hf_id, do_lower_case=False, use_fast=False),

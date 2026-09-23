@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import math
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,12 +56,19 @@ from colabsd.bundle import (
 )
 from colabsd.errors import ColabSDError
 from colabsd.ui import theme
-from colabsd.ui.core import Message, render_messages
+from colabsd.ui.core import Message, counted, render_messages
 
 #: Bumped to 2 when the report dropped its second source, and to 3 when the training budget
 #: became the user's and every archive started recording the one its run was given. Older
 #: manifests carry blocks this version does not write, or lack one it does; either way they
 #: still open, and `older_schema_notices` says what is different about them.
+#:
+#: The number tracks READ compatibility, not the manifest's shape. A reader of schema N must be
+#: able to open every manifest stamped N, so a block ADDED at the top level -- `training_status`
+#: in the bundle manifest, `runs_stopped_early` in the archive's -- does not bump it: an older
+#: reader finds the keys it knows and reports the rest as not recorded. Only a change that would
+#: make an existing reader wrong -- a key removed, renamed, or given a different meaning -- bumps
+#: it, and then `_OLDER_SCHEMAS` / `_require_readable_schema` gains the entry that says what moved.
 ARCHIVE_SCHEMA_VERSION = 3
 ARCHIVE_FORMAT = "colabsd-performance"
 
@@ -78,12 +85,44 @@ REPORT_MEMBERS: dict[str, str] = {"csv": "report.csv", "png": "report.png", "jso
 
 #: What each member is for, in the README and in the manifest.
 MEMBER_PURPOSE: dict[str, str] = {
-    "report.csv": "every tracked metric for every condition, mean +/- sd across the repeated runs",
+    "report.csv": (
+        "every tracked metric for every condition, mean +/- sd across the repeated runs, with the "
+        "number of runs each metric was measured over"
+    ),
     "report.png": "the figure: the spread across the repeated runs, and the unlock count",
     "report.json": "what build_report recorded about the figure it drew",
-    curves.CURVE_CSV_NAME: "training loss (MSE) and validation Spearman, one row per epoch per run",
-    curves.CURVE_PNG_NAME: "the same two curves drawn, with the epoch each run kept circled",
+    curves.CURVE_CSV_NAME: (
+        "training loss (MSE), validation loss (MSE) and validation Spearman, one row per epoch per run"
+    ),
+    curves.CURVE_PNG_NAME: "the same three curves drawn, with the epoch each run kept circled",
 }
+
+#: Every name a complete `performance_report.zip` holds, in the order `write_performance_archive`
+#: writes them: the two it writes itself, then the report's three, then the two curve files. The one
+#: list every surface reads. `summary_html` built its sentence from `report_paths` instead, which
+#: `report_members` has already narrowed to what `colabsd.report` writes, so the panel told a reader
+#: that an archive of seven files held three -- while TUTORIAL.md and the generated notebook both
+#: named all seven. A run with no `training_log.json` to draw curves from writes fewer; that is what
+#: `archive_contents_sentence` takes an argument for.
+ARCHIVE_MEMBERS: tuple[str, ...] = (
+    README_NAME,
+    MANIFEST_NAME,
+    *REPORT_MEMBERS.values(),
+    curves.CURVE_CSV_NAME,
+    curves.CURVE_PNG_NAME,
+)
+
+
+def archive_contents_sentence(members: Iterable[str] | None = None) -> str:
+    """What is inside the archive, named, for whichever surface is describing it.
+
+    With no argument it describes a complete archive, which is what a section note shown before the
+    button is pressed can promise. With the names read back out of a written zip it describes that
+    one, which is shorter for a run recovered from an interrupted session: it has no epoch log, so
+    no curves were drawn and the archive is honest about holding five files rather than seven.
+    """
+    names = tuple(members) if members is not None else ARCHIVE_MEMBERS
+    return "Inside it, in the order they were written: " + ", ".join(f"`{name}`" for name in names) + "."
 
 
 class ExportError(ColabSDError):
@@ -95,15 +134,29 @@ class ExportError(ColabSDError):
 # ------------------------------------------------------------------------------------------
 
 
+#: Nobody wrote this number down.
+NOT_RECORDED = "not recorded"
+
+#: The number was written down and cannot exist -- the sd of a single run, a precision@k over a
+#: prediction with no spread. `colabsd.train.summarize_across_runs` returns NaN for these on
+#: purpose (a 0.0 would read as "perfectly stable") and `colabsd.report` already calls them
+#: undefined on the figure, so the archive's README must not call the same number missing.
+UNDEFINED = "undefined"
+
+
 def number(value: Any) -> str:
-    """A metric, or the words for one that was never recorded — never a bare `nan`."""
+    """A metric, the word for one that cannot exist, or the word for one nobody recorded.
+
+    Never a bare `nan`, and never the same word for both: a reader acts differently on "the
+    run did not record this" than on "one run has no spread to report".
+    """
     if value is None:
-        return "not recorded"
+        return NOT_RECORDED
     try:
         as_float = float(value)
     except (TypeError, ValueError):
-        return "not recorded"
-    return "not recorded" if not math.isfinite(as_float) else f"{as_float:.4f}"
+        return NOT_RECORDED
+    return UNDEFINED if not math.isfinite(as_float) else f"{as_float:.4f}"
 
 
 def unlock_verdict(unlock_count: int, partition: str = "test") -> str:
@@ -129,7 +182,7 @@ def unlock_verdict(unlock_count: int, partition: str = "test") -> str:
         )
     return (
         f"This is read number {unlock_count} of the same test partition. Choices made after the first read "
-        "were informed by it, so treat this as an optimiztic estimate, not a held-out one."
+        "were informed by it, so treat this as an optimistic estimate, not a held-out one."
     )
 
 
@@ -144,7 +197,7 @@ def partition_verdict(partition: str, unlock_count: int) -> str:
         )
     return (
         f"These are validation numbers, but the test partition of this run directory has already been read "
-        f"{unlock_count}x. A later test report from here is an optimiztic estimate rather than a held-out one."
+        f"{unlock_count}x. A later test report from here is an optimistic estimate rather than a held-out one."
     )
 
 
@@ -222,10 +275,9 @@ class PerformanceFacts:
     def truncation_line(self) -> str:
         """Which columns rank more rows than the partition holds, and why that reads as 1.0."""
         names = ", ".join(self.truncated_metrics)
-        rows = self.partition_rows
-        counted = f"{rows} row" if rows == 1 else f"{rows} rows"
+        rows_phrase = counted(self.partition_rows, "row")
         return (
-            f"{names} — this partition is {counted}, shorter than the cut those names promise, so every "
+            f"{names} — this partition is {rows_phrase}, shorter than the cut those names promise, so every "
             "variant falls inside it and the number is near 1 for any ranking at all"
         )
 
@@ -244,11 +296,17 @@ class PerformanceFacts:
         return ", ".join(parts) + " — these numbers include a run that was stopped by hand"
 
     def headline_line(self) -> str:
-        """The metric on show, mean +/- sd, over however many runs."""
+        """The metric on show, mean +/- sd, over however many runs.
+
+        An undefined sd says why it is undefined when the reason is the obvious one, which is
+        the same sentence `colabsd.report` writes under the figure in the same archive.
+        """
         mean = number(self.headline.get("mean"))
         sd = number(self.headline.get("sd"))
         runs = int(self.headline.get("n") or self.n_runs or 0)
-        return f"{self.metric} {mean} +/- {sd} over {runs} run(s)"
+        if sd == UNDEFINED and runs == 1:
+            sd = f"{UNDEFINED} (a single run)"
+        return f"{self.metric} {mean} +/- {sd} over {counted(runs, 'run')}"
 
     def describe(self) -> str:
         """One line: what these numbers are, and what produced them."""
@@ -332,6 +390,12 @@ def performance_facts(
     The budget is read the same way round: the report already wrote the one it was given, so
     that record is preferred, and an explicit `budget` or one the run carries fills in for a
     summary written without it.
+
+    The headline statistics come back through `_restored_headline` on the way in as well as on
+    the way out. `colabsd.report` writes `report.json` through `json_safe`, so a single run's sd
+    -- NaN by design, never 0.0 -- is `null` in the file this reads; taken as `None` it renders
+    as 'not recorded', the one word this module keeps apart from 'undefined'. The default plan
+    is one split seed by one model seed, so that was the ordinary archive.
     """
     from colabsd.bundle import utc_now
 
@@ -359,7 +423,7 @@ def performance_facts(
         unlock_count=max(counted, remembered),
         unlock_source=str(report_summary.get("unlock_source") or "not recorded"),
         metric=metric,
-        headline=_mapping(headline),
+        headline=_restored_headline(_mapping(headline)),
         model_name=model_name,
         adapter_name=str(_attr(run_result, "adapter_name") or model_name),
         is_provisional=bool(provisional),
@@ -464,6 +528,31 @@ def manifest_payload(facts: PerformanceFacts, files: Mapping[str, Mapping[str, A
     return _json_safe(payload)
 
 
+def _restored_headline(headline: Mapping[str, Any]) -> dict[str, Any]:
+    """The headline statistics, with a written `null` read back as the NaN it was written from.
+
+    `_json_safe` has to write NaN as `null` or the manifest is not JSON, so a single run's sd --
+    NaN by design, never 0.0 -- lands there as `null`. Dropping the key on read-back turned
+    "undefined" into "nobody wrote it", which is exactly the distinction
+    `colabsd.bundle.restore_undefined_numbers` exists to keep. Neither spelling of the count is
+    restored -- `report.json` writes `n` and `performance.json` writes `n_runs`, both are counts,
+    an absent one means the archive recorded no runs, and a NaN there cannot be an `int`.
+    """
+    from colabsd.bundle import restore_undefined_numbers
+
+    present = {key: headline[key] for key in ("mean", "sd") if key in headline}
+    restored = restore_undefined_numbers(present)
+    # `report.json` spells the count `n` and `performance.json` spells it `n_runs`; one function
+    # reads both, because the same distinction has to survive both paths. The count is never
+    # restored to NaN in either -- `headline_line` calls `int()` on it, and `int(nan)` raises.
+    for key in ("n", "n_runs"):
+        count = headline.get(key)
+        if count is not None:
+            restored["n"] = count
+            break
+    return restored
+
+
 def facts_from_manifest(manifest: Mapping[str, Any]) -> PerformanceFacts:
     """The inverse of `manifest_payload`, so an archive read back says what it was written with."""
     unlock = _mapping(manifest.get("unlock"))
@@ -483,11 +572,7 @@ def facts_from_manifest(manifest: Mapping[str, Any]) -> PerformanceFacts:
         unlock_count=int(unlock.get("count") or 0),
         unlock_source=str(unlock.get("source") or "not recorded"),
         metric=str(headline.get("metric") or DEFAULT_METRIC),
-        headline={
-            key: value
-            for key, value in (("mean", headline.get("mean")), ("sd", headline.get("sd")), ("n", headline.get("n_runs")))
-            if value is not None
-        },
+        headline=_restored_headline(headline),
         model_name=str(model.get("model_name") or "this model"),
         adapter_name=str(model.get("adapter_name") or ""),
         is_provisional=bool(hyperparameters.get("is_provisional", provenance.get("is_provisional", False))),
@@ -521,7 +606,7 @@ def _budget_lines(facts: PerformanceFacts) -> list[str]:
     # Wrapped at the width `_wrap` uses, so "cannot be set by hand" lands on one line: it is the
     # claim this paragraph exists to make, and a reader skimming must not have to reassemble it.
     not_a_setting = (
-        "The learning rates, LoRA rank, alpha and dropout cannot be set by hand: they are modelling "
+        "The learning rates, LoRA rank, alpha and dropout cannot be set by hand: they are modeling "
         "choices, looked up for this backbone. The budget can be set by hand -- it is how long the run "
         "was allowed to take and what fitted on the card it ran on"
     )
@@ -585,7 +670,7 @@ def readme_text(facts: PerformanceFacts, files: Mapping[str, Mapping[str, Any]])
         f"  repeated runs      {facts.n_runs}  ({seeds})",
         *( [f"  stopped early      {facts.stopped_early_line()}"] if facts.runs_stopped_early else [] ),
         *( [f"  not a real cut     {facts.truncation_line()}"] if facts.truncated_metrics else [] ),
-        f"  library size       {str(facts.n_sequences) + ' sequences' if facts.n_sequences else 'not recorded'}",
+        f"  library size       {counted(facts.n_sequences, 'sequence') if facts.n_sequences else 'not recorded'}",
         "",
         _wrap(partition_verdict(facts.partition, facts.unlock_count)),
         "",
@@ -636,7 +721,7 @@ def notices(facts: PerformanceFacts) -> list[Message]:
                     "archive_test_read_repeatedly",
                     "warning",
                     f"**Test** numbers from read number {facts.unlock_count} of the same partition: an "
-                    "optimiztic estimate, not a held-out one. `performance.json` carries the count with them.",
+                    "optimistic estimate, not a held-out one. `performance.json` carries the count with them.",
                 )
             )
         else:
@@ -723,11 +808,16 @@ def older_schema_notices(schema_version: int) -> list[Message]:
 
 
 def summary_html(export: PerformanceExport) -> str:
-    """The block a notebook shows after writing an archive."""
-    files = ", ".join(f"`{name}`" for name in sorted(export.report_paths))
+    """The block a notebook shows after writing an archive.
+
+    The member list comes off the file that was just written, not from `export.report_paths`:
+    `report_members` narrows that to the three files `colabsd.report` writes, so this sentence
+    named three members of a seven-member archive while the archive, TUTORIAL.md and the notebook
+    all named seven.
+    """
     return theme.note_html(
         f"Written **{export.path.name}** — {export.facts.describe()}\n\n"
-        f"Inside it, beside `{MANIFEST_NAME}` and `{README_NAME}`: {files}."
+        f"{archive_contents_sentence(export.members or None)}"
     ) + render_messages(notices(export.facts))
 
 
@@ -964,6 +1054,9 @@ class PerformanceExport:
     path: Path
     facts: PerformanceFacts
     report_paths: dict[str, Path]
+    #: What is actually inside the zip, read back off it. `report_paths` is the narrowed three,
+    #: which is why the panel's own sentence has to be built from this instead.
+    members: tuple[str, ...] = ()
     downloaded: bool = False
 
     def written(self) -> dict[str, Path]:
@@ -1052,9 +1145,15 @@ def export_performance(
     archive = write_performance_archive(
         work / archive_name, facts=facts, report_paths=paths, extra_files=extra
     )
+    # Read back rather than predicted: a run with no epoch log contributes no curves, and the
+    # sentence the panel prints about the archive has to be about the file on disk.
+    with zipfile.ZipFile(archive) as opened:
+        members = tuple(opened.namelist())
     if download:
         runners.download(archive)
-    return PerformanceExport(path=archive, facts=facts, report_paths=paths, downloaded=download)
+    return PerformanceExport(
+        path=archive, facts=facts, report_paths=paths, members=members, downloaded=download
+    )
 
 
 @dataclass(frozen=True)

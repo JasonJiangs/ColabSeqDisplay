@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from colabsd.backbones import registry
-from colabsd.backbones.registry import BACKBONES, BackboneEntry
+from colabsd.backbones.registry import BACKBONES, BackboneEntry, extra_install
 from colabsd.ui import theme
 from colabsd.ui.theme import Severity
 
@@ -102,6 +102,21 @@ SECTION_TITLES: dict[str, str] = {
 # --------------------------------------------------------------------------- state
 
 
+def default_backbone() -> str:
+    """The backbone the form starts on: the cheapest one the notebooks offer.
+
+    Derived rather than typed, because `WizardState.backbone` is what the dropdown's `value` is
+    set from and `backbone_choices()` is what its `options` are built from. A literal here that
+    fell off the offered list -- struck out of its family the way `ESM2-8M` was -- killed
+    `MainWizard` at construction with `TraitError: Invalid selection: value not found`, so the
+    notebook's one cell rendered nothing at all and no sentence anywhere named the backbone that
+    had gone. Empty only for a registry that offers nothing, which is a registry bug and is what
+    `tests/test_ui_core.py` now says in one line.
+    """
+    offered = colab_backbones()
+    return offered[0] if offered else ""
+
+
 @dataclass
 class WizardState:
     """Every choice a user has made, in one object the pure functions read.
@@ -117,7 +132,7 @@ class WizardState:
     n_variants: int = 0
     wt_length: int = 0
 
-    backbone: str = "ESM2-35M"
+    backbone: str = field(default_factory=default_backbone)
     dtype: str = "float32"
 
     three_di_source: str = "none"
@@ -200,14 +215,78 @@ def colab_backbones() -> list[str]:
     return sorted(names, key=_backbone_sort_key)
 
 
+def and_joined(names: Sequence[str]) -> str:
+    """`A`, `B` and `C` -- backbone names as one English list, each one code-formatted.
+
+    Every backbone name in the sentences around this is in backticks, and `", ".join` left
+    eight bare names in the middle of one. The join is here rather than in either panel
+    because the training panel, the Predict panel and the notebook generator all say it.
+    """
+    ticked = [f"`{name}`" for name in names]
+    if not ticked:
+        return "none at all"
+    if len(ticked) == 1:
+        return ticked[0]
+    return ", ".join(ticked[:-1]) + f" and {ticked[-1]}"
+
+
+def as_sentence(text: str) -> str:
+    """`colabsd.backbones.registry.as_sentence`, under the name the panels and the generator call.
+
+    The implementation moved next to the reasons it finishes: `registry.withheld_note` needs it
+    too, and nothing under `colabsd/backbones/` may import this module. This is the join, not a
+    second copy -- two copies of exactly this function are what left one renderer printing
+    "...withhold them.)." after the other three were fixed.
+    """
+    return registry.as_sentence(text)
+
+
+def offered_backbones_phrase() -> str:
+    """Every backbone the notebooks offer, named -- `ESM2-35M`, ... and `ESMDance`.
+
+    Named one by one rather than family by family because a family is not the unit the form
+    offers any more. `WITHHELD_MODEL_REASONS` strikes `ESM2-8M` out of an ESM2 family that is
+    otherwise on the form, so "the ESM2 ... families are offered here" stood directly above a
+    bullet saying `ESM2-8M` is not -- the panel contradicting itself in two consecutive lines.
+    The Predict panel was fixed this way first; this is the one rendering both of them use.
+    """
+    return and_joined(registry.offered())
+
+
 def withdrawn_backbones() -> list[str]:
     """Registered backbones the notebooks do not offer — the answer to "where did mine go?".
 
     Deliberately only the *list*: the reasons differ per backbone and live in
     `colabsd.backbones.registry.withheld_reason`. A single sentence here covering all of them
-    was wrong about four of the seven.
+    was wrong about several of them -- today `METL` has no adapter at all and `ESMC-300M`
+    carries tuned hyperparameters, so neither "untested" nor "untuned" covers the list. No
+    count is quoted on purpose: the last two said four of seven and went stale twice.
     """
     return sorted(name for name in BACKBONES if not _offered(name))
+
+
+def withheld_groups() -> list[tuple[list[str], str]]:
+    """The withheld backbones grouped by the reason they share, in `withdrawn_backbones()` order.
+
+    Two ESMC models carry one family reason between them, and both renderers printed that
+    sixty-word paragraph twice. Under `ESMC-300M` it reads as a non-sequitur about itself -- "a
+    family with one searched member and one placeholder -- `ESMC-300M` was searched and clears
+    the bar on its own" -- and under `ESMC-600M` it reads a second time. A reason that belongs to
+    a family is said once, about every name it covers. Grouped on the reason text rather than on
+    the family, so a name struck out of an offered family by `WITHHELD_MODEL_REASONS` keeps its
+    own bullet without a special case, and a registry that cannot explain a family is answered
+    the way `withdrawn_note` already answers it rather than taking the page down.
+    """
+    from colabsd.backbones import registry
+
+    groups: dict[str, list[str]] = {}
+    for name in withdrawn_backbones():
+        try:
+            reason = registry.withheld_reason(name) or "it is offered"
+        except Exception:  # noqa: BLE001 - a family in neither list is a registry bug, not a dead page
+            reason = "no reason is recorded for it in the registry, which is a bug worth reporting"
+        groups.setdefault(reason, []).append(name)
+    return [(names, reason) for reason, names in groups.items()]
 
 
 def _backbone_sort_key(name: str) -> tuple[int, int, str]:
@@ -221,13 +300,78 @@ def sequence_only_backbones() -> list[str]:
     return [name for name in colab_backbones() if not BACKBONES[name].needs_structure]
 
 
+def _article(word: str) -> str:
+    """`a` or `an` for a family name read out of the registry -- "an ESM2", "a SaProt"."""
+    return "an" if word[:1].upper() in "AEIOU" else "a"
+
+
+def sequence_only_phrase() -> str:
+    """`an ESM2, ESMDance or ProtT5` -- the offered families that need no wild-type 3Di string.
+
+    Naming ESM2 as the one way out of the 3Di step was true when ESM2 and SaProt were the whole
+    form. `ESMDance` is the second-cheapest entry on it now and `ProtT5-XL` is on it too, and
+    both read the sequence alone, so six hand-written sentences were telling a user the step was
+    unavoidable for two backbones it does not apply to. Derived for the same reason
+    `build_notebooks.or_joined` derives the notebook's copy: the families change and a sentence
+    must not have to be found and changed with them. Empty when every offered backbone reads
+    structure, so the caller drops the clause rather than offering a way out that does not exist.
+    """
+    families: list[str] = []
+    for name in sequence_only_backbones():
+        family = BACKBONES[name].family
+        if family not in families:
+            families.append(family)
+    if not families:
+        return ""
+    if len(families) == 1:
+        return f"{_article(families[0])} {families[0]}"
+    return f"{_article(families[0])} " + ", ".join(families[:-1]) + f" or {families[-1]}"
+
+
 def structure_backbones() -> list[str]:
     """Colab backbones that do need a 3Di string."""
     return [name for name in colab_backbones() if BACKBONES[name].needs_structure]
 
 
+#: The one offered backbone whose pooled feature is its own prediction rather than a trunk
+#: embedding: ESMDance pools its 50-d `res_pred` output. A name and not a derivation, because the
+#: registry records no property that says so -- but the membership test is the point.
+#: `main_workflow.SECTION_NOTES["model"]` stated it in a literal and would have gone on stating it
+#: after the form stopped offering it; `build_notebooks.pooled_feature_lines` already dropped its
+#: paragraph in that case, and now both ask here.
+NON_TRUNK_READOUT: str = "ESMDance"
+
+
+def non_trunk_readout() -> str | None:
+    """The offered backbone read out through its own prediction, or None when it is not offered."""
+    return NON_TRUNK_READOUT if _offered(NON_TRUNK_READOUT) else None
+
+
+def trunk_width_range() -> tuple[int, int] | None:
+    """Narrowest and widest pooled width among the offered backbones that hand over a trunk.
+
+    `None` when there is no such pair to compare against, which is the case that makes the
+    sentence unsayable rather than merely shorter.
+    """
+    widths = sorted(
+        BACKBONES[name].embed_dim for name in colab_backbones()
+        if _offered(name) and name != NON_TRUNK_READOUT
+    )
+    return (widths[0], widths[-1]) if widths else None
+
+
 def backbone_label(name: str) -> str:
-    """One dropdown line: the name plus the two things that decide whether to pick it."""
+    """One dropdown line: the name plus everything that decides whether to pick it.
+
+    Everything, now, rather than the structure need and the runtime: an entry that needs a
+    package Colab does not ship says so here, and so does one that loads in a single numeric
+    precision. That last clause is the one a reader most needs before choosing, because
+    `backbone_needs_dtype` is a `stop`: pick `SaProt-1.3B` off this list at the default
+    precision and the **Train** button is dead until an advanced checkbox in another section is
+    found and a dropdown changed. Every other surface that mentions the requirement -- the
+    summary under the dropdown, the red box, TUTORIAL.md and the notebook's own table -- is read
+    after the choice or beside it; this is the only one read while making it.
+    """
     entry = backbone_entry(name)
     if entry is None:
         return f"{name} — not registered"
@@ -236,8 +380,16 @@ def backbone_label(name: str) -> str:
     parts = ["needs a 3Di string" if entry.needs_structure else "sequence only"]
     minutes = entry.approx_lora_minutes_t4
     parts.append("needs an L4 or A100" if minutes is None else f"~{minutes} min per run on a T4")
-    if entry.tier == "extra":
-        parts.append("one extra install")
+    required = registry.required_dtype(name)
+    if required:
+        parts.append(f"loads only in {required}")
+    packages = extra_install(name)
+    if packages:
+        # Named, not counted: this label said "one extra install" for the one `extra`-tier
+        # backbone the form offers, which needs two. `registry.extra_install` is the same
+        # argument line the notebook's table cell and `backbone_extra_install` print, so the
+        # first thing a reader sees about it cannot disagree with either.
+        parts.append(f"extra: pip install {packages}")
     return f"{name} — {', '.join(parts)}"
 
 
@@ -253,8 +405,19 @@ def backbone_summary(name: str) -> str:
     """A short markdown paragraph about one backbone, for the biologist reading the form."""
     entry = backbone_entry(name)
     if entry is None:
-        return f"**{name}** is not in the backbone registry. Pick one of: {', '.join(colab_backbones())}."
-    structure = "needs a wild-type 3Di string" if entry.needs_structure else "sequence only"
+        return f"**{name}** is not in the backbone registry. Pick one of: {and_joined(colab_backbones())}."
+    # `needs_structure` and `needs_wt_3di` are not the same question, and this line asks the
+    # second one. `METL` needs a structure -- a Rosetta-relaxed one -- and no 3Di string at all
+    # (`tests/test_backbone_surface.py` pins `needs_structure and not needs_wt_3di("METL")`), so
+    # branching on the first told a reader to go and fold a 3Di string this backbone would not
+    # read. README.md's backbone table says the true thing; this box was the one left saying the
+    # opposite of it.
+    if registry.needs_wt_3di(name):
+        structure = "needs a wild-type 3Di string"
+    elif entry.needs_structure:
+        structure = "reads a structure, but not as a 3Di string"
+    else:
+        structure = "sequence only"
     lines = [
         f"**{name}** — {entry.family} family, {entry.embed_dim}-d pooled feature"
         + (f", `{entry.hf_id}`" if entry.hf_id else "")
@@ -262,12 +425,26 @@ def backbone_summary(name: str) -> str:
         f"Structure: {structure}.",
     ]
     minutes = entry.approx_lora_minutes_t4
-    if minutes is None:
+    if entry.tier == "local_only":
+        # Naming a card implies a card would be enough. There is nothing here to load on any of
+        # them, which is what `local_only` means and what the note below already explains.
+        lines.append("Runtime: not available in Colab at all, on any card.")
+    elif minutes is None:
         lines.append("Runtime: does **not** fit a free T4 — needs an L4 or an A100.")
     else:
         lines.append(
             f"Runtime: the registry estimates **{minutes} min per run** on a T4 for a "
             f"{REFERENCE_LIBRARY_VARIANTS:,d}-variant library, scaled to the size of yours."
+        )
+    required = registry.required_dtype(name)
+    if required:
+        # "under *Show the advanced settings*" is where the checkbox is, not where the field is.
+        # `FieldRule("dtype", "model", ...)` puts the dropdown in this section, directly below
+        # this summary; the checkbox that reveals it lives in the first one. A reader told to look
+        # under the checkbox scrolls back to section 1 and finds no precision control there.
+        lines.append(
+            f"Precision: loads only in `{required}` — set **Numeric precision**, the dropdown "
+            "below, which appears once *Show the advanced settings* is ticked in the first section."
         )
     lines.append(entry.notes)
     return "\n\n".join(lines)
@@ -443,7 +620,7 @@ class RuntimeEstimate:
 
     @property
     def runs_phrase(self) -> str:
-        return "1 run" if self.n_runs == 1 else f"{self.n_runs} runs"
+        return counted(self.n_runs, "run")
 
     @property
     def epochs_changed(self) -> bool:
@@ -453,10 +630,13 @@ class RuntimeEstimate:
     def describe(self) -> str:
         if self.per_run_minutes is None:
             return f"{self.runs_phrase}; the registry has no T4 estimate for this backbone."
-        scaled = "" if self.n_variants <= 0 else f", scaled to your {self.n_variants:,d} variants"
+        scaled = "" if self.n_variants <= 0 else f", scaled to your {counted(self.n_variants, 'variant')}"
         epochs = ""
         if self.epochs_changed:
-            epochs = f" and to your {self.max_epochs} epochs rather than its {self.lookup_max_epochs}"
+            epochs = (
+                f" and to your {counted(self.max_epochs, 'epoch')} rather than its "
+                f"{self.lookup_max_epochs}"
+            )
         return (
             f"about {format_minutes(self.minutes or 0.0)} for {self.runs_phrase} — an estimate, not a measurement: "
             f"the registry's {self.per_run_minutes} min/run on a T4 for a "
@@ -501,9 +681,61 @@ def estimate_runtime(state: WizardState) -> RuntimeEstimate:
     )
 
 
+#: What a duration too short to round to a minute is called, so the two panels that quote one
+#: call it the same thing.
+UNDER_A_MINUTE = "under a minute"
+
+
+def positions_phrase(positions: Any) -> str:
+    """The mutated positions as prose, not as a Python list: `22, 42, 279`.
+
+    `f"{list(positions)}"` put `[22, 42, 49, ...]` in the middle of an English sentence -- in the
+    section-1 library note that TUTORIAL tells a reader to read most carefully, and again in the
+    Predict panel's bundle table, one cell after a comma-joined list of the very same sites' column
+    names. It is the repr-in-a-sentence shape that was taken out of `colabsd.backbones.saprot_hf`'s
+    3Di error. The numbers are the content, so they stay; the brackets and the Python spacing go.
+
+    Here rather than in either panel because both print it and neither may import the other -- the
+    same reason `counted` above lives here.
+    """
+    return ", ".join(f"{int(position)}" for position in positions)
+
+
+def counted(count: int, noun: str, *, plural: str | None = None) -> str:
+    """`1 condition`, `2 conditions`, `1,054 residues` -- a count and the noun it governs agreeing.
+
+    Written for the section-1 library note, which said "1 conditions" about the bundled example and
+    would have said "1 mutated sites" about a single-site library, and then used for four lines of
+    that one note while its fifth line said "all 1 rows", the red box two functions below said "1
+    mutation columns for 2 positions", and the scoring step said "Scored 1 variants". A count in
+    front of a plural noun is one class of small wrongness, not eight of them, so the helper lives
+    here rather than in either panel: this module imports the backbone registry and `colabsd.ui.theme`
+    and nothing else of ours, so both wizards, `colabsd.ui.exports`, `colabsd.ui.unlock`,
+    `colabsd.ui.prepare_workflow` and `build_notebooks.py` all reach it and none of them has to
+    import another panel to.
+
+    Thousands are always grouped. One wild type was printed as "1,054 residues" by the training
+    panel and "1054 residues" by the predict panel and read as two different proteins, so the
+    separator is the helper's decision and not each caller's. `colabsd.bundle` and `colabsd.report`
+    each keep a private `_plural` of their own; they sit below the widget layer and cannot import
+    this one.
+    """
+    word = noun if abs(int(count)) == 1 else (plural or f"{noun}s")
+    return f"{int(count):,} {word}"
+
+
 def format_minutes(minutes: float) -> str:
-    """`"18 min"`, `"2 h 05 min"` — never a bare float in front of a user."""
+    """`"under a minute"`, `"18 min"`, `"2 h 05 min"` -- never a bare float in front of a user.
+
+    A duration that rounds down to nothing is said in words. The panel printed "Finished 1 run in
+    0 min." for a run that really took forty seconds, and the scoring cost's lower bound read
+    "0 min to 5 min", while `predict_workflow.span_of` had been saying "under a minute" about the
+    same quantity for two rounds. Exactly zero is still `0 min`: a figure nobody measured -- a
+    backbone the registry has no T4 estimate for -- must not read as a fast one.
+    """
     total = int(round(max(minutes, 0.0)))
+    if total == 0:
+        return "0 min" if minutes <= 0 else UNDER_A_MINUTE
     if total < 60:
         return f"{total} min"
     return f"{total // 60} h {total % 60:02d} min"
@@ -559,7 +791,7 @@ def _data_section(state: WizardState) -> bool:
 
 
 def _structure_section(state: WizardState) -> bool:
-    """The 3Di question exists only for a backbone that reads one; an ESM2 removes it."""
+    """The 3Di question exists only for a backbone that reads one; a sequence-only backbone removes it."""
     return needs_structure(state)
 
 
@@ -705,11 +937,21 @@ def backbone_messages(state: WizardState, runtime: Runtime | None = None) -> lis
             Message(
                 "unknown_backbone",
                 "stop",
-                f"`{name}` is not a registered backbone. Pick one of: {', '.join(colab_backbones())}.",
+                f"`{name}` is not a registered backbone. Pick one of: {and_joined(colab_backbones())}.",
             )
         ]
     if entry.tier == "local_only":
-        return [Message("backbone_not_in_colab", "stop", f"**{name}** cannot run in Colab. {entry.notes}")]
+        # `entry.notes` is deliberately not spliced in, for the same reason `backbone_needs_big_gpu`
+        # below no longer splices it: `backbone_summary` prints the registry's description in full
+        # under the dropdown, which is on screen at the same time as this box, and METL's note ended
+        # on "out of scope for Colab" directly under a red box that opens "cannot run in Colab".
+        return [
+            Message(
+                "backbone_not_in_colab",
+                "stop",
+                f"**{name}** cannot run in Colab. Pick one of: {and_joined(colab_backbones())}.",
+            )
+        ]
     if not _offered(name):
         return [Message("backbone_withdrawn", "stop", withdrawn_text(name))]
     out: list[Message] = []
@@ -718,20 +960,69 @@ def backbone_messages(state: WizardState, runtime: Runtime | None = None) -> lis
         if runtime is not None and runtime.has_gpu:
             memory = f", {runtime.gpu_memory_gb:g} GB" if runtime.gpu_memory_gb else ""
             card = f" This session has a {runtime.gpu_name}{memory}."
+        # `entry.notes` is deliberately not spliced in here. It describes the backbone, and
+        # `backbone_summary` prints it under the dropdown, which is on screen at the same time as
+        # this box: repeated here it made a ProtT5-XL user on a T4 read the same 43 words twice,
+        # and its pip sentence a third time in `backbone_extra_install` below. This box says the
+        # verdict about the card that was detected and what to do about it.
         out.append(
             Message(
                 "backbone_needs_big_gpu",
                 "stop",
-                f"**{name}** does not fit a free T4.{card} {entry.notes} Switch to an L4 or A100 (Colab Pro), or "
-                f"pick a backbone that does fit: {', '.join(_fits_t4())}.",
+                f"**{name}** does not fit a free T4.{card} Switch to an L4 or A100 (Colab Pro), or "
+                f"pick a backbone that does fit: {and_joined(_fits_t4())}.",
+            )
+        )
+    required = registry.required_dtype(name)
+    if required and str(state.dtype) != required:
+        head = (
+            f"**{name}** loads only in `{required}`, and **Numeric precision** is set to "
+            f"`{state.dtype}`. Tick **Show the advanced settings** in the first section and "
+            f"change it to `{required}`"
+        )
+        # The out-of-memory clause is true of float32 and of nothing else: float16 and
+        # bfloat16 are both two bytes a weight, so memory is not why float16 is refused --
+        # `dtype_not_trainable` owns that, and saying it here too is how one fact came to be
+        # stated in three documents before.
+        tail = (
+            f" — in `{state.dtype}` this backbone runs out of memory on every card Colab "
+            "offers, after the download."
+            if str(state.dtype) == "float32"
+            else "."
+        )
+        out.append(Message("backbone_needs_dtype", "stop", head + tail))
+    # `==`, never `in`: "float16" is a substring of "bfloat16", and a substring test here would
+    # stop the one precision this message tells the reader to switch to. `backbone_messages`
+    # returns [] in predict mode a few lines above, so this is train-only by construction --
+    # float16 loads and scores perfectly well, it only cannot be trained in.
+    if str(state.dtype) == "float16":
+        out.append(
+            Message(
+                "dtype_not_trainable",
+                "stop",
+                "**Numeric precision `float16` cannot train a model.** The optimizer's epsilon "
+                "(1e-8) is smaller than the smallest number float16 can hold, so the first update "
+                "divides by zero and every weight becomes `NaN`. The run finishes and its "
+                "validation Spearman reads `0.0000`, which is the dead model and not a score. Tick "
+                "**Show the advanced settings** in the first section and set **Numeric precision** "
+                "to `bfloat16` — the same two bytes per weight, so the same memory — or to "
+                "`float32`.",
             )
         )
     if entry.tier == "extra":
+        # The package line and nothing else. `entry.notes` explains why this backbone needs two
+        # packages and `backbone_summary` prints that under the dropdown; this box is the command,
+        # and it fires whatever card was detected because installing them is the user's job on an
+        # L4 as much as on a T4. Before `ProtT5-XL` went on the form nobody could select an
+        # `extra`-tier backbone at all, and the round that put it there also put the command into
+        # `notes`, so a T4 user read it three times. The stop above no longer splices `notes`, and
+        # `notes` no longer carries the command.
+        package = extra_install(name) or "one extra package"
         out.append(
             Message(
                 "backbone_extra_install",
                 "info",
-                f"**{name}** needs one extra package. {entry.notes}",
+                f"**{name}** needs `pip install {package}` and a runtime restart before it will load.",
             )
         )
     return out
@@ -748,7 +1039,7 @@ def withdrawn_text(name: str) -> str:
         reason = registry.withheld_note(name)
     except Exception:
         reason = f"`{name}` is in this package but the notebooks do not offer it."
-    return f"{reason} Pick one of: {', '.join(colab_backbones())}."
+    return f"{reason} Pick one of: {and_joined(colab_backbones())}."
 
 
 def t4_class(runtime: Runtime | None) -> bool:
@@ -778,7 +1069,7 @@ def structure_messages(state: WizardState) -> list[Message]:
                 "stop",
                 f"**{state.backbone}** reads structure alongside sequence, so it needs one Foldseek 3Di letter "
                 "per residue of your wild type. Choose a 3Di source above, or pick a sequence-only backbone "
-                f"({', '.join(sequence_only_backbones())}).",
+                f"({and_joined(sequence_only_backbones())}).",
             )
         )
     if state.three_di_source == "esmfold" and _structure_section(state):
@@ -788,7 +1079,7 @@ def structure_messages(state: WizardState) -> list[Message]:
                 Message(
                     "esmfold_too_long",
                     "stop",
-                    f"Your wild type is {state.wt_length:,d} residues; ESMFold runs out of memory on a free T4 "
+                    f"Your wild type is {counted(state.wt_length, 'residue')}; ESMFold runs out of memory on a free T4 "
                     f"past about {limit:,d}. Download a structure (`.pdb` / `.cif`) from the PDB or AlphaFold "
                     "and upload that instead.",
                 )
@@ -808,8 +1099,8 @@ def structure_messages(state: WizardState) -> list[Message]:
             Message(
                 "three_di_length_mismatch",
                 "stop",
-                f"The 3Di string is {state.wt_3di_length:,d} states long but the wild type is "
-                f"{state.wt_length:,d} residues. Reload the structure or the wild-type sequence.",
+                f"The 3Di string is {counted(state.wt_3di_length, 'state')} long but the wild type is "
+                f"{counted(state.wt_length, 'residue')}. Reload the structure or the wild-type sequence.",
             )
         )
     return out
@@ -828,11 +1119,12 @@ def config_messages(state: WizardState, status: ConfigStatus, estimate: RuntimeE
             Message(
                 "config_unreadable",
                 "stop",
-                f"The hyperparameters for **{status.model}** could not be read: {status.error}",
+                f"The hyperparameters for **{status.model}** could not be read: "
+                f"{theme.as_text(status.error)}",
             )
         ]
     if not status.found:
-        known = ", ".join(f"`{name}`" for name in status.models) or "none"
+        known = and_joined(status.models)
         return [
             Message(
                 "config_missing",
@@ -854,8 +1146,8 @@ def config_messages(state: WizardState, status: ConfigStatus, estimate: RuntimeE
         Message(
             "config_provisional",
             "stop" if long_run else "warning",
-            f"{status.description.rstrip('. ')}. Read every number it produces as a lower bound, not a "
-            f"result.{tail}",
+            f"{theme.as_text(status.description.rstrip('. '))}. Read every number it produces as a "
+            f"lower bound, not a result.{tail}",
         )
     ]
 
@@ -962,8 +1254,9 @@ def test_unlock_messages(unlock_count: int, *, requested: bool = False) -> list[
             Message(
                 "test_reunlock",
                 "stop",
-                f"This test set has already been read {count} time(s). Reading it again, after seeing the last "
-                f"number, is how a test set stops being a test set. The report will say {count + 1}.",
+                f"This test set has already been read {counted(count, 'time')}. Reading it again, after "
+                f"seeing the last number, is how a test set stops being a test set. The report will say "
+                f"{count + 1}.",
             )
         ]
     if count > 0:
@@ -971,7 +1264,7 @@ def test_unlock_messages(unlock_count: int, *, requested: bool = False) -> list[
             Message(
                 "test_already_unlocked",
                 "warning",
-                f"This test set has been read {count} time(s), and the report says so.",
+                f"This test set has been read {counted(count, 'time')}, and the report says so.",
             )
         ]
     return [
@@ -1136,12 +1429,12 @@ def runtime_summary(runtime: Runtime | None) -> str:
     big = sorted(name for name, verdict in verdicts.items() if verdict == "needs_bigger_gpu")
     lines = [f"You are on {where} with a **{runtime.gpu_name}**{memory}."]
     if ok:
-        lines.append(f"Trains here: {', '.join(ok)}.")
+        lines.append(f"Trains here: {and_joined(ok)}.")
     if big:
-        lines.append(f"Too big for this card: {', '.join(big)} — those need an L4 or an A100 (Colab Pro).")
+        lines.append(f"Too big for this card: {and_joined(big)} — those need an L4 or an A100 (Colab Pro).")
     unavailable = sorted(name for name, verdict in verdicts.items() if verdict == "unavailable")
     if unavailable:
-        lines.append(f"Not available in Colab at all: {', '.join(unavailable)}.")
+        lines.append(f"Not available in Colab at all: {and_joined(unavailable)}.")
     return "\n\n".join(lines)
 
 
@@ -1160,7 +1453,7 @@ class DriveMount:
 
     def describe(self) -> str:
         if not self.mounted:
-            return f"Google Drive is not mounted: {self.reason} Results stay on this machine."
+            return f"Google Drive is not mounted: {theme.as_text(self.reason)} Results stay on this machine."
         return (
             f"Google Drive is mounted at `{self.root}`. Model weights cache in `{self.hf_cache}` and results are "
             f"written to `{self.output_dir}`."
@@ -1274,12 +1567,12 @@ def upload_notice(what: str) -> str:
     )
 
 
-def upload_cancelled_notice(what: str) -> str:
+def upload_canceled_notice(what: str) -> str:
     """What to say when the picker came back empty, so the freeze `upload_notice` warns about
     has a stated end: not a bare "no file", but that the page is answering again.
     """
     return (
-        f"Nothing was uploaded for {what} — the picker was cancelled or timed out. The panel is live again; "
+        f"Nothing was uploaded for {what} — the picker was canceled or timed out. The panel is live again; "
         "press the button again when you have the file."
     )
 
@@ -1356,7 +1649,13 @@ class Section:
 
 
 def render_messages(messages: Iterable[Message]) -> str:
-    """Every message as one HTML block, worst first."""
+    """Every message as one HTML block, in the order given.
+
+    It does NOT sort. `_ordered` sorts, and so does each board that wants worst-first;
+    `colabsd.ui.unlock.status_notices` deliberately does not, because its "already unlocked"
+    warning has to be read before the stop under it. This docstring claimed "worst first" for
+    long enough that the Predict panel was written trusting it and shipped unsorted.
+    """
     return "".join(item.html() for item in messages)
 
 

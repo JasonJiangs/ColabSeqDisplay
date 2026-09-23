@@ -50,11 +50,11 @@ and `_meta.source_file` names the upstream file each parameter block was copied 
 |---|---|---|---|
 | ESM2-150M | yes | 0.5636 ± 0.0113 | 27 |
 | ESM2-650M | yes | 0.5618 ± 0.0125 | 39 |
-| ESMC-300M | no | 0.5611 ± 0.0107 | 35 |
+| ESMC-300M | yes | 0.5611 ± 0.0107 | 35 |
 | ESM2-35M | yes | 0.5608 ± 0.0120 | 37 |
-| ProtT5-XL | no | 0.5581 ± 0.0162 | 21 |
+| ProtT5-XL | yes | 0.5581 ± 0.0162 | 21 |
 | SaProt-650M | yes | 0.5580 ± 0.0085 | 2 |
-| ESMDance | no | 0.5569 ± 0.0128 | 28 |
+| ESMDance | yes | 0.5569 ± 0.0128 | 28 |
 | SaProt-1.3B | yes | 0.5559 ± 0.0162 | 12 |
 | SaProt-35M | yes | 0.5555 ± 0.0126 | 2 |
 | METL | no | 0.5482 ± 0.0158 | 12 |
@@ -133,8 +133,9 @@ looked up. `colabsd.bestconfig.BudgetOverrides` rejects any key outside
 ## Filling a gap
 
 What is missing is a tuned `mutation_site_mean` entry for `Ankh-large`, `ESM2-8M`, `ESMC-600M`
-and `SeqDance`, the four backbones the study did not search. Of the seven the notebook offers,
-only `ESM2-8M` is in that list. Closing a gap means running the
+and `SeqDance`, the four backbones the study did not search. **None of the nine the notebook
+offers is in that list** — a placeholder entry is what keeps a backbone off the form, and
+`ESM2-8M` was the last exception to that rule. Closing a gap means running the
 search offline against your own library with the seqdisplay-opt command line
 (`seqdisplay-lora-optuna` to run the study, `seqdisplay-lora-reevaluate` to retrain its best
 candidates across split and model seeds), then copying the winning trial's values in with

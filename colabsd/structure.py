@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 from colabsd.errors import StructureError
@@ -187,8 +188,21 @@ def _select_record(records: list[tuple[str, str, str]], chain: str | None, path:
     return records[0]
 
 
-def validate_three_di(three_di: str, expected_length: int | None = None, *, source: str = "3Di input") -> str:
-    """Return the validated lowercase 3Di string, or raise an actionable error."""
+def validate_three_di(
+    three_di: str,
+    expected_length: int | None = None,
+    *,
+    source: str = "3Di input",
+    wt_sequence: str | None = None,
+) -> str:
+    """Return the validated lowercase 3Di string, or raise an actionable error.
+
+    `wt_sequence` is what tells a 3Di string from the amino-acid sequence. The alphabet cannot:
+    `set(THREE_DI_STATES) - {"#"}` is exactly the twenty canonical residues lower-cased, so a
+    pasted FASTA passes the character check with nothing to object to. The discriminator is
+    therefore identity against the wild type itself, and it is only applied when the caller
+    has the wild type to compare with; every caller that does not keeps the old behavior.
+    """
     cleaned = "".join(three_di.split()).lower()
     if not cleaned:
         raise StructureError(f"{source} produced an empty 3Di string.")
@@ -196,8 +210,20 @@ def validate_three_di(three_di: str, expected_length: int | None = None, *, sour
     if bad:
         raise StructureError(
             f"{source} contains characters that are not foldseek 3Di states: {bad}. The 3Di alphabet is "
-            f"'{THREE_DI_STATES}', one state per residue — check that the file is a foldseek 3Di string "
-            "and not an amino-acid FASTA."
+            f"'{THREE_DI_STATES}', one state per residue. This check can only see characters outside "
+            "that alphabet, so what it has found is a FASTA header line, a gap or alignment character, "
+            "or a residue code the 3Di alphabet has no state for (B, J, O, U, X or Z) — it is not what "
+            "tells a 3Di string from an amino-acid sequence, because the other twenty letters are the "
+            "same twenty either way. Pass the wild type as wt_sequence= and that comparison is made too."
+        )
+    if set(cleaned) == {"#"}:
+        raise StructureError(
+            f"{source} is {len(cleaned)} mask states and nothing else. '#' is what foldseek writes "
+            "where a residue has no assignable backbone geometry, so this string carries no structure "
+            "at all: SaProt would read it as the sequence alone. The usual causes are a structure file "
+            "with no backbone atoms and a chain selection that picked a ligand or a nucleic-acid chain. "
+            "Pick the protein chain (chain=\"A\", ...), or fold the WT sequence with "
+            "colabsd.structure.three_di_from_esmfold()."
         )
     if expected_length is not None and len(cleaned) != expected_length:
         raise StructureError(
@@ -207,18 +233,47 @@ def validate_three_di(three_di: str, expected_length: int | None = None, *, sour
             "structure with missing/extra residues — an ESMFold or AlphaFold model of the exact WT "
             "sequence always matches, or trim the structure to the WT numbering."
         )
+    if wt_sequence:
+        wt = "".join(wt_sequence.split()).lower()
+        if len(wt) == len(cleaned):
+            same = sum(1 for a, b in zip(cleaned, wt, strict=True) if a == b)
+            # Exact equality is always the sequence. Half the positions is the near miss -- a
+            # variant's sequence pasted instead of the wild type's -- and it is only asked from
+            # 20 residues up, because below that a handful of chance agreements means nothing.
+            if same == len(cleaned) or (len(cleaned) >= 20 and same * 2 >= len(cleaned)):
+                raise StructureError(
+                    f"{source} is the amino-acid sequence, not a 3Di string: it agrees with the wild type "
+                    f"at {same} of {len(cleaned)} positions. The 3Di alphabet is the same twenty letters as "
+                    f"the amino-acid alphabet ('{THREE_DI_STATES}'), so the letters alone cannot tell the "
+                    "two apart, and this compares the string with your wild type instead. A foldseek 3Di "
+                    "string describes the backbone shape at each residue and agrees with the sequence at "
+                    "only a handful of positions. Build one with "
+                    "`colabsd.structure.three_di_from_structure(<AlphaFold PDB/CIF>)` or "
+                    "`colabsd.structure.three_di_from_esmfold(wt_sequence)` and use what that produces. "
+                    "If this really is a foldseek 3Di string that happens to look like your sequence, "
+                    "there is no override on the page, but the API takes it two ways: "
+                    "`colabsd.structure.validate_three_di(text)` called without `wt_sequence=` skips this "
+                    "comparison, and `dataclasses.replace(spec, wt_3di=text)` takes any alphabet-valid "
+                    "string unchecked."
+                )
     return cleaned
 
 
-def _check_matches_wt(structure_aa: str, expected_sequence: str, *, source: str) -> None:
-    """Compare the structure's own residues with the WT sequence the library uses."""
+def _check_matches_wt(structure_aa: str, expected_sequence: str, *, source: str) -> str:
+    """Compare the structure's own residues with the WT sequence the library uses.
+
+    Returns the remark a reader needs, or `""` when there is nothing to say. It is
+    returned rather than printed because the only caller that matters is a widget
+    callback: a `print` from there goes to the notebook's stdout, which no panel
+    captures, so the line naming the disagreeing positions reached nobody.
+    """
     observed = structure_aa.upper()
     expected = "".join(expected_sequence.split()).upper()
     if len(observed) != len(expected):
-        return  # validate_three_di owns the length message
+        return ""  # validate_three_di owns the length message
     mismatched = [i + 1 for i, (a, b) in enumerate(zip(observed, expected, strict=True)) if a != b and a != "X"]
     if not mismatched:
-        return
+        return ""
     preview = ", ".join(f"{expected[i - 1]}{i}->{observed[i - 1]}" for i in mismatched[:5])
     if len(mismatched) > max(5, int(_SEQUENCE_MISMATCH_TOLERANCE * len(expected))):
         raise StructureError(
@@ -226,10 +281,23 @@ def _check_matches_wt(structure_aa: str, expected_sequence: str, *, source: str)
             f"disagree ({preview}...). The 3Di string would not line up with your library's coordinates. "
             "Pick the chain that holds your protein (chain=\"A\", ...), or fold the WT sequence itself."
         )
-    print(
-        f"[colabsd] {source} differs from the WT at {len(mismatched)} residue(s) ({preview}). "
+    return (
+        f"{source} differs from the WT at {len(mismatched)} "
+        f"residue{'' if len(mismatched) == 1 else 's'} ({preview}). "
         "Using its 3Di string anyway; check this is the intended structure."
     )
+
+
+def _report(text: str, on_note: Callable[[str], None] | None) -> None:
+    """Hand a remark to the caller's sink, or print it when there is none.
+
+    The default keeps the plain-API behaviour these functions always had. A panel
+    passes `on_note=` and renders the text in its own section log instead.
+    """
+    if on_note is not None:
+        on_note(text)
+    else:
+        print(f"[colabsd] {text}")
 
 
 def three_di_from_structure(
@@ -239,8 +307,14 @@ def three_di_from_structure(
     foldseek_bin: Path | str | None = None,
     expected_length: int | None = None,
     expected_sequence: str | None = None,
+    on_note: Callable[[str], None] | None = None,
 ) -> str:
-    """Run `foldseek structureto3didescriptor` on a structure and return its 3Di string."""
+    """Run `foldseek structureto3didescriptor` on a structure and return its 3Di string.
+
+    `on_note` receives any remark this function would otherwise print — today only
+    the construct-mismatch line, which a panel needs in its section log rather than
+    on the notebook's stdout. Left unset, the remark is printed as it always was.
+    """
     structure = Path(path).expanduser()
     if not structure.is_file():
         raise StructureError(f"Structure file not found: {structure}. Upload it, or pass the right path.")
@@ -296,13 +370,15 @@ def three_di_from_structure(
             f"foldseek returned {len(amino_acids)} residues but {len(three_di)} 3Di states for {source}. "
             "This foldseek build is not producing the expected descriptor format; upgrade it."
         )
-    cleaned = validate_three_di(three_di, expected_length, source=source)
+    cleaned = validate_three_di(three_di, expected_length, source=source, wt_sequence=expected_sequence)
     if expected_sequence is not None:
-        _check_matches_wt(amino_acids, expected_sequence, source=source)
+        note = _check_matches_wt(amino_acids, expected_sequence, source=source)
+        if note:
+            _report(note, on_note)
     return cleaned
 
 
-def load_three_di(path: Path | str, *, expected_length: int | None = None) -> str:
+def load_three_di(path: Path | str, *, expected_length: int | None = None, wt_sequence: str | None = None) -> str:
     """Load a 3Di string from a plain-text or single-record FASTA file."""
     source = Path(path).expanduser()
     if not source.is_file():
@@ -322,7 +398,7 @@ def load_three_di(path: Path | str, *, expected_length: int | None = None) -> st
         three_di = load_foldseek_sequence(source.resolve(), source.parent)
     except (OSError, ValueError) as exc:
         raise StructureError(f"Could not read a 3Di string from {source} ({exc}).") from exc
-    return validate_three_di(three_di, expected_length, source=str(source))
+    return validate_three_di(three_di, expected_length, source=str(source), wt_sequence=wt_sequence)
 
 
 def _load_esmfold(use_cuda: bool):
@@ -350,6 +426,7 @@ def three_di_from_esmfold(
     device: str = "cuda",
     foldseek_bin: Path | str | None = None,
     pdb_out: Path | str | None = None,
+    on_note: Callable[[str], None] | None = None,
 ) -> str:
     """Fold the WT with ESMFold, then read its 3Di string. Memory-hungry fallback.
 
@@ -375,11 +452,12 @@ def three_di_from_esmfold(
             "protein then takes hours, so downloading an AlphaFold model is usually faster."
         )
     if not use_cuda:
-        print("[colabsd] ESMFold on CPU: expect tens of minutes to hours for a long protein.")
+        _report("ESMFold on CPU: expect tens of minutes to hours for a long protein.", on_note)
     elif len(sequence) > _ESMFOLD_SAFE_LENGTH_T4:
-        print(
-            f"[colabsd] ESMFold on {len(sequence)} residues needs well over 16 GB of GPU memory; "
-            "a free-tier T4 will most likely run out. An AlphaFold DB model is the cheap way out."
+        _report(
+            f"ESMFold on {len(sequence)} residues needs well over 16 GB of GPU memory; "
+            "a free-tier T4 will most likely run out. An AlphaFold DB model is the cheap way out.",
+            on_note,
         )
 
     model = _load_esmfold(use_cuda)
@@ -401,11 +479,15 @@ def three_di_from_esmfold(
         target = Path(pdb_out).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(pdb_text)
-        return three_di_from_structure(target, foldseek_bin=foldseek_bin, expected_sequence=sequence)
+        return three_di_from_structure(
+            target, foldseek_bin=foldseek_bin, expected_sequence=sequence, on_note=on_note
+        )
     with tempfile.TemporaryDirectory(prefix="colabsd_esmfold_") as tmp:
         target = Path(tmp) / "wt.pdb"
         target.write_text(pdb_text)
-        return three_di_from_structure(target, foldseek_bin=foldseek_bin, expected_sequence=sequence)
+        return three_di_from_structure(
+            target, foldseek_bin=foldseek_bin, expected_sequence=sequence, on_note=on_note
+        )
 
 
 def get_wt_3di(
@@ -416,13 +498,18 @@ def get_wt_3di(
     chain: str | None = None,
     foldseek_bin: Path | str | None = None,
     device: str = "cuda",
+    on_note: Callable[[str], None] | None = None,
 ) -> str:
-    """Resolve the WT 3Di string from whatever the user has, cheapest source first."""
+    """Resolve the WT 3Di string from whatever the user has, cheapest source first.
+
+    `on_note` is forwarded to whichever builder runs, so a panel sees the remarks
+    the structure and folding routes would otherwise print.
+    """
     wt = "".join(wt_sequence.split())
     if not wt:
         raise StructureError("get_wt_3di needs the WT amino-acid sequence to check the 3Di length against.")
     if three_di_path is not None:
-        return load_three_di(three_di_path, expected_length=len(wt))
+        return load_three_di(three_di_path, expected_length=len(wt), wt_sequence=wt)
     if structure_path is not None:
         return three_di_from_structure(
             structure_path,
@@ -430,5 +517,6 @@ def get_wt_3di(
             foldseek_bin=foldseek_bin,
             expected_length=len(wt),
             expected_sequence=wt,
+            on_note=on_note,
         )
-    return three_di_from_esmfold(wt, device=device, foldseek_bin=foldseek_bin)
+    return three_di_from_esmfold(wt, device=device, foldseek_bin=foldseek_bin, on_note=on_note)

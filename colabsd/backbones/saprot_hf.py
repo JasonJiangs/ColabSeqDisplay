@@ -71,9 +71,21 @@ class SaProtAdapter(HFAdapterBase):
         try:
             return [saprot_interleaved_sequence(sequence, self.wt_3di) for sequence in sequences]
         except ValueError as exc:
+            # Both numbers are said in English rather than repr'd. `lengths` is a set of the
+            # distinct variant lengths, and interpolating it printed "the variants are [287]
+            # residues long" for the ordinary case where every variant is the same length; a
+            # one-character 3Di string printed "is 1 characters". Nothing below the widget layer
+            # may import `colabsd.ui.core.counted` -- `colabsd.ui.core` imports this package's
+            # registry, and `tests/test_backbone_surface.py` asserts the registry never pulls in
+            # `colabsd.ui` -- so the agreement is spelled out here.
             lengths = sorted({len(sequence) for sequence in sequences})
+            shown = str(lengths[0]) if len(lengths) == 1 else " and ".join(
+                (", ".join(str(number) for number in lengths[:-1]), str(lengths[-1]))
+            )
+            states = "character" if len(self.wt_3di) == 1 else "characters"
+            residues = "residue" if lengths == [1] else "residues"
             raise BackboneError(
-                f"The wild-type 3Di string is {len(self.wt_3di)} characters but the variants are "
-                f"{lengths} residues long. They must match one-to-one: rebuild the 3Di string from a "
+                f"The wild-type 3Di string is {len(self.wt_3di)} {states} but the variants are "
+                f"{shown} {residues} long. They must match one-to-one: rebuild the 3Di string from a "
                 "structure of the full-length wild type."
             ) from exc

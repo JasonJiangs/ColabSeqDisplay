@@ -59,13 +59,21 @@ SDK_MODEL_NAMES: dict[str, str] = {
 
 def import_esm_sdk() -> tuple[Any, Any]:
     """Return `(ESMC, EsmSequenceTokenizer)` from the EvolutionaryScale SDK."""
+    # Imported here, not at module scope: `registry` imports the adapter modules, so the reverse
+    # at import time is a cycle. `pinned_install` is what renders the version bound, and this
+    # message used to hand out a bare `pip install esm` -- the very command that installs the 3.4
+    # release the adapter then refuses, after the 1.3 GB download.
+    from colabsd.backbones.registry import pinned_install
+
     try:
         from esm.models.esmc import ESMC
         from esm.tokenization import EsmSequenceTokenizer
     except ImportError as exc:
         raise BackboneError(
             "ESM-C needs the EvolutionaryScale SDK, which is not importable in this runtime. "
-            "Run `pip install esm` (or `pip install 'colabseqdisplay[esmc]'`) and restart the runtime. "
+            f"Run `pip install {pinned_install('esm')}` and restart the runtime — the bound matters: "
+            "from 3.4 the SDK fuses the attention projections LoRA has to reach, and the adapter refuses "
+            "such a build. "
             "Beware of the older `fair-esm` package: it installs a different module under the same `esm` "
             f"name and has no ESM-C, so uninstall it first if it is present. Original error: {exc}"
         ) from exc
@@ -127,6 +135,7 @@ class ESMCAdapter(HFAdapterBase):
             ) from exc
         self._require_plain_attention(model)
         self._require_matching_width(model)
+        self._require_injectable_attention(model)
         return model.to(self.torch_dtype())
 
     def _require_sdk_checkpoint(self) -> None:
@@ -151,8 +160,57 @@ class ESMCAdapter(HFAdapterBase):
             "way. Install a release of the `esm` package whose esm.pretrained builders take use_flash_attn."
         )
 
+    def _require_injectable_attention(self, model: nn.Module) -> None:
+        """Refuse an SDK build whose q/k/v LoRA cannot reach, at load time rather than mid-run.
+
+        `colabsd.engine.lora.inject_lora` replaces `nn.Linear` layers, and it already knows ESM-C's
+        fused name: `layernorm_qkv` is in its `_FUSED_QKV_ALIASES`. Through `esm` 3.2.1 that
+        attribute is an `nn.Sequential(LayerNorm, Linear)`, so the `Linear` inside it is matched and
+        all four projections are covered. From 3.4.0 it is an `EsmcLayerNormLinear` -- a class of the
+        SDK's own, holding no `nn.Linear` child -- so the only thing left to match is `out_proj`, and
+        `validate_qkvo_coverage` raises.
+
+        Which it should: the alternative is a run with LoRA on a quarter of the attention. But it
+        raised deep inside the engine, with a module-name dump, *after* a 1.3 GB download and a press
+        of Train. Asking the same question here turns that into a sentence naming the package and the
+        version bound, before anything has been spent. The question is asked of the engine's own
+        matcher rather than of a copy of its rules, so a change there cannot leave this check behind.
+        """
+        import torch.nn
+
+        from colabsd.backbones.registry import pinned_install
+        from colabsd.engine.lora import target_roles, validate_qkvo_coverage
+
+        matched = [
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.Linear) and target_roles(name)
+        ]
+        if not matched:
+            # No attention projection of any name: not the fused-class case this guard is about, and
+            # not something it can diagnose. A real ESM-C build always has `out_proj` at least; a
+            # stand-in that has none is somebody else's complaint to make.
+            return
+        try:
+            validate_qkvo_coverage(matched)
+        except RuntimeError as exc:
+            try:
+                import esm
+
+                version = f" (`esm` {esm.__version__})"
+            except Exception:  # pragma: no cover - the SDK imported a moment ago to build the model
+                version = ""
+            raise BackboneError(
+                f"The `esm` SDK in this runtime{version} builds '{self.model_name}' with an attention "
+                "block LoRA cannot be injected into: its fused `layernorm_qkv` is a class of the SDK's "
+                "own rather than an `nn.Sequential` holding an `nn.Linear`, so only `out_proj` can be "
+                "adapted and a run would train a quarter of the attention. Install a release below "
+                f"3.4: `pip install {pinned_install('esm')}` and restart the runtime. "
+                f"The engine's own words: {exc}"
+            ) from exc
+
     def _require_matching_width(self, model: nn.Module) -> None:
-        """ESM-C models carry no `config`, so check the embedding width the registry promised."""
+        """ESM-C models carry no `config`, so check the pooled feature width the registry promised."""
         hidden = getattr(getattr(model, "embed", None), "embedding_dim", None)
         if hidden is not None and int(hidden) != self.embed_dim:
             raise BackboneError(

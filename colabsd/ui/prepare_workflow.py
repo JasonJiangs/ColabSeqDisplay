@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from colabsd.ui import core, theme
-from colabsd.ui.core import Message, esmfold_safe_length
+from colabsd.ui.core import Message, counted, esmfold_safe_length
 
 #: The file this step writes, and the name it is written under.
 THREE_DI_FILENAME = "wt_3di.txt"
@@ -226,7 +226,7 @@ def three_di_blockers(state: core.WizardState, artifact: Artifact | None = None)
             problems.append("Tick the box accepting the ESMFold memory risk, or upload a structure instead.")
         if state.wt_length > esmfold_safe_length():
             problems.append(
-                f"Your wild type is {state.wt_length:,d} residues and ESMFold runs out of memory on a free T4 "
+                f"Your wild type is {counted(state.wt_length, 'residue')} and ESMFold runs out of memory on a free T4 "
                 f"past about {esmfold_safe_length():,d}. Download a structure from the PDB or AlphaFold and "
                 "upload it instead."
             )
@@ -246,12 +246,13 @@ def section_note(state: core.WizardState) -> str:
     """
     if not core.needs_structure(state):
         return ""
+    instead = core.sequence_only_phrase()
+    escape = f" — choose {instead} backbone above and this step is not here at all" if instead else ""
     return (
-        f"**{state.backbone}** reads your protein's *shape* as well as its sequence — choose an ESM2 "
-        "backbone above and this step is not here at all. The shape is one letter per residue, a Foldseek "
-        "3Di string. The usual answer is a structure file you already have or can download from the PDB or "
-        "[AlphaFold](https://alphafold.ebi.ac.uk); folding it here is the last resort. The string stays in "
-        "this session: there is nothing to download and upload back."
+        f"**{state.backbone}** reads your protein's *shape* as well as its sequence{escape}. The shape is "
+        "one letter per residue, a Foldseek 3Di string. The usual answer is a structure file you already "
+        "have or can download from the PDB or [AlphaFold](https://alphafold.ebi.ac.uk); folding it here is "
+        "the last resort. The string stays in this session: there is nothing to download and upload back."
     )
 
 
@@ -379,21 +380,42 @@ class ThreeDiSection:
         artifact: Artifact | None,
         work_dir: Path,
         has_gpu: bool,
+        on_note: Callable[[str], None] | None = None,
     ) -> str:
-        """Produce the 3Di string this run will be trained with. Raises with what to fix."""
+        """Produce the 3Di string this run will be trained with. Raises with what to fix.
+
+        `on_note` collects the remarks the two structure routes used to `print()` -- above all
+        the construct-mismatch line, which names the residues a PDB disagrees with the wild type
+        about and is what the TUTORIAL tells a reader to look at. A bare print inside a widget
+        callback reaches nobody: nothing in `colabsd.ui` captures stdout. Given a sink, the
+        caller renders those remarks in the section log beside its own sentence; left `None`,
+        `colabsd.structure` prints them as it always did for a plain-API caller.
+        """
         problems = three_di_blockers(state, artifact)
         if problems:
             raise ValueError(" ".join(problems))
         length = len(wt_sequence)
         source = state.three_di_source
+        # The three routes below hand over a string somebody typed, uploaded or reused, and the
+        # 3Di alphabet is the twenty amino-acid letters lower-cased, so no check of the letters
+        # can tell a structure string from the sequence itself. `wt_sequence` is what makes the
+        # difference: the validator compares the two and refuses a string that is the sequence
+        # again. `upload_structure` below already passes it as `expected_sequence`, and the
+        # ESMFold route produces its own string from that sequence, so neither needs it here.
         if source == "session":
             assert artifact is not None  # three_di_blockers refused this above
-            return backend.load_three_di(artifact.path, expected_length=length)
+            return backend.load_three_di(
+                artifact.path, expected_length=length, wt_sequence=wt_sequence
+            )
         if source == "paste":
-            return backend.validate_three_di(str(state.get("three_di_text") or ""), length)
+            return backend.validate_three_di(
+                str(state.get("three_di_text") or ""), length, wt_sequence=wt_sequence
+            )
         if source == "upload_3di":
             return backend.load_three_di(
-                Path(str(state.get("three_di_file")).strip()), expected_length=length
+                Path(str(state.get("three_di_file")).strip()),
+                expected_length=length,
+                wt_sequence=wt_sequence,
             )
         if source == "upload_structure":
             return backend.three_di_from_structure(
@@ -401,9 +423,11 @@ class ThreeDiSection:
                 chain=str(state.get("chain") or "").strip() or None,
                 expected_length=length,
                 expected_sequence=wt_sequence,
+                on_note=on_note,
             )
         return backend.three_di_from_esmfold(
             wt_sequence,
             device="cuda" if has_gpu else "cpu",
             pdb_out=Path(work_dir) / "wt_esmfold.pdb",
+            on_note=on_note,
         )

@@ -55,18 +55,55 @@ def check_severity(severity: str) -> Severity:
     return severity  # type: ignore[return-value]
 
 
+#: A paragraph line with a bullet on the line directly under it. Everything that legitimately
+#: ends a paragraph, or is itself a list item, a numbered item, a heading or raw HTML, is excluded
+#: by the lookahead, so the only match is the shape markdown reads as lazy continuation.
+_LAZY_BULLET = re.compile(r"(?m)^(?P<paragraph>(?![ \t]*(?:[-*+][ \t]|\d+\.[ \t]|#|<|$)).+)\n(?=[ \t]*[-*+][ \t])")
+
+
+def promote_lazy_bullets(text: str) -> str:
+    """A blank line inserted wherever a bullet list starts on the line under a paragraph.
+
+    Markdown does not let a list interrupt a paragraph: with the first `- ` directly under a head
+    line, python-markdown reads the whole run as ONE paragraph and emits no `<li>` at all, and the
+    browser then collapses the newlines -- so a five-line note is painted as one run-on sentence
+    with literal hyphens in the middle of it. `_fallback_markdown` produced no `<li>` either; it
+    only broke the lines. Both renderings were wrong, and neither was visibly wrong in the source.
+    Five panel notes shipped that way and survived three rounds of reading.
+
+    Putting a blank line in each of those five notes fixed those five. This fixes the *shape*, for
+    both renderers at once and for every note written after today -- including the ones assembled
+    by `"\n".join(lines)`, which the literal sweep in `tests/test_ui_core.py` cannot see and which
+    is the one blind spot that sweep declares. Nothing in this package means a line beginning `- `
+    to be read as prose, so promoting it is always what the author intended.
+
+    Text carrying a fenced code block is returned untouched: inside a fence a `- ` is content.
+    """
+    if "```" in text:
+        return text
+    return _LAZY_BULLET.sub(lambda match: match.group("paragraph") + "\n\n", text)
+
+
 def render_markdown(text: str) -> str:
     """Render markdown to HTML.
 
-    Falls back to `_fallback_markdown` when the `markdown` package is absent, so the wizards
-    still read correctly in a bare environment. Raw HTML in `text` passes through untouched
-    either way, which is what lets a note carry a link.
+    `markdown` is a declared dependency, so this is the renderer a reader actually gets.
+    `_fallback_markdown` is the safety net for a runtime that has not installed it -- not a
+    second dialect: `tests/test_ui_core.py` sweeps every literal in this package for the one
+    shape the two disagreed about and `tests/test_ui_main.py` holds them to the same `<li>`
+    count for every note the panels build, because the shape that broke five notes for three
+    rounds broke them under both. Raw HTML in `text` passes through untouched either way, which
+    is what lets a note carry a link.
+
+    `promote_lazy_bullets` runs above the choice of renderer, because that one shape was wrong in
+    both of them and had to be corrected once rather than in each branch.
     """
+    prepared = promote_lazy_bullets(text)
     try:
         import markdown as _markdown
     except ImportError:
-        return _fallback_markdown(text)
-    return _markdown.markdown(text)
+        return _fallback_markdown(prepared)
+    return _markdown.markdown(prepared)
 
 
 def render_markdown_inline(text: str) -> str:
@@ -118,6 +155,22 @@ def _inline(text: str) -> str:
     return out
 
 
+def as_text(value: object) -> str:
+    """A value that is data, not markup, made safe to drop into a note.
+
+    Every builder here renders markdown and lets raw HTML through -- that is what lets a note
+    carry a link, a colored span or the bundle table -- so an exception or a filename holding
+    `<address>` is eaten by the browser and the part of the message naming what failed simply
+    disappears. Escape the VALUE, never the assembled note: `html.escape` over a whole note
+    would print the markup the note meant to draw.
+
+    Do not also wrap the result in backticks. Both renderers escape the contents of a code span
+    themselves, so `` `{as_text(x)}` `` comes out as `&lt;address&gt;` on the page. Backticks or
+    this, not both. Apply it once, where the value enters the sentence, not where it is stored.
+    """
+    return _html.escape(str(value), quote=False)
+
+
 def heading_html(text: str, level: int = 3) -> str:
     """A form section title."""
     level = max(1, min(6, int(level)))
@@ -133,7 +186,7 @@ def note_html(text: str) -> str:
 
 
 def message_html(text: str, severity: str = "info") -> str:
-    """One contextual message, colored and labelled by what ignoring it costs."""
+    """One contextual message, colored and labeled by what ignoring it costs."""
     check_severity(severity)
     color = SEVERITY_COLOR[severity]
     label = f"{SEVERITY_ICON[severity]} {SEVERITY_LABEL[severity]}:"

@@ -63,6 +63,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from colabsd.bestconfig import BudgetOverrides, BudgetSettings, resolve_budget
+
+# `json_safe` and nothing else. `colabsd.bundle` imports `colabsd`, `colabsd.bestconfig`,
+# `colabsd.errors` and `colabsd.spec`, never this module, so this edge closes no cycle. It is
+# the same writer `bundle.save_bundle` and `report.build_report` already use, which is the
+# point: `run_result.json` was the one artifact of the four written with bare NaN tokens.
+from colabsd.bundle import json_safe
 from colabsd.errors import ColabSDError, ConfigError, DataError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -175,6 +181,8 @@ class RunResult:
         validation_summary: macro mean over conditions, mean +- sd across runs.
         test_runs, test_aggregate: None until `unlock_test` fills them in.
         unlock_count: how often the test partition has been read.
+        n_reused: runs answered from a finished run already in `output_dir` rather than
+            trained again. A press where this equals `n_runs` trained nothing at all.
         paths: files written by `finetune`.
     """
 
@@ -197,6 +205,7 @@ class RunResult:
     n_sequences: int
     created_utc: str
     unlock_count: int = 0
+    n_reused: int = 0
     test_runs: list[dict[str, Any]] | None = None
     test_aggregate: pd.DataFrame | None = None
     minutes: float = 0.0
@@ -233,6 +242,7 @@ class RunResult:
             "model_seeds": list(self.model_seeds),
             "n_sequences": self.n_sequences,
             "n_runs": self.n_runs,
+            "n_reused": self.n_reused,
             "created_utc": self.created_utc,
             "minutes": self.minutes,
             "unlock_count": self.unlock_count,
@@ -258,7 +268,13 @@ class RunResult:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         result_path = self.output_dir / "run_result.json"
-        result_path.write_text(json.dumps(self.to_dict(), indent=2))
+        # `json_safe` plus `allow_nan=False`, exactly as `colabsd.bundle.save_bundle` and
+        # `colabsd.report` write theirs. The sd of a single run is NaN, which `json.dumps`
+        # writes as the bare token `NaN`: valid for Python's own reader, refused by every
+        # strict JSON reader there is, so a file nobody outside Python could open. `json_safe`
+        # turns those into `null` and `allow_nan=False` turns anything it missed into an
+        # exception here rather than into an unreadable file on disk.
+        result_path.write_text(json.dumps(json_safe(self.to_dict()), indent=2, allow_nan=False))
         runs_path = self.output_dir / "validation_runs.csv"
         pd.DataFrame(_flatten_runs(self.runs, self.condition_columns)).to_csv(runs_path, index=False)
         summary_path = self.output_dir / "validation_summary.csv"
@@ -312,6 +328,16 @@ def finetune(
     moved to `unfinished_checkpoint.pt` before it is retrained rather than overwritten; see
     the module docstring and `recover_runs`. Test metrics are never returned: call
     `unlock_test` for those.
+
+    Two refusals guard the numbers themselves. An adapter built at `dtype="float16"` is refused
+    before anything loads: float16's smallest number is larger than AdamW's epsilon, so the
+    first optimizer step divides by zero and the run finishes with an all-NaN model whose
+    correlation the engine reports as 0.0000. And any run whose loss curve or validation
+    predictions come back non-finite is refused after it trains, rather than published -- the
+    metrics cannot be asked, because `colabsd.engine.metrics` coerces a correlation it could not
+    compute to 0.0, which is a finite number no check of the metrics can tell from a measured
+    zero. Neither refusal writes a `RunResult`, so nothing downstream ever holds the number and
+    the next call retrains rather than reuses.
     """
     from colabsd.engine.train_config import TrainingStopped, train_eval_config
 
@@ -321,6 +347,17 @@ def finetune(
     targets = np.asarray(targets, dtype=np.float32)
     condition_columns = list(spec.condition_columns)
     _validate_inputs(sequences, targets, condition_columns, splits, spec)
+    # `==`, never `in`: "float16" is a substring of "bfloat16", and bfloat16 trains.
+    if _text_attr(adapter, "dtype") == "float16":
+        raise ColabSDError(
+            "float16 cannot train a model. AdamW's epsilon (1e-8) is smaller than the smallest "
+            "number float16 can hold, so the first optimizer step divides by zero and every "
+            "weight becomes NaN: the run finishes, and its validation Spearman is reported as "
+            "0.0000, which is the dead model and not a score. Build the adapter with "
+            "dtype='bfloat16' -- the same two bytes per weight, so the same memory -- or with "
+            "dtype='float32'. float16 is still fine for scoring a bundle that was trained in "
+            "something else."
+        )
 
     seeds = _unique([int(seed) for seed in (model_seeds if model_seeds else _default_model_seeds(best))])
     try:
@@ -359,6 +396,10 @@ def finetune(
 
     rows: list[dict[str, Any]] = []
     run_dirs: list[Path] = []
+    # A press that finds every run already finished in `output_dir` trains nothing, and used
+    # to report itself in exactly the words a real fit uses. Counted here because the loop
+    # below is the only place the distinction exists.
+    reused = 0
     notes: list[str] = []
     # One guard for the whole call, not one per run and not one per layer below this: a
     # watcher that raised once will raise again on every event for the rest of the job.
@@ -422,6 +463,7 @@ def finetune(
                         on_epoch=on_epoch,
                         on_batch=on_batch,
                     )
+                    _refuse_nonfinite_run(run_dir, name)
                     minutes = (time.time() - t0) / 60.0
                     _lock_test_artifacts(
                         run_dir=run_dir,
@@ -444,11 +486,27 @@ def finetune(
                     notes.extend(_cut_short_warning(row, name))
                 else:
                     row = cached
+                    reused += 1
                 rows.append(row)
                 run_dirs.append(run_dir)
                 _notify(progress, len(rows), total, name)
 
         notes.extend(watcher.warnings)
+        # Read before the RunResult is built, not inside its argument list. Every run has
+        # trained, been locked and been written to disk by the time this line runs, so a
+        # ColabSDError escaping from here threw away a finished job over a bookkeeping file:
+        # `run_result.json` was never written while `runs/` and `locked_test/` sat there
+        # complete. The counter falls back to zero, and the note is what stops that zero
+        # travelling on its own as a claim that the test partition has never been read.
+        try:
+            unlocks = read_unlock_count(output_dir)
+        except ColabSDError as exc:
+            unlocks = 0
+            notes.append(
+                f"The unlock counter could not be read ({exc}), so this result records the test "
+                "partition as never unlocked. Every run finished and is on disk; delete "
+                f"{output_dir / UNLOCK_FILENAME} to reset the counter, and say so in the report."
+            )
         aggregate = _aggregate(rows, condition_columns, partition="validation")
         result = RunResult(
             model_name=str(best.model),
@@ -470,7 +528,8 @@ def finetune(
             paths={},
             n_sequences=len(sequences),
             created_utc=_utc_now(),
-            unlock_count=read_unlock_count(output_dir),
+            unlock_count=unlocks,
+            n_reused=reused,
             minutes=(time.time() - started) / 60.0,
             warnings=_provisional_warning(best) + _budget_warning(settings) + notes,
             adapter_dtype=_text_attr(adapter, "dtype"),
@@ -524,7 +583,10 @@ def unlock_test(run_result: RunResult, *, output_dir: str | Path) -> dict[str, A
                 "split_seed": int(locked["split_seed"]),
                 "model_seed": int(locked["model_seed"]),
                 "run_dir": locked.get("run_dir", ""),
-                "test": {"mean": dict(locked["test"]["mean"]), "per_condition": per_condition},
+                "test": {
+                    "mean": _macro_without_unmeasured(locked["test"]["mean"], locked["test"]["per_target"]),
+                    "per_condition": per_condition,
+                },
             }
         )
     rows.sort(key=lambda row: (row["split_seed"], row["model_seed"]))
@@ -589,7 +651,7 @@ class RecoveredRun:
 
     def describe(self) -> str:
         """One line for a notebook: which run, how it ended, what it scored, where it is."""
-        ran = f" after {self.epochs_run} epoch(s)" if self.epochs_run else ""
+        ran = f" after {self.epochs_run} epoch{'' if self.epochs_run == 1 else 's'}" if self.epochs_run else ""
         best = "" if self.best_epoch is None else f" · best epoch {self.best_epoch + 1}"
         score = (
             ""
@@ -850,7 +912,7 @@ def _visible_row(
         "epochs_budget": int(max_epochs or metrics.get("epochs_run", 0) or 0),
         "test_locked": True,
         "validation": {
-            "mean": dict(validation["mean"]),
+            "mean": _macro_without_unmeasured(validation["mean"], validation["per_target"]),
             "per_condition": _rename_targets(validation["per_target"], condition_columns),
         },
     }
@@ -872,7 +934,7 @@ def _cached_row(run_dir: Path, fingerprint: str) -> dict[str, Any] | None:
 
     `colabsd_run.json` is written only after a run returns, so its presence used to be taken
     as proof that the run was complete. It is not: a stop press inside the epoch loop ends
-    that loop and the run finalises normally, marker file and all, having trained two epochs
+    that loop and the run finalizes normally, marker file and all, having trained two epochs
     of the twenty that were asked for. Reusing that as the finished answer makes the obvious
     remedy -- press Train again -- do nothing at all, so a run that records
     `stopped_early: "interrupted"` is never a cache hit.
@@ -984,7 +1046,9 @@ def _how_far(blob: dict[str, Any] | None, recorded: dict[str, Any] | None) -> st
         return ""
     budget = (recorded or {}).get("epochs_budget")
     same_run = (recorded or {}).get("epochs_run") == ran
-    return f" ({int(ran)} of {int(budget)} epochs)" if budget and same_run else f" ({int(ran)} epoch(s) trained)"
+    if budget and same_run:
+        return f" ({int(ran)} of {int(budget)} epoch{'' if int(budget) == 1 else 's'})"
+    return f" ({int(ran)} epoch{'' if int(ran) == 1 else 's'} trained)"
 
 
 def _free_path(directory: Path, name: str) -> Path:
@@ -1008,6 +1072,52 @@ def _cut_short_warning(row: dict[str, Any], name: str) -> list[str]:
         "short run's, not the budget's; the next Train press retrains it rather than reusing it, "
         "and moves these weights aside first."
     ]
+
+
+def _nonfinite_reason(run_dir: Path) -> str | None:
+    """Why this run's numbers are not a measurement, or None when they are.
+
+    Asked of the loss curve and of the predictions, never of the metrics: the engine's
+    `_safe_corr` reports 0.0 for a correlation it could not compute, so an all-NaN model
+    leaves `metrics.json` saying `Spearman: 0.0` -- a finite number no check of the metrics
+    can tell from a measured zero.
+    """
+    log_path = run_dir / "training_log.json"
+    if log_path.is_file():
+        try:
+            rows = json.loads(log_path.read_text())
+        except ValueError:
+            rows = []
+        for row in rows if isinstance(rows, list) else []:
+            for key in ("train_loss", "val_loss"):
+                value = row.get(key)
+                if value is None or not np.isfinite(float(value)):
+                    return f"{key} is {value} at epoch {int(row.get('epoch', 0))}"
+    npz_path = run_dir / "predictions.npz"
+    if npz_path.is_file():
+        with np.load(npz_path) as blob:
+            preds = np.asarray(blob["validation_predictions"], dtype=np.float64)
+        bad = int((~np.isfinite(preds)).sum())
+        if bad:
+            return f"{bad} of {preds.size} validation predictions are not finite"
+    return None
+
+
+def _refuse_nonfinite_run(run_dir: Path, name: str) -> None:
+    """Refuse a run whose numbers are not finite, instead of publishing a dead model's 0.0000."""
+    reason = _nonfinite_reason(run_dir)
+    if reason is None:
+        return
+    raise ColabSDError(
+        f"Run {name} trained a model whose numbers are not finite: {reason}. This is a dead "
+        "model, not a score of zero -- the correlation of an all-NaN prediction is reported as "
+        "0.0000, which is why it is refused here instead of published. The usual cause is "
+        "numeric precision float16, whose smallest number is larger than the optimizer's "
+        "epsilon: train in bfloat16, which is the same two bytes per weight and the same "
+        "memory, or in float32. Nothing on the page will show these numbers and nothing will "
+        f"reuse this run -- pressing Train again retrains it. What the engine wrote is in "
+        f"{run_dir}: training_log.json holds the loss curve this refusal read."
+    )
 
 
 def _validate_inputs(
@@ -1057,6 +1167,15 @@ def _clean_split(split: dict[str, list[int]], n: int, split_seed: int) -> dict[s
     for key, indices in cleaned.items():
         if not indices:
             raise DataError(f"Split seed {split_seed} has an empty {key}; the library is too small to split 8:1:1.")
+        if len(indices) < 2:
+            raise DataError(
+                f"Split seed {split_seed} gives {key} only {len(indices)} of this library's {n} variants, "
+                "and every metric here needs at least two rows: NDCG is undefined on one document and "
+                "Spearman has nothing to rank. An 8:1:1 split is 80/10/10 rounded down, so the validation "
+                "partition reaches two rows at 20 variants -- and at 20 for every split seed, because the "
+                "partition sizes depend on the library size alone. This library needs at least 20 variants "
+                "to train."
+            )
         if min(indices) < 0 or max(indices) >= n:
             raise DataError(
                 f"Split seed {split_seed} indexes row {max(indices)} of a {n}-row library. "
@@ -1072,7 +1191,7 @@ def _clean_split(split: dict[str, list[int]], n: int, split_seed: int) -> dict[s
         if shared:
             raise DataError(
                 f"Split seed {split_seed} puts {len(shared)} rows (for example {shared[:5]}) in both {left} and "
-                f"{right}. That leaks the held-out data into training and makes every number optimiztic: "
+                f"{right}. That leaks the held-out data into training and makes every number optimistic: "
                 "rebuild the splits with colabsd.data.make_splits()."
             )
     return cleaned
@@ -1272,6 +1391,36 @@ def _aggregate(rows: list[dict[str, Any]], condition_columns: list[str], *, part
                 }
             )
     return pd.DataFrame.from_records(records)
+
+
+def _macro_without_unmeasured(macro: Any, per_target: Any) -> dict[str, float]:
+    """The engine's macro block, with a metric no target could produce restored to NaN.
+
+    `colabsd.engine.metrics.mean_metric` returns `0.0` when every per-target value of a metric is
+    non-finite -- `precision_k` is NaN on a prediction whose range collapses, so a head that
+    predicts one number makes P@10 and P@50 undefined for every condition. Carried through, that
+    `0.0` is published as a measurement: `report.csv`'s `mean` row, `report.json` and the report
+    figure all show a bar at zero over "1 run", while `summarize_across_runs` reports the same
+    emptiness honestly as mean NaN over 0 runs in `validation_summary.csv` for the same run.
+    docs/CONTRACTS.md forbids exactly this -- an undefined statistic must not be published as 0.0,
+    "because a zero would read as 'perfectly stable'".
+
+    Masked here, on colabsd's side of the engine seam (docs/CONTRACTS.md section 0), so the
+    vendored engine is untouched and every artifact of one run says the same thing.
+    """
+    values = per_target.values() if isinstance(per_target, dict) else ()
+    out: dict[str, float] = {}
+    for metric, value in dict(macro).items():
+        measured = False
+        for target in values:
+            try:
+                if np.isfinite(float(target[metric])):
+                    measured = True
+                    break
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+        out[metric] = float(value) if measured else float("nan")
+    return out
 
 
 def _macro_summary(rows: list[dict[str, Any]], partition: str) -> dict[str, dict[str, float]]:

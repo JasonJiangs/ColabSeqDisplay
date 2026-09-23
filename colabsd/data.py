@@ -14,7 +14,9 @@ first rule through `require_unique_columns`.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -46,6 +48,16 @@ THREE_TO_ONE: dict[str, str] = {
 }
 ONE_LETTER_CODES: frozenset[str] = frozenset(THREE_TO_ONE.values())
 
+#: Where `load_library` records what a `min_count` did to the table it hands back: the key
+#: `DataFrame.attrs` carries, holding the read-count column, the threshold, the rows read out
+#: of the CSV and the rows kept. Plain strings and ints rather than an object of ours, because
+#: this travels with the frame and whatever reads it back should need nothing imported from
+#: here to understand it. Absent when no filter ran -- `min_count` was zero, the spec named no
+#: read-count column, or the CSV had no such column, which warns `MinCountIgnoredWarning`
+#: instead. Present with `rows_kept == rows_read` when the threshold ran and nothing fell below
+#: it, because a threshold that dropped nothing is a fact a user should be shown, not silence.
+MIN_COUNT_RECORD: str = "colabsd_min_count"
+
 
 def one_to_three_letter() -> dict[str, str]:
     """Invert `THREE_TO_ONE`, the one residue table this package owns.
@@ -55,6 +67,16 @@ def one_to_three_letter() -> dict[str, str]:
     rather than writing a second table out by hand keeps one list of twenty residues.
     """
     return {one: three for three, one in THREE_TO_ONE.items()}
+
+
+def _quoted(names: Iterable[Any]) -> str:
+    """`'p22', 'p42', 'activity'` -- a column list as prose, not as a Python list repr.
+
+    Kept private and duplicated in `colabsd.report` rather than shared: both modules sit below
+    the widget layer and cannot import `colabsd.ui.core`, which holds the panels' copy
+    (`positions_phrase`). The same reason `_plural` is written out twice.
+    """
+    return ", ".join(f"'{name}'" for name in names) or "none"
 
 
 class MinCountIgnoredWarning(UserWarning):
@@ -88,11 +110,19 @@ def load_library(
         csv_path: variant table, one row per variant.
         spec: library description; `spec.validate()` runs first.
         min_count: drop rows whose `spec.count_column` value is below this. A positive
-            threshold with no such column warns and keeps every row.
+            threshold whose column is missing from the table warns and keeps every row;
+            a spec that names no read-count column at all raises instead, because there
+            is nothing to count. A whole number of reads either way: a fractional
+            threshold raises, because the record left on the frame carries a whole one
+            and would misreport it.
 
     Returns:
         The filtered table with a reset index, one full-length amino-acid string
         per row, and a float32 array of shape `(N, len(spec.condition_columns))`.
+        When a `min_count` actually filtered, the returned table also carries
+        `attrs[MIN_COUNT_RECORD]` -- the column, the threshold, and the rows read and
+        kept -- because the count a caller is handed is the post-filter one and the
+        pre-filter one is the only thing that exposes a mistyped threshold.
     """
     spec.validate()
     path = Path(csv_path)
@@ -102,8 +132,10 @@ def load_library(
     if frame.empty:
         raise LibraryError(f"{path} has no rows. The variant table needs at least one variant.")
 
-    frame = _apply_min_count(frame, spec, min_count, path)
+    frame, filtered = _apply_min_count(frame, spec, min_count, path)
     frame = frame.reset_index(drop=True)
+    if filtered is not None:
+        frame.attrs[MIN_COUNT_RECORD] = filtered
     sequences = build_sequences(frame, spec)
     targets = build_targets(frame, spec)
     return frame, sequences, targets
@@ -152,11 +184,21 @@ def require_unique_columns(frame: pd.DataFrame, columns: list[str], *, source: s
         )
 
 
-def _apply_min_count(frame: pd.DataFrame, spec: LibrarySpec, min_count: int, path: Path) -> pd.DataFrame:
-    """Filter on `spec.count_column`, saying so out loud when there is nothing to filter on."""
+def _apply_min_count(
+    frame: pd.DataFrame, spec: LibrarySpec, min_count: int, path: Path
+) -> tuple[pd.DataFrame, dict[str, Any] | None]:
+    """Filter on `spec.count_column`, saying so out loud when there is nothing to filter on.
+
+    Hands back the table and, when a threshold really ran over a column that was really there,
+    a record of what it did -- the column, the threshold, and the rows read and kept -- for
+    `load_library` to hang on the frame under `MIN_COUNT_RECORD`. The record is `None` on every
+    path where no filtering happened, because the two ways a threshold can do nothing already
+    announce themselves: a spec with no read-count column raises here, and a table without the
+    column it names warns `MinCountIgnoredWarning`.
+    """
     threshold = _as_threshold(min_count)
     if not threshold:
-        return frame
+        return frame, None
     column = spec.count_column
     if column is None:
         raise LibraryError(
@@ -166,12 +208,12 @@ def _apply_min_count(frame: pd.DataFrame, spec: LibrarySpec, min_count: int, pat
     if column not in frame.columns:
         warnings.warn(
             f"min_count={min_count!r} was ignored: {path} has no '{column}' column, so all {len(frame)} variants "
-            f"were kept. Its columns are {list(frame.columns)}; set LibrarySpec(count_column=...) to the read-count "
-            "column, or pass min_count=0 to say you meant to keep every variant.",
+            f"were kept. Its columns are {_quoted(frame.columns)}; set LibrarySpec(count_column=...) to the "
+            "read-count column, or pass min_count=0 to say you meant to keep every variant.",
             MinCountIgnoredWarning,
             stacklevel=3,
         )
-        return frame
+        return frame, None
     require_unique_columns(frame, [column], source=str(path))
     counts = _numeric_counts(frame, path, column)
     filtered = frame.loc[counts >= threshold]
@@ -179,7 +221,12 @@ def _apply_min_count(frame: pd.DataFrame, spec: LibrarySpec, min_count: int, pat
         raise LibraryError(
             f"No variant in {path} has {column} >= {min_count}; the highest is {counts.max():g}. Lower min_count."
         )
-    return filtered
+    return filtered, {
+        "column": str(column),
+        "threshold": int(threshold),
+        "rows_read": int(len(frame)),
+        "rows_kept": int(len(filtered)),
+    }
 
 
 def build_sequences(frame: pd.DataFrame, spec: LibrarySpec) -> list[str]:
@@ -318,8 +365,8 @@ def _require_columns(
     if missing:
         where = f" in {path}" if path is not None else ""
         raise LibraryError(
-            f"Columns {missing} are not{where} in the variant table. "
-            f"Available columns: {list(frame.columns)}. Fix the column names in the library specification."
+            f"Columns {_quoted(missing)} are not{where} in the variant table. "
+            f"Available columns: {_quoted(frame.columns)}. Fix the column names in the library specification."
             f"{_mangled_hint(frame, missing)}"
         )
     require_unique_columns(frame, wanted, source=None if path is None else str(path))
@@ -345,7 +392,21 @@ def _as_threshold(min_count: object) -> float:
     value = float(min_count)
     if not np.isfinite(value):
         raise LibraryError(f"min_count must be a finite number of reads, got {min_count!r}.")
-    return max(value, 0.0)
+    # Clamped before the whole-number test, so that the two negatives answer the same way. A
+    # threshold below zero is below every read count there can be, so it filters nothing whichever
+    # way it is spelled; tested first, `-3` was quietly clamped to 0 while `-0.5` was refused as
+    # fractional, and the refusal then suggested "Pass 0 or 1" about a number the caller had
+    # written as negative. Nothing above zero is changed by the clamp, so 2.5 and 0.5 still raise.
+    value = max(value, 0.0)
+    if value != int(value):
+        raise LibraryError(
+            f"min_count must be a whole number of reads, got {min_count!r}. The record this filter "
+            f"leaves on the frame -- and the sentence the panel prints from it -- carries a whole "
+            f"threshold, so a fractional one would be reported as {int(value)} while the filter kept "
+            f"only rows at or above {min_count!r}: a false claim about a real row. Pass {int(value)} "
+            f"or {int(value) + 1}."
+        )
+    return value
 
 
 def _numeric_counts(frame: pd.DataFrame, path: Path, column: str) -> pd.Series:
@@ -361,18 +422,32 @@ def _numeric_counts(frame: pd.DataFrame, path: Path, column: str) -> pd.Series:
 
 def _one_letter_column(frame: pd.DataFrame, column: str, spec: LibrarySpec) -> list[str]:
     text = frame[column].astype(str).str.strip()
+    # Two readers, one sentence. The notebook user has a checkbox and no keyword argument in
+    # sight, so the checkbox is named first, verbatim, including its comma -- it is
+    # `colabsd.ui.main_workflow`'s "Residues are written as Asn, not N", under "Show the
+    # advanced settings". The plain-API user gets the constructor argument second. Telling
+    # only the second reader, as this did, sent the first one looking for a `three_letter=`
+    # that is on no control.
     if spec.three_letter:
         mapped = text.str.capitalize().map(THREE_TO_ONE)
-        expected = "three-letter codes such as Asn; set three_letter=False if the CSV uses one-letter codes"
+        expected = (
+            "three-letter codes such as Asn. Untick **Residues are written as Asn, not N** on the "
+            "form -- it is under *Show the advanced settings* -- if the CSV uses one-letter codes, "
+            "or build the spec with LibrarySpec(three_letter=False)."
+        )
     else:
         upper = text.str.upper()
         mapped = upper.where(upper.isin(ONE_LETTER_CODES))
-        expected = "one-letter codes such as N; set three_letter=True if the CSV uses three-letter codes"
+        expected = (
+            "one-letter codes such as N. Tick **Residues are written as Asn, not N** on the form -- "
+            "it is under *Show the advanced settings* -- if the CSV uses three-letter codes, or "
+            "build the spec with LibrarySpec(three_letter=True)."
+        )
     unknown = mapped.isna()
     if unknown.any():
         position = int(np.argmax(unknown.to_numpy()))
         raise LibraryError(
             f"Unknown residue {text.iloc[position]!r} in column '{column}', row {position} "
-            f"(index {frame.index[position]!r}). Residues must be {expected}."
+            f"(index {frame.index[position]!r}). Residues must be {expected}"
         )
     return mapped.tolist()

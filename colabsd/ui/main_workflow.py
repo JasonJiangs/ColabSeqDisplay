@@ -17,18 +17,19 @@ backbone question — the one whose answer decides everything else — was asked
 `wt_3di.txt` downloaded between them. It is asked once now, in step 2, and step 3 is
 whatever that answer implies: a SaProt backbone reads structure and needs a wild-type 3Di
 string, which `colabsd.ui.prepare_workflow` builds the section for and which stays in the
-session. An ESM2 backbone needs nothing, and then there is no step 3 at all.
+session. A backbone that reads the sequence alone needs nothing prepared, and then there is
+no step 3 at all.
 
 Two deliberate differences from the ColabPLM notebooks we are otherwise copying:
 
-* **The modelling choices are read-only.** They hand the user LoRA and trainer widgets; we
+* **The modeling choices are read-only.** They hand the user LoRA and trainer widgets; we
   look the values up from a study that was already run and show them with their provenance
   and their measured test Spearman, or, for a placeholder entry, in red. A hyperparameter
   re-tuned while you watch your own validation score has quietly eaten your test set. How
   the model is read out is decided the same way and is not on the form either: the pooled
   feature is the mean of the embeddings at the mutated sites. Three settings are the
   exception — the epoch ceiling, the early-stopping patience and the micro batch — because
-  they are budget rather than modelling: how long the user is willing to train, and what
+  they are budget rather than modeling: how long the user is willing to train, and what
   fits on the card they were given. They are prefilled from the same lookup, validated
   before the run, and whatever they end up as is what the bundle and the archive record.
 * **The test set is not unlocked here.** There is no widget on this page that can read it.
@@ -52,6 +53,7 @@ from colabsd.backbones.registry import BACKBONES
 from colabsd.spec import LibrarySpec
 from colabsd.ui import core, exports, theme
 from colabsd.ui import prepare_workflow as prep
+from colabsd.ui.core import counted
 
 # --------------------------------------------------------------------------------------
 # What is on the page
@@ -106,16 +108,44 @@ SECTION_TITLES: dict[str, str] = {
     "score": "Score some variants",
 }
 
+
+def model_section_note() -> str:
+    """What the backbone dropdown is choosing between, said without naming a name twice.
+
+    The pooled-feature sentence is the reason this is a function and not a literal. It used to
+    say `ESMDance` in prose, which meant the note would go on explaining a backbone the form
+    had stopped offering -- the registry drops a name by moving it into
+    `WITHHELD_MODEL_REASONS`, and nothing in a hand-written string notices. The notebook's own
+    guide already asked `build_notebooks.pooled_feature_lines` rather than restating it, so
+    both now ask `colabsd.ui.core`: `non_trunk_readout()` for the one offered backbone that is
+    read out through its own prediction instead of a trunk embedding, and `trunk_width_range()`
+    for the widths the sentence contrasts it against. Either coming back `None` makes the
+    contrast unsayable rather than merely shorter, so the clause is dropped whole.
+    """
+    note = (
+        "Which protein language model reads each sequence. The default reads sequence only, fits a free T4 "
+        "and needs nothing prepared. Each one is pooled the same way -- the mean over your mutated sites -- "
+    )
+    readout = core.non_trunk_readout()
+    widths = core.trunk_width_range()
+    if readout and widths:
+        narrowest, widest = widths
+        note += (
+            f"but not all of them pool the same thing: every entry but `{readout}` averages the trunk "
+            f"embedding, {narrowest:,} to {widest:,} numbers wide, and `{readout}` averages its own "
+            f"{BACKBONES[readout].embed_dim:,}-dimensional dynamics prediction. "
+        )
+    else:
+        note += "and every one of them pools the same thing, the trunk embedding. "
+    return note + "A SaProt backbone adds a preparation step below; the rest add none."
+
+
 SECTION_NOTES: dict[str, str] = {
     "data": (
         "One row per variant: the residue at each mutated site, and what you measured for it. Full-length "
         "sequences are **built** by substituting those residues into your wild type, never read from a FASTA."
     ),
-    "model": (
-        "Which protein language model reads each sequence. The default reads sequence only, fits a free T4 "
-        "and needs nothing prepared. Every backbone here is read out the same way: the mean of the "
-        "embeddings at your mutated sites. A SaProt backbone adds a preparation step below; ESM2 adds none."
-    ),
+    "model": model_section_note(),
     "structure": "",  # `prepare_workflow.section_note` writes this one: it names the backbone that caused it.
     "hyperparameters": (
         "Looked up for the backbone above and shown with its provenance. The learning rates, the LoRA "
@@ -129,10 +159,10 @@ SECTION_NOTES: dict[str, str] = {
         "trains on the training split and early-stops on validation. **Validation numbers only** come back: "
         "the test partition is moved out of reach as each run finishes, and only the last cell of this "
         "notebook can open it, which counts every unlock.\n\n"
-        "While it trains, the loss and the validation score are drawn under the progress line and redrawn "
-        "every few seconds, with the loss of each batch inside the epoch under way overlaid faintly — so a "
-        "run that is not converging says so before its first epoch closes. They are the same two curves the "
-        "performance archive keeps as `training_curve.png`."
+        "While it trains, the training loss, the same MSE on the validation split and the validation score "
+        "are drawn under the progress line and redrawn every few seconds, with the loss of each batch inside "
+        "the epoch under way overlaid faintly — so a run that is not converging says so before its first "
+        "epoch closes. They are the same three curves the performance archive keeps as `training_curve.png`."
     ),
     "results": (
         "What the fine-tuned model scored on the **validation** partition of every run: the macro average "
@@ -142,10 +172,16 @@ SECTION_NOTES: dict[str, str] = {
     "export": (
         "- **The model**, as one `.zip` the Predict notebook reads: the LoRA weights, the head, your library "
         "description, the *frozen* pooled coordinates, the hyperparameters and the provenance.\n"
-        "- **The performance**, as a second `.zip`: the report CSV, the figure, and a `performance.json` "
-        "saying which partition the numbers describe and how many times the test set has been read. It is "
-        "written from **validation** numbers with the test partition still locked; unlock it later and press "
-        "again for the same archive carrying the test numbers and the count."
+        # The sentence `exports.archive_contents_sentence` returns opens "Inside it, in the order
+        # they were written:", because in `exports.summary_html` it follows a paragraph break. So
+        # this half ends on a full stop rather than a colon: with one it read "as a second `.zip`:
+        # Inside it, in the order they were written: ..." -- two colons and a capital between them.
+        "- **The performance**, as a second `.zip`. "
+        f"{exports.archive_contents_sentence()} "
+        "The `README.txt` says in plain text which partition the numbers describe and how many times "
+        "the test set has been read, and `performance.json` says the same as JSON. It is written from "
+        "**validation** numbers with the test partition still locked; unlock it later and press again "
+        "for the same archive carrying the test numbers and the count."
     ),
     "score": (
         "The smallest useful prediction outlet. For a real screen open "
@@ -160,9 +196,13 @@ MESSAGE_SECTIONS: dict[str, str] = {
     "min_count_without_count_column": "data",
     "count_column_ignored": "data",
     "library_not_loaded": "data",
+    # Beside the note the last check wrote, because the note is what it contradicts.
+    "library_changed": "data",
     "unknown_backbone": "model",
     "backbone_not_in_colab": "model",
     "backbone_needs_big_gpu": "model",
+    "backbone_needs_dtype": "model",
+    "dtype_not_trainable": "model",
     "backbone_extra_install": "model",
     "backbone_withdrawn": "model",
     "three_di_missing": "structure",
@@ -208,10 +248,41 @@ SECTION_RETRY: dict[str, str] = {
 BLOCKING_KEYS: frozenset[str] = frozenset(
     {
         "library_not_loaded",
+        # The data form edited since the check that loaded the frame. It is a refusal and not a
+        # warning because nothing is withdrawn from the page when it fires: `results_stale`
+        # warns because the results it is about are taken off the screen at the same moment,
+        # whereas here `self.frame` is still loaded, still the previous table, and pressing
+        # Train really would train it under the settings now on the form.
+        "library_changed",
+        # A threshold with no column to apply it to: `colabsd.data.load_library` refuses outright
+        # rather than keep every row, so nothing loads. It blocks rather than warns because the
+        # flag is never unset -- a library read at 0 stays loaded when the box is raised to 10,
+        # and the run would train on an unfiltered frame under a form saying 10. `library_changed`
+        # above now catches that drift as well, and says the general thing; this one stays because
+        # it says the particular thing -- that **Check my library** will not get past
+        # `needs a read-count column` until a column is named -- and it is the message that
+        # remains true after the user presses the button the other one asks for.
+        "min_count_without_count_column",
         "no_gpu",
         "unknown_backbone",
         "backbone_not_in_colab",
         "backbone_needs_big_gpu",
+        # A backbone that loads in one precision only, with the form set to another: the run
+        # gets as far as downloading 11 GB of weights and then runs out of memory on every card
+        # Colab has, which is the same hour-and-a-download cost `backbone_needs_big_gpu` above
+        # refuses for. It is a refusal rather than a warning for that reason: the only thing a
+        # reader can do with the red box is the thing it asks for, and pressing Train first
+        # spends the download to find that out. `core.backbone_messages` raises it from
+        # `registry.required_dtype`, so a backbone with no required precision never sees it.
+        "backbone_needs_dtype",
+        # `float16` cannot train anything: the optimizer's epsilon is smaller than the smallest
+        # number the format holds, so the first update divides by zero and every weight becomes
+        # NaN. The run does not crash -- it finishes, and the panel reports its validation
+        # Spearman as 0.0000, which is the dead model and not a score. An hour of training that
+        # ends in NaN is not a warning, so the button refuses. `colabsd.train.finetune` refuses
+        # the same thing at the library boundary; this is so the user is told before the hour,
+        # not after it.
+        "dtype_not_trainable",
         "backbone_withdrawn",
         "three_di_missing",
         "three_di_not_attached",
@@ -220,7 +291,7 @@ BLOCKING_KEYS: frozenset[str] = frozenset(
         "esmfold_too_long",
         "config_missing",
         "config_unreadable",
-        # A budget the training loop cannot honour: zero epochs, a patience nothing can reach,
+        # A budget the training loop cannot honor: zero epochs, a patience nothing can reach,
         # a micro batch that does not divide the effective one or does not fit the training
         # split. Every one of those is a crash or an empty run a minute in, so the button
         # refuses rather than warns, and `colabsd.bestconfig` supplies the sentence.
@@ -278,56 +349,77 @@ def example_note() -> str:
     """The bundled example described from the files themselves, so the prose cannot drift."""
     variants = example_variants()
     length = example_wt_length()
-    size = f"{variants:,d} variants" if variants else "the variants"
+    size = counted(variants, "variant") if variants else "the variants"
     protein = f"a {length:,d}-residue PET hydrolase" if length else "a PET hydrolase"
     sites = len(parse_list(EXAMPLE_MUTATION_COLUMNS))
     note = (
-        f"The bundled **{EXAMPLE_NAME}** library: {size} of {protein}, {sites} mutated sites against one "
+        f"The bundled **{EXAMPLE_NAME}** library: {size} of {protein}, {counted(sites, 'mutated site')} against one "
         f"measured condition, `{EXAMPLE_CONDITION_COLUMNS}` — the log of the assay reading. It runs, end "
         "to end, inside one Colab session, and it is far too small to measure a backbone with"
     )
     rows = example_test_rows()
-    return note + (f": an 8:1:1 split leaves {rows} variants to test on." if rows > 0 else ".")
+    return note + (f": an 8:1:1 split leaves {counted(rows, 'variant')} to test on." if rows > 0 else ".")
 
 
 def withdrawn_note() -> str:
     """Where the backbones that used to be on this list went, one line per name.
 
-    Somebody who came here for ProtT5 or ESMC deserves an answer rather than a shorter list
-    and no explanation, and the answer is not "they were deleted". It is also not one
-    sentence: this note used to say every withdrawn backbone had a tested adapter and no
-    tuned hyperparameters, and that was wrong four times over — METL has no adapter at all,
-    and ProtT5-XL, ESMC-300M, ESMDance and METL each ship a tuned `cosine_p90_mean` entry in
-    `config/best/` (the half `colabsd.bestconfig` never opens, so `hyperparameter_state`
-    still calls all four placeholders).
+    Somebody who came here for ESMC deserves an answer rather than a shorter list and no
+    explanation, and the answer is not "they were deleted". It is also not one sentence: this
+    note used to say every withdrawn backbone had a tested adapter and no tuned
+    hyperparameters, and both halves are false of the list as it stands — `METL` has no
+    adapter at all, and `ESMC-300M` is tuned in the half `colabsd.bestconfig` actually reads.
     So the reason is asked of `colabsd.backbones.registry` per name, which is where it is
     written and where the notebook's own guide reads it from.
+
+    A reason shared by a family is one bullet about however many names it covers, so the
+    sentence after it has to agree in number -- `ESMC-300M` and `ESMC-600M` were told "It still
+    builds from Python." -- and has to be asked of every name in the group rather than of
+    `names[0]`. No group mixes adapter states in the registry as it stands, but that is a fact
+    about today's entries and not a property of the grouping, which is on the reason text.
     """
     from colabsd.backbones import registry
 
     withdrawn = core.withdrawn_backbones()
     if not withdrawn:
         return ""
-    families = " and ".join(registry.OFFERED_FAMILIES)
+    offered = registry.offered()
+    # The blank lines are the note, not a formatting preference. python-markdown does not let a
+    # list interrupt a paragraph: with the first bullet directly under this intro line the whole
+    # note came back as one <p> with bare newlines in it, which HTML collapses to spaces, so a
+    # reader saw eight logical lines run together with literal hyphens inside the sentence and no
+    # <ul> at all -- and `theme._fallback_markdown` emitted no <li> either, because a block whose
+    # first line is not a bullet is rendered as a paragraph joined with <br>. One blank line
+    # before the bullets and one before the closing sentence give both renderers three blocks:
+    # a paragraph, a list, a paragraph.
     lines = [
-        f"**Only {families} are offered here** — read the sequence, or read the sequence and the shape. "
-        f"The other {len(withdrawn)} of the {len(BACKBONES)} are in the package and not on this form:"
+        f"**The form offers {len(offered)} of the {len(BACKBONES)} backbones this package "
+        f"registers**: {core.offered_backbones_phrase()}. The other {len(withdrawn)} are in the "
+        "package and not on this form:",
+        "",
     ]
-    for name in withdrawn:
-        tail = (
-            "still builds from Python"
-            if registry.has_adapter(name)
-            else "no adapter here, so there is nothing to run it with"
-        )
-        try:
-            reason = registry.withheld_reason(name) or "it is offered"
-        except Exception:
-            # A family in neither list is a registry bug. It must not stop the page building.
-            reason = "no reason is recorded for it in the registry, which is a bug worth reporting"
-        lines.append(f"- `{name}` — {reason}; {tail}.")
+    for names, reason in core.withheld_groups():
+        built = [name for name in names if registry.has_adapter(name)]
+        bare = [name for name in names if not registry.has_adapter(name)]
+        if not bare:
+            tail = "It still builds from Python." if len(built) == 1 else "They still build from Python."
+        elif not built:
+            tail = (
+                "No adapter here, so there is nothing to run it with."
+                if len(bare) == 1
+                else "No adapters here, so there is nothing to run them with."
+            )
+        else:
+            tail = (
+                f"{core.and_joined(built)} still builds from Python; "
+                f"{core.and_joined(bare)} has no adapter here at all."
+            )
+        lines.append(f"- {core.and_joined(names)} — {core.as_sentence(reason)} {tail}")
+    lines.append("")
     lines.append(
         "To put one back on the form, move its family out of `WITHHELD_FAMILY_REASONS` and into "
-        "`OFFERED_FAMILIES` in `colabsd/backbones/registry.py`."
+        "`OFFERED_FAMILIES` in `colabsd/backbones/registry.py`; for a single name struck out of a family "
+        "that is already on the form, delete its line from `WITHHELD_MODEL_REASONS` there."
     )
     return "\n".join(lines)
 
@@ -346,6 +438,11 @@ LIBRARY_NOTE = (
 #: Everything this wizard keeps in `WizardState.extra`, and what it starts as.
 EXTRA_DEFAULTS: dict[str, Any] = {
     "library_loaded": False,
+    # What the data form said when **Check my library** last read the table. `library_loaded`
+    # says a table was read; this says *which* one, so editing the form afterwards is caught
+    # rather than trained on. `None` until the first check, which is why `library_is_stale`
+    # is False before one.
+    "library_fingerprint": None,
     "trained": False,
     "exported": False,
     "library_csv": "",
@@ -359,6 +456,9 @@ EXTRA_DEFAULTS: dict[str, Any] = {
     # The read-count column the last load asked to filter on and did not find. Empty when the
     # load filtered on what it was given, which is every load naming a column the CSV has.
     "count_column_missing": "",
+    # And what that table's columns actually were, so the box about the column it has not got
+    # can name the ones it has. Written only when the filter was dropped; empty otherwise.
+    "count_column_options": "",
     "three_di_text": "",
     "three_di_file": "",
     "structure_file": "",
@@ -435,7 +535,7 @@ PROGRESS_STYLE = (
     f"overflow:hidden;text-overflow:ellipsis;height:{PROGRESS_ROW_HEIGHT};line-height:{PROGRESS_ROW_HEIGHT}"
 )
 
-#: How wide the live training curve is drawn on the page. The figure itself is 10 x 6.6 inches
+#: How wide the live training curve is drawn on the page. The figure itself is 15 x 4.4 inches
 #: whatever the dpi (`colabsd.curves.build_curve_figure`), so this is the browser scaling one
 #: fixed picture rather than a second size the figure has to be drawn at: the screen and
 #: `training_curve.png` stay the same drawing. The figure is three panels side by side, so it
@@ -469,14 +569,17 @@ def new_state(**changes: Any) -> core.WizardState:
 # --------------------------------------------------------------------------------------
 
 
-def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
-    """Everything that decides *what* a run is, so a change to any of it invalidates one.
+def library_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
+    """Every field that decides *which table* **Check my library** reads, and how.
 
-    Where the results are written is deliberately not in here: mounting Drive half way
-    through does not make the numbers on screen belong to a different experiment. What it
-    does change is where the next run goes, and `run_dir` and `run_directory_moved` are
-    where that is kept straight -- the results stay, and they keep pointing at the directory
-    they were written to.
+    These nine are what `colabsd.data.load_library` is handed: the file, the wild type, the
+    positions, the two column lists, the three-letter flag and the read-count filter. Change
+    one of them and the frame already in memory is a frame of something else, which is why
+    `library_is_stale` compares this against what was recorded at check time.
+
+    It is the front half of `training_fingerprint`, spelled once so the two cannot drift: a
+    field added here is a field that invalidates both the loaded library and a finished run,
+    and there is no way to add it to one and forget the other.
     """
     return (
         state.data_source,
@@ -488,6 +591,22 @@ def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
         bool(state.get("three_letter_residues")),
         str(state.get("count_column") or ""),
         int(state.get("min_count") or 0),
+    )
+
+
+def training_fingerprint(state: core.WizardState) -> tuple[Any, ...]:
+    """Everything that decides *what* a run is, so a change to any of it invalidates one.
+
+    The library half is `library_fingerprint` and is not repeated here; the rest is the model,
+    the precision, the structure, the seeds and the budget.
+
+    Where the results are written is deliberately not in here: mounting Drive half way
+    through does not make the numbers on screen belong to a different experiment. What it
+    does change is where the next run goes, and `run_dir` and `run_directory_moved` are
+    where that is kept straight -- the results stay, and they keep pointing at the directory
+    they were written to.
+    """
+    return library_fingerprint(state) + (
         state.backbone,
         state.dtype,
         state.three_di_source,
@@ -512,6 +631,22 @@ def results_are_stale(state: core.WizardState) -> bool:
         return False
     recorded = state.get("trained_fingerprint")
     return recorded is not None and tuple(recorded) != training_fingerprint(state)
+
+
+def library_is_stale(state: core.WizardState) -> bool:
+    """True when the data form has been edited since **Check my library** read the table.
+
+    The sibling of `results_are_stale`, one step earlier: that one asks whether the numbers on
+    screen still describe the form, this one asks whether the frame in memory does. Both are
+    needed, and the second is the one that was missing -- `results_are_stale` only consults
+    its fingerprint once a run has finished, so it guarded the run and never the library, and
+    a user who changed the read-count column after checking trained the previous table under
+    the new settings with nothing on the page saying so.
+    """
+    if not state.get("library_loaded"):
+        return False
+    recorded = state.get("library_fingerprint")
+    return recorded is not None and tuple(recorded) != library_fingerprint(state)
 
 
 def has_results(state: core.WizardState) -> bool:
@@ -553,7 +688,7 @@ def numbered_titles(state: core.WizardState) -> dict[str, str]:
     """Every section's heading, numbered by where it actually falls on this page.
 
     A step this configuration does not need is absent, not grayed out, so the numbers close
-    up behind it: an ESM2 run has no preparation step, and its hyperparameters are step 3.
+    up behind it: a sequence-only run has no preparation step, and its hyperparameters are step 3.
     """
     shown = visible_sections(state)
     titles = {name: f"{index} · {SECTION_TITLES[name]}" for index, name in enumerate(shown, start=1)}
@@ -611,23 +746,49 @@ def extra_messages(state: core.WizardState) -> list[core.Message]:
                 "Your library has not been read yet. Press **Check my library** below.",
             )
         )
+    if library_is_stale(state):
+        # Routed to the **data** section on purpose: it renders directly under the note the
+        # check wrote, which is the thing it is contradicting. The note itself is left alone --
+        # it is the record of what was actually read, and rewriting it would destroy the
+        # evidence this box is pointing at. `library_loaded` is left alone too: clearing it
+        # would raise `library_not_loaded`, which is false, and collapse every section below
+        # the library off the page.
+        out.append(
+            core.Message(
+                "library_changed",
+                "stop",
+                "The library settings have changed since **Check my library** last read the table, so "
+                "the note above describes the previous one. Press **Check my library** again before "
+                "training: otherwise the run would be trained on the table that was read, under the "
+                "settings now on the form.",
+            )
+        )
     if int(state.get("min_count") or 0) > 0 and not str(state.get("count_column") or "").strip():
         out.append(
             core.Message(
                 "min_count_without_count_column",
-                "warning",
-                f"You asked to drop variants seen fewer than {state.get('min_count')} times, but no read-count "
-                "column is named, so every row will be kept. Name the column above, or set the threshold to 0.",
+                "stop",
+                f"You asked to drop variants seen fewer than {counted(int(state.get('min_count') or 0), 'time')}, but no "
+                "read-count column is named, so there is no column to count and nothing will load: "
+                "**Check my library** stops with `needs a read-count column`. Name the column above, "
+                "or set the threshold to 0.",
             )
         )
     ignored_column = str(state.get("count_column_missing") or "")
     if ignored_column and ignored_column == str(state.get("count_column") or "").strip():
+        # The columns the table does have are the one fact `colabsd.data`'s own warning carried
+        # and this box did not, which is why that warning used to be echoed into this section as
+        # a second yellow box saying the same thing. It is said once now, here, where it also
+        # says what to do about it and where it survives a refresh.
+        options = str(state.get("count_column_options") or "")
+        has = f" Its columns are {options}." if options else ""
         out.append(
             core.Message(
                 "count_column_ignored",
                 "warning",
                 f"The library that loaded has no **{ignored_column}** column, so the threshold of "
-                f"{state.get('min_count')} filtered nothing and all {state.n_variants:,} variants were kept. "
+                f"{state.get('min_count')} filtered nothing and the table kept "
+                f"{counted(state.n_variants, 'variant')}.{has} "
                 "Correct the column name above and press **Check my library** again, or set the threshold to "
                 "0 if you meant to keep every variant.",
             )
@@ -800,6 +961,126 @@ def missing_count_column(frame: Any, state: core.WizardState) -> str:
     return "" if column in columns else column
 
 
+def _measured(value: float) -> str:
+    """One measured target value at four significant figures: `0`, `6.281`, `-1.25`, `1.235e+06`."""
+    return f"{float(value):.4g}"
+
+
+def condition_line(targets: Any, spec: LibrarySpec) -> str:
+    """The conditions, named, with the range of the measured values behind each one.
+
+    TUTORIAL section 1 tells a reader to read "the range of the target values" before going on,
+    and section "Filling in the form" says the same about their own library; for two rounds the
+    panel printed no range at all and the documents promised one. It is the number that catches
+    a condition column pointing at the wrong column -- a column of read counts reads `from 3 to
+    900` where this example's activity reads `from 0 to 6.281` -- and training z-scores the
+    labels, so the raw scale is invisible everywhere downstream. Per condition, because
+    `spec.condition_columns` may hold several and they are predicted at once.
+
+    Computed from the `targets` array `colabsd.data.load_library` returned rather than from the
+    frame: `build_targets` has already refused a missing, non-numeric or float32-overflowing
+    value with a message of its own, so every number here is finite and there is no NaN case to
+    render. A constant column is not an error but is worth saying out loud: z-scoring it divides
+    by zero, and it is what a mis-named column often looks like.
+    """
+    columns = list(spec.condition_columns)
+    said: list[str] = []
+    for index, column in enumerate(columns):
+        values = [float(row[index]) for row in targets]
+        if not values:
+            said.append(f"`{column}`")
+            continue
+        low, high = min(values), max(values)
+        said.append(
+            f"`{column}` is {_measured(low)} in every row"
+            if low == high
+            else f"`{column}` from {_measured(low)} to {_measured(high)}"
+        )
+    return f"- {counted(len(columns), 'condition')}: " + "; ".join(said) + "."
+
+
+def min_count_line(frame: Any) -> str:
+    """What the read-count threshold did to the table that loaded, or nothing when none ran.
+
+    The asymmetry this closes: a `min_count` that did nothing already announced itself twice --
+    `colabsd.data` warns when the CSV has no such column, and `extra_messages` warns when no
+    column was named at all -- while a `min_count` that dropped 73 of 137 rows said nothing, and
+    the only count on the page was the 64 that survived. TUTORIAL section 1 asks a reader to
+    check these numbers before going on, because every later step inherits a mistake made here,
+    and one number on its own cannot show a mistyped threshold or a mistyped column.
+    `colabsd.data.load_library` records the two counts on the frame it returns; this is only the
+    sentence.
+    """
+    from colabsd.data import MIN_COUNT_RECORD
+
+    record = getattr(frame, "attrs", {}).get(MIN_COUNT_RECORD)
+    if not record:
+        return ""
+    read, kept = int(record["rows_read"]), int(record["rows_kept"])
+    column, threshold = str(record["column"]), int(record["threshold"])
+    dropped = read - kept
+    if not dropped:
+        return (
+            f"- Read counts: {counted(read, 'row')} read, none below {threshold:,} in **{column}**, so the "
+            "threshold dropped nothing."
+        )
+    return (
+        f"- Read counts: {counted(dropped, 'row')} of {counted(read, 'row')} fell below "
+        f"{threshold:,} in **{column}** and {'was' if dropped == 1 else 'were'} dropped; "
+        f"{kept:,} kept."
+    )
+
+
+def library_note(frame: Any, csv_path: Any, spec: LibrarySpec, targets: Any) -> str:
+    """Everything the library that just loaded says about itself, in one note.
+
+    TUTORIAL section 1 says "Read those numbers before you go on" about this note, which is why
+    it is a function of the four things it describes rather than four lines inside the button
+    handler: `tests/test_ui_main.py` renders it through both of `colabsd.ui.theme`'s markdown
+    paths and counts the list items, and that is how three rounds of a run-on paragraph were
+    finally found. python-markdown does not let a list interrupt a paragraph, so with the first
+    bullet directly under the head line the whole note came back as a single <p> with bare
+    newlines in it -- "**124 variants** from `x.csv`. - Wild type: 287 residues. - 19 mutated
+    sites at [22] ..." on one line, hyphens and all -- and `theme._fallback_markdown` joined the
+    same lines with <br> and made no <li> either. The blank line after the head line is what
+    gives both renderers a paragraph and then a list.
+
+    `min_count_line`'s bullet is appended with a single newline on purpose: by then the list has
+    started, and a blank line there would end it and start a second one.
+    """
+    note = (
+        f"**{counted(len(frame), 'variant')}** from `{csv_path}`.\n\n"
+        f"- Wild type: {counted(len(spec.wt_sequence), 'residue')}.\n"
+        f"- {counted(spec.k, 'mutated site')} at {core.positions_phrase(spec.positions_1based)}, "
+        f"wild-type {'residue' if spec.k == 1 else 'residues'} `{spec.wt_residues()}`.\n"
+        f"{condition_line(targets, spec)}"
+    )
+    dropped = min_count_line(frame)
+    return note + (f"\n{dropped}" if dropped else "")
+
+
+def three_di_note(three_di: str, wt_sequence: str, target: Any) -> str:
+    """What arrived from the 3Di step, measured against the wild type it has to match.
+
+    The two lengths are the note: a 3Di string of the wrong length is the one way this step can
+    look like it worked and not have, and `core.three_di_length_mismatch` reads the same two
+    numbers. Extracted for the renderer guard in `tests/test_ui_main.py`, and carrying the blank
+    line the guard is about -- three bullets directly under this head line came out of both
+    renderers as one paragraph with the hyphens left in it.
+    """
+    return (
+        # Through `counted` for the thousands separator, not for the plural: the two lengths
+        # are the same wild type and a one-residue protein is not a library. The library note
+        # a step above prints its own length that way, and a 1,054-residue wild type reading
+        # "1,054 residues" there and "1054 residues" here looked like two different numbers.
+        f"3Di attached: {counted(len(three_di), 'state')} for {counted(len(wt_sequence), 'residue')}, "
+        "and kept in this session.\n\n"
+        f"- sequence `{wt_sequence[:60]}…`\n"
+        f"- 3Di      `{three_di[:60]}…`\n"
+        f"- written to `{target}`"
+    )
+
+
 def load_blockers(state: core.WizardState) -> list[str]:
     """What stops the check-my-library button, each said as the thing to go and fix."""
     problems = []
@@ -819,8 +1100,8 @@ def load_blockers(state: core.WizardState) -> list[str]:
         problems.append("No condition columns named. List at least one CSV column holding a measured activity.")
     if columns and len(columns) != len(positions):
         problems.append(
-            f"{len(columns)} mutation columns for {len(positions)} positions. Name exactly one column per "
-            "position, in the same order."
+            f"{counted(len(columns), 'mutation column')} for {counted(len(positions), 'position')}. Name exactly "
+            "one column per position, in the same order."
         )
     return problems
 
@@ -1008,7 +1289,7 @@ def hyperparameter_view(best: Any, budget: TrainingBudget | None = None) -> Hype
     else:
         spearman = f"{mean:.4f}" + (f" ± {sd:.4f}" if sd is not None else "")
         if n_runs:
-            spearman += f" over {n_runs} re-evaluation runs"
+            spearman += f" over {counted(n_runs, 're-evaluation run')}"
     meta = dict(getattr(best, "meta", {}) or {})
     provenance = str(meta.get("source") or "not recorded")
     if meta.get("optuna_trial") is not None:
@@ -1022,8 +1303,9 @@ def hyperparameter_view(best: Any, budget: TrainingBudget | None = None) -> Hype
         provenance=provenance,
         test_spearman=spearman,
         protocol=(
-            f"{len(split_seeds)} split seeds × {len(model_seeds)} model seeds = "
-            f"{len(split_seeds) * len(model_seeds)} runs, selected on {getattr(best, 'objective', 'unknown')}"
+            f"{counted(len(split_seeds), 'split seed')} × {counted(len(model_seeds), 'model seed')} = "
+            f"{counted(len(split_seeds) * len(model_seeds), 'run')}, "
+            f"selected on {getattr(best, 'objective', 'unknown')}"
         ),
         lora_rows=[(name, _format_value(value)) for name, value in sorted(dict(best.params).items())],
         training_rows=[
@@ -1049,6 +1331,23 @@ def _rows_html(rows: Sequence[tuple[str, str]]) -> str:
     return f"<table>{cells}</table>"
 
 
+def provenance_note(view: HyperparameterView) -> str:
+    """Where these numbers came from, under the two tables that show them.
+
+    Extracted from `hyperparameter_html` so that `tests/test_ui_main.py` can render it through
+    both of `colabsd.ui.theme`'s markdown paths, which is how the missing blank line was found:
+    with the two bullets directly under the provenance line, python-markdown read the whole note
+    as one paragraph and produced no list at all, so a reader got "Provenance: mutation_site_mean
+    - Evaluation protocol: ... - Read from ..." on one line. Neither renderer lets a list
+    interrupt a paragraph; the blank line is what starts the list under both.
+    """
+    return (
+        f"Provenance: {view.provenance}\n\n"
+        f"- Evaluation protocol: {view.protocol}\n"
+        f"- Read from `{view.source_path}`"
+    )
+
+
 def hyperparameter_html(view: HyperparameterView) -> str:
     """The looked-up hyperparameters, as a settled result or as a red placeholder."""
     if view.is_provisional:
@@ -1072,11 +1371,7 @@ def hyperparameter_html(view: HyperparameterView) -> str:
         + "</div><div style='margin-top:8px'><b>Training block</b>"
         + _rows_html(view.training_rows)
         + "</div>"
-        + theme.note_html(
-            f"Provenance: {view.provenance}\n"
-            f"- Evaluation protocol: {view.protocol}\n"
-            f"- Read from `{view.source_path}`"
-        )
+        + theme.note_html(provenance_note(view))
     )
 
 
@@ -1302,9 +1597,14 @@ def capture_loader_warnings(load: Callable[[], Any]) -> tuple[Any, list[str]]:
     `colabsd.data` warns rather than raises when the read-count column it was told to filter
     on is not in the CSV: the library still loads, and what trains is not what the form asked
     for. A warning written to stderr inside an ipywidgets callback reaches no cell in Colab,
-    so the one warning that changes the training set has to be caught here and put on the
-    page. `simplefilter("always", ...)` because Python shows a warning once per source line
-    and the second press of the button would otherwise be silent.
+    so a warning that changes the training set has to be caught here rather than left to a
+    stream nobody is reading. `simplefilter("always", ...)` because Python shows a warning once
+    per source line, and a caller that echoes one would otherwise be silent on the second press.
+
+    What the caller does with them is the caller's decision: `on_check_library` echoes a warning
+    only when the panel is not already saying the same thing in its own box, because for the one
+    warning this actually catches today the panel raises `count_column_ignored` for exactly the
+    same condition, and section 1 was showing that one fact in two yellow boxes.
     """
     import warnings
 
@@ -1351,11 +1651,12 @@ def truncation_note(dropped: Sequence[str], n_validation: int) -> str:
         return ""
     names = ", ".join(f"`{metric}`" for metric in dropped)
     cuts = ", ".join(str(metric_cutoff(metric)) for metric in dropped)
-    rows = int(n_validation)
-    counted = f"{rows} row" if rows == 1 else f"{rows} rows"
+    # `counted` rather than a fourth inline plural: this said "1 rows" once, which is the same
+    # defect the library note had, and a local of that name would now shadow the helper.
+    partition = counted(int(n_validation), "row")
     verb, named = ("is", "it names") if len(dropped) == 1 else ("are", "they name")
     return (
-        f"{names} {verb} not in this table: the validation partition is **{counted}**, shorter than the "
+        f"{names} {verb} not in this table: the validation partition is **{partition}**, shorter than the "
         f"cut {named} ({cuts}). Every variant falls inside a cut that long, so the number cannot mean what "
         "its name promises — with that few rows even an arbitrary ranking scores a long way above zero. "
         "`report.csv` in the performance archive carries it anyway."
@@ -1394,10 +1695,39 @@ def validation_headline(summary: dict[str, Any] | None) -> str:
     mean = float(macro.get("mean", float("nan")))
     sd = float(macro.get("sd", float("nan")))
     n_runs = int(macro.get("n_runs", 0))
-    line = f"Validation Spearman, averaged over conditions: {mean:.4f} ± {sd:.4f} ({n_runs} run(s))"
+    line = f"Validation Spearman, averaged over conditions: {mean:.4f} ± {sd:.4f} ({counted(n_runs, 'run')})"
     if n_runs < 2:
         line += " — one run shows no spread, so the ± is `nan`."
     return line
+
+
+def finished_note(n_runs: int, minutes: float, headline: str, *, reused: int = 0) -> str:
+    """The line above the results table: how many runs, how long, and what they scored.
+
+    `core.format_minutes` says a run that rounds down to nothing in words, so this no longer
+    reports "Finished 1 run in 0 min." for a run that really took forty seconds. Extracted for
+    the renderer guard: the headline bullet sat directly under the head line, so neither
+    renderer made a list of it and the run's score was read as a hyphen in the middle of a
+    sentence.
+
+    `reused` is how many of those runs were answered from a finished run already in the working
+    directory rather than trained again (`colabsd.train.RunResult.n_reused`). A press that
+    trained nothing at all used to read "Finished 4 runs in 0 min." -- the same sentence a real
+    fit makes, with a duration near zero because it is the wall time of the call. A fully
+    reused press says no duration at all: a wall time of zero is not a fast run.
+    """
+    n_runs = int(n_runs or 0)
+    reused = int(reused or 0)
+    if n_runs and reused >= n_runs:
+        head = f"Reused {counted(n_runs, 'run')} already in the working directory -- nothing was trained."
+    elif reused:
+        head = (
+            f"Finished {counted(n_runs, 'run')} in {core.format_minutes(minutes)}; "
+            f"{counted(reused, 'run')} reused from the working directory."
+        )
+    else:
+        head = f"Finished {counted(n_runs, 'run')} in {core.format_minutes(minutes)}."
+    return f"{head}\n\n- **{headline}**"
 
 
 def plan_line(state: core.WizardState, best: Any | None = None) -> str:
@@ -1405,14 +1735,18 @@ def plan_line(state: core.WizardState, best: Any | None = None) -> str:
     split_seeds, model_seeds = training_seeds(state, best)
     estimate = core.estimate_runtime(state)
     line = (
-        f"Split seeds {split_seeds} × model seeds {model_seeds} = **{estimate.n_runs} run(s)**. "
+        # `core.positions_phrase`, not the lists themselves: a Python list repr in an English
+        # sentence read "Split seeds [1, 2] × model seeds [11, 22]", brackets and all.
+        f"Split seeds {core.positions_phrase(split_seeds)} × model seeds "
+        f"{core.positions_phrase(model_seeds)} = **{counted(estimate.n_runs, 'run')}**. "
         f"{estimate.describe()}"
     )
     protocol = len(getattr(best, "split_seeds", []) or []) * len(getattr(best, "model_seeds", []) or [])
     if protocol and estimate.n_runs < protocol:
         line += (
-            f" The registry entry was selected over {protocol} runs; {estimate.n_runs} says less about "
-            "reproducibility."
+            f" The registry entry was selected over {counted(protocol, 'run')}; "
+            f"{counted(estimate.n_runs, 'run')} "
+            f"{'says' if estimate.n_runs == 1 else 'say'} less about reproducibility."
         )
     return line
 
@@ -1460,17 +1794,29 @@ class Backend:
 
         return create_adapter(backbone, **kwargs)
 
-    def load_three_di(self, path: Path, *, expected_length: int | None = None) -> str:
+    def load_three_di(
+        self, path: Path, *, expected_length: int | None = None, wt_sequence: str | None = None
+    ) -> str:
         from colabsd.structure import load_three_di
 
-        return load_three_di(path, expected_length=expected_length)
+        return load_three_di(path, expected_length=expected_length, wt_sequence=wt_sequence)
 
-    def validate_three_di(self, text: str, expected_length: int | None = None) -> str:
+    def validate_three_di(
+        self, text: str, expected_length: int | None = None, *, wt_sequence: str | None = None
+    ) -> str:
+        # `wt_sequence` is how the check tells a 3Di string from the amino-acid sequence: the
+        # 3Di alphabet is the same twenty letters lower-cased, so the letters alone cannot, and
+        # `colabsd.structure.validate_three_di` compares the two strings instead. Keyword-only
+        # with a None default, so a caller that has no wild type to hand still validates the
+        # alphabet and the length.
         from colabsd.structure import validate_three_di
 
-        return validate_three_di(text, expected_length)
+        return validate_three_di(text, expected_length, wt_sequence=wt_sequence)
 
     def three_di_from_structure(self, path: Path, **kwargs: Any) -> str:
+        # `on_note` comes through here: the two structure routes report a construct mismatch by
+        # handing the sentence back rather than printing it, because nothing under `colabsd.ui`
+        # captures stdout and a print from inside a button handler reaches nobody.
         from colabsd.structure import three_di_from_structure
 
         return three_di_from_structure(path, **kwargs)
@@ -1530,7 +1876,7 @@ class Backend:
             raise RuntimeError(core.upload_needs_colab_notice(what)) from None
         uploaded = files.upload()
         if not uploaded:
-            raise RuntimeError(core.upload_cancelled_notice(what))
+            raise RuntimeError(core.upload_canceled_notice(what))
         return Path(next(iter(uploaded))).resolve()
 
     def offer_download(self, path: Path) -> None:
@@ -2020,10 +2366,22 @@ class MainWizard:
         return self.w.VBox([row, download])
 
     def _write_library_template(self) -> Path:
-        """The bundled example library, copied out under a name of its own."""
+        """The bundled example library, copied out under a name of its own.
+
+        In the notation the form has already been set to. The bundled file is written in
+        one-letter codes, so ticking the box and pressing this handed back a template the
+        panel's own loader refuses at row 0 -- "Unknown residue 'Y' in column 'p22', row 0".
+        The state key rather than `spec.three_letter`, because at the moment this button is
+        pressed no library has loaded and there is no spec: it is the same key `library_spec`
+        reads.
+        """
         from colabsd import templates
 
-        return templates.write_library_template(work_dir(self.state), example_path("library.csv"))
+        return templates.write_library_template(
+            work_dir(self.state),
+            example_path("library.csv"),
+            three_letter=bool(self.state.get("three_letter_residues")),
+        )
 
     def _write_variants_template(self) -> Path:
         """A variants table with *this* library's mutated-site columns and its wild-type row.
@@ -2186,7 +2544,10 @@ class MainWizard:
                     self.progress.value = ""
                 self.logs[section].value = theme.message_html(interrupted_text(section, where), "warning")
             except Exception as exc:  # noqa: BLE001 - the message is the product here
-                text = f"**That did not work.** {type(exc).__name__}: {exc}"
+                # `theme.as_text` because the note is HTML and an exception message is data:
+                # an error naming `<https://...>` or a host that "said <address>" had the part
+                # naming what failed eaten by the browser.
+                text = f"**That did not work.** {type(exc).__name__}: {theme.as_text(exc)}"
                 advice = out_of_memory_advice(exc, training_budget(self.state)) if section == "run" else ""
                 self.logs[section].value = theme.message_html(f"{text}\n\n{advice}" if advice else text, "stop")
             finally:
@@ -2445,7 +2806,7 @@ class MainWizard:
                 self._draw_curve()
         except Exception as exc:  # noqa: BLE001 - the picture is the convenience, the model is the point
             self.logs["run"].value += theme.message_html(
-                f"{CURVE_FAILURE_WARNING} ({type(exc).__name__}: {exc})", "warning"
+                f"{CURVE_FAILURE_WARNING} ({type(exc).__name__}: {theme.as_text(exc)})", "warning"
             )
 
     def _draw_curve_from_run(self) -> bool:
@@ -2481,20 +2842,29 @@ class MainWizard:
         self.state.n_variants = len(frame)
         self.state.wt_length = len(spec.wt_sequence)
         self.state.wt_3di_length = 0
-        self.state.set("count_column_missing", missing_count_column(frame, self.state))
-        self.state.set("library_loaded", True)
-        self._say(
-            "data",
-            f"**{len(frame):,} variants** from `{csv_path}`.\n"
-            f"- Wild type: {len(spec.wt_sequence)} residues.\n"
-            f"- {spec.k} mutated sites at {list(spec.positions_1based)}, wild-type residues "
-            f"`{spec.wt_residues()}`.\n"
-            f"- {spec.n_targets} conditions: {', '.join(spec.condition_columns)}.",
+        missing_column = missing_count_column(frame, self.state)
+        self.state.set("count_column_missing", missing_column)
+        self.state.set(
+            "count_column_options",
+            ", ".join(f"`{name}`" for name in getattr(frame, "columns", [])) if missing_column else "",
         )
-        # The loader's own words, which name the columns the CSV does have. A load that warned
-        # is a load that did something other than what the form asked for.
-        for warning in warned:
-            self.logs["data"].value += theme.message_html(warning, "warning")
+        self.state.set("library_loaded", True)
+        # And what the form said while it was read, so an edit afterwards is caught rather than
+        # trained on. Written beside the flag and never apart from it: the flag says a table was
+        # read, this says which one.
+        self.state.set("library_fingerprint", library_fingerprint(self.state))
+        self._say("data", library_note(frame, csv_path, spec, targets))
+        # The loader's own words, when they are not the panel's own words over again. `warned`
+        # holds `MinCountIgnoredWarning` and nothing else, and it is raised for exactly the
+        # condition `extra_messages` raises `count_column_ignored` for -- a read-count column
+        # named on the form that the table has not got -- so section 1 was showing one fact in
+        # two yellow boxes one line apart. `count_column_ignored` is the box that says what to
+        # do about it, survives a refresh and sits under the control, and it now carries the
+        # column list that was this warning's alone, so the echo is only for a warning the
+        # panel is not already making.
+        if not missing_column:
+            for warning in warned:
+                self.logs["data"].value += theme.message_html(warning, "warning")
 
     def _resolve_library_inputs(self) -> tuple[Path, str]:
         if self.state.data_source == "bundled_example":
@@ -2514,6 +2884,11 @@ class MainWizard:
         """
         if self.spec is None:
             raise ValueError("Check the library first: the 3Di string is measured against its wild-type length.")
+        # Collected, not appended as they arrive: `_say` REPLACES `logs[section].value`, so a
+        # note written before the step's own sentence would be erased by it. One `_say` below,
+        # with the notes under it. `theme.as_text` because a structure filename and a residue
+        # list are data going into HTML (see the escape at `_guard`).
+        notes: list[str] = []
         three_di = self.three_di.resolve(
             self.state,
             self.backend,
@@ -2521,6 +2896,7 @@ class MainWizard:
             artifact=self.artifact(),
             work_dir=work_dir(self.state),
             has_gpu=self._has_gpu(),
+            on_note=notes.append,
         )
         self.spec = replace(self.spec, wt_3di=three_di)
         self.spec.validate()
@@ -2534,14 +2910,10 @@ class MainWizard:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(three_di + "\n")
         self.session_three_di = prep.written_artifact(target, three_di)
-        length = len(self.spec.wt_sequence)
-        self._say(
-            "structure",
-            f"3Di attached: {len(three_di)} states for {length} residues, and kept in this session.\n"
-            f"- sequence `{self.spec.wt_sequence[:60]}…`\n"
-            f"- 3Di      `{three_di[:60]}…`\n"
-            f"- written to `{target}`",
-        )
+        said = three_di_note(three_di, self.spec.wt_sequence, target)
+        if notes:
+            said += "".join(f"\n- {theme.as_text(note)}" for note in notes)
+        self._say("structure", said)
 
     def on_train(self) -> None:
         items = messages(self.state, runtime=self.runtime, status=self._config_status())
@@ -2616,9 +2988,14 @@ class MainWizard:
         note = truncation_note(truncated_metrics(n_validation), n_validation)
         return (
             theme.note_html(
-                f"Finished {getattr(self.run, 'n_runs', 0)} run(s) in "
-                f"{core.format_minutes(getattr(self.run, 'minutes', 0.0))}.\n"
-                f"- **{validation_headline(summary)}**"
+                finished_note(
+                    getattr(self.run, "n_runs", 0),
+                    getattr(self.run, "minutes", 0.0),
+                    validation_headline(summary),
+                    # `getattr` with a default: a hand-built `RunResult` in a test, and one
+                    # written by an older colabsd and read back, may not carry the counter.
+                    reused=int(getattr(self.run, "n_reused", 0) or 0),
+                )
             )
             + f"<div style='margin-top:10px'><b>{model_label} — validation</b>{table}</div>"
             + theme.note_html(
@@ -2644,6 +3021,11 @@ class MainWizard:
 
     def on_export(self) -> None:
         """Write the model bundle: the weights, and everything needed to use them again."""
+        # Same defect as `on_score`: the previous export's "Written ..." sentence stayed on the
+        # page under the refusal. Only the widget is cleared here -- `self.bundle` is the bundle
+        # that is still on disk and is what `on_score` scores with, and dropping it while
+        # `has_bundle(state)` still says yes would turn a refused export into a crash below.
+        self.export_result.value = ""
         problems = export_blockers(self.state)
         if problems:
             raise RuntimeError(" ".join(problems))
@@ -2667,6 +3049,10 @@ class MainWizard:
         so the report was unreachable unless you spent the test set to see it. Pressing this
         again after an unlock rewrites the same file with the test numbers and the count.
         """
+        # Same defect as `on_score`: the previous archive's summary stayed on the page under the
+        # refusal.
+        self.performance_result.value = ""
+        self.performance = None
         problems = export_blockers(self.state)
         if problems:
             raise RuntimeError(" ".join(problems))
@@ -2684,6 +3070,11 @@ class MainWizard:
         self.performance_result.value = exports.summary_html(export)
 
     def on_score(self) -> None:
+        # A refusal must not leave the previous run's ranked table and its "Written to" sentence
+        # on the page under a red Stop. `_guard` clears `logs[section]` and nothing else, and
+        # `refresh()` never touches this widget.
+        self.score_result.value = ""
+        self.scores = None
         problems = score_blockers(self.state)
         if problems:
             raise RuntimeError(" ".join(problems))
@@ -2698,7 +3089,7 @@ class MainWizard:
         target.parent.mkdir(parents=True, exist_ok=True)
         self.scores.to_csv(target, index=False)
         self.score_result.value = theme.note_html(
-            f"Scored {len(self.scores)} variants, ranked by `{rank_by}`. Written to `{target}`."
+            f"Scored {counted(len(self.scores), 'variant')}, ranked by `{rank_by}`. Written to `{target}`."
         ) + self.scores.head(20).to_html(index=False)
         self.backend.offer_download(target)
 

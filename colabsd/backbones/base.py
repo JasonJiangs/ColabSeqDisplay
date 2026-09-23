@@ -17,6 +17,7 @@ importing this module costs nothing in a notebook cell.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from colabsd.backbones.registry import BACKBONES, BackboneEntry
@@ -27,6 +28,73 @@ if TYPE_CHECKING:
     import torch.nn as nn
 
 DTYPES = ("float32", "float16", "bfloat16")
+
+#: What the slow T5 sentencepiece tokenizer needs, as (what you `pip install`, what you import).
+#: Two packages, not one: `sentencepiece` reads the vocabulary, and under transformers 5 the slow
+#: T5 tokenizer parses `spiece.model` through `protobuf`. The pair differs for protobuf, which is
+#: the whole reason this is written as pairs: the distribution installs the `google` namespace and
+#: no top-level module of its own name, so `find_spec("protobuf")` is None on a runtime that has
+#: it -- transformers spells its own check `google.protobuf` for the same reason. It lives here
+#: rather than in either adapter because both T5 families ask the question, from opposite ends:
+#: `prott5_hf` before transformers is called at all, because for that repo the slow tokenizer is
+#: mandatory, and `ankh_hf` only after a load has already failed, because that one ships a fast
+#: `tokenizer.json` and a precheck there would refuse a backbone that works.
+T5_TOKENIZER_PACKAGES: tuple[tuple[str, str], ...] = (
+    ("sentencepiece", "sentencepiece"),
+    ("protobuf", "google.protobuf"),
+)
+
+
+def missing_t5_tokenizer_packages() -> list[str]:
+    """The install names of whichever T5 tokenizer packages this runtime does not have.
+
+    Empty when both are there, which is what a caller reads as "a missing package is not what
+    broke this". `find_spec` is fetched from `importlib.util` inside the call rather than bound at
+    import, both to keep importing this module free and so a test can force either answer.
+
+    A dotted name is asked in a `try`, because `find_spec` imports the parent package before it
+    looks for the child: `find_spec("google.protobuf")` returns None only when `google` exists and
+    has no `protobuf` in it, and raises `ModuleNotFoundError` on a runtime that has no `google` at
+    all -- which is precisely the runtime this function exists to describe. Uncaught, it reached
+    `prott5_hf` as a bare "No module named 'google'" instead of the sentence naming both packages,
+    and reached `ankh_hf` from inside its `except BackboneError` handler, discarding the diagnosis
+    it had already made. A name that cannot even be looked up is a name this runtime does not have.
+    """
+    from importlib.util import find_spec
+
+    def absent(module: str) -> bool:
+        try:
+            return find_spec(module) is None
+        except (ImportError, ValueError):
+            # ModuleNotFoundError for a missing parent package; ValueError for a module that is
+            # somehow already in sys.modules without a spec. Either way there is nothing to load.
+            return True
+
+    return [install for install, module in T5_TOKENIZER_PACKAGES if absent(module)]
+
+
+@lru_cache(maxsize=1)
+def dtype_keyword() -> str:
+    """`"dtype"` or `"torch_dtype"` -- whichever the installed transformers means by it.
+
+    transformers renamed the argument and kept the old name as a deprecated alias, so every load
+    printed "`torch_dtype` is deprecated! Use `dtype` instead!" into the notebook. Passing the new
+    name unconditionally is the worse bug, not the fix: `pyproject.toml` asks for
+    `transformers>=4.40`, and on a release that predates the rename `dtype=` lands in `**kwargs`
+    and is dropped without a word -- the model would load in float32 while the form said
+    `bfloat16`, silently, which is exactly the failure `SaProt-1.3B` needs the setting to prevent:
+    float32 is the precision its 66 layers run out of memory in, on every card Colab offers.
+
+    So the question is asked of the installed library rather than of its version string: the new
+    name exists precisely where `PretrainedConfig` carries a `dtype` attribute. Cached, because it
+    cannot change inside a session and every backbone load asks.
+    """
+    try:
+        from transformers import PretrainedConfig
+
+        return "dtype" if hasattr(PretrainedConfig(), "dtype") else "torch_dtype"
+    except Exception:  # pragma: no cover - transformers is a hard dependency
+        return "torch_dtype"
 
 
 class HFAdapterBase:
@@ -139,8 +207,9 @@ class HFAdapterBase:
         return getattr(torch, self.dtype)
 
     def _from_pretrained(self, factory: Any, **kwargs: Any) -> nn.Module:
+        keyword = dtype_keyword()
         return self._guarded(
-            lambda: factory.from_pretrained(self.hf_id, torch_dtype=self.torch_dtype(), **kwargs),
+            lambda: factory.from_pretrained(self.hf_id, **{keyword: self.torch_dtype()}, **kwargs),
             "weights",
         )
 

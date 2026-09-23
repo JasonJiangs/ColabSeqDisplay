@@ -32,6 +32,7 @@ JSON and its README all say it the same way.
 
 from __future__ import annotations
 
+import html as _html
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -39,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from colabsd.ui import exports, theme
-from colabsd.ui.core import Message, render_messages
+from colabsd.ui.core import Message, counted, render_messages
 from colabsd.ui.exports import number, unlock_verdict
 
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
@@ -61,6 +62,8 @@ def _recorded_metrics() -> tuple[str, ...]:
 #: Used only when `colabsd.train` cannot be imported at all, exactly like `FALLBACK_METRICS`:
 #: the name is read from that module so the panel and the trainer cannot disagree about it.
 FALLBACK_LOCKED_DIRNAME = "locked_test"
+#: Same reason, for the file the counter lives in.
+FALLBACK_UNLOCK_FILENAME = "unlock.json"
 
 
 def _locked_dirname() -> str:
@@ -69,6 +72,14 @@ def _locked_dirname() -> str:
     except ImportError:  # pragma: no cover - colabsd.train is a hard dependency in Colab
         return FALLBACK_LOCKED_DIRNAME
     return str(LOCKED_DIRNAME)
+
+
+def _unlock_filename() -> str:
+    try:
+        from colabsd.train import UNLOCK_FILENAME
+    except ImportError:  # pragma: no cover - colabsd.train is a hard dependency in Colab
+        return FALLBACK_UNLOCK_FILENAME
+    return str(UNLOCK_FILENAME)
 
 
 def has_locked_test(output_dir: Path | str | None) -> bool:
@@ -214,12 +225,14 @@ def truncated_metric_notices(run_result: Any, metric: str) -> list[Message]:
     rows = report.partition_rows(run_result).get("test", 0)
     if not rows or metric not in report.truncated_metrics(rows, [metric]):
         return []
-    counted = f"{rows} row" if rows == 1 else f"{rows} rows"
+    # Named `rows_phrase` and not `counted`: `core.counted` is what builds it now, and a local
+    # of that name would shadow the import for the rest of this function without a test noticing.
+    rows_phrase = counted(rows, "row")
     return [
         Message(
             "metric_truncated",
             "warning",
-            f"**`{metric}` is not a cut of a partition this size.** The test partition is {counted}, "
+            f"**`{metric}` is not a cut of a partition this size.** The test partition is {rows_phrase}, "
             f"shorter than the {report.metric_cutoff(metric)} that name promises, so every variant falls "
             "inside it and the number is near 1 for any ranking at all. Pick a metric that ranks the whole "
             "partition — `Spearman` — if you want the headline to mean something.",
@@ -230,7 +243,7 @@ def truncated_metric_notices(run_result: Any, metric: str) -> list[Message]:
 def status_notices(
     *,
     inputs: UnlockInputs,
-    unlock_count: int,
+    unlock_count: int | None,
     confirmed: bool,
     locked_test: bool | None = None,
     metric: str = DEFAULT_METRIC,
@@ -247,11 +260,27 @@ def status_notices(
     has been on disk, untouched, since training finished" was then said about a folder with no
     test partition and no training behind it -- and said while the real run directory's own
     counter said otherwise. `None` means nobody looked, and nothing is claimed either way.
+
+    `unlock_count` takes the same convention for the same reason. An `unlock.json` that cannot
+    be parsed used to arrive here as 0, and 0 is not "unknown": it is the one claim that must
+    never be made wrongly, and the panel made it -- "the test partition has been on disk,
+    untouched, since training finished" -- about a directory whose counter it had just failed
+    to read. `None` means the counter could not be read, and nothing here claims it is zero.
     """
     out: list[Message] = []
     nothing_locked = inputs.output_dir is not None and locked_test is False
     out.extend(truncated_metric_notices(inputs.run_result, metric))
-    if unlock_count == 1:
+    if unlock_count is None:
+        out.append(
+            Message(
+                "unlock_count_unreadable",
+                "warning",
+                f"The unlock counter in `{inputs.output_dir}/{_unlock_filename()}` could not be read, so how "
+                "often this test partition has already been read is unknown. Nothing here claims it "
+                "is zero. Delete that file to reset the counter, and say so in the report.",
+            )
+        )
+    elif unlock_count == 1:
         out.append(
             Message(
                 "already_unlocked_once",
@@ -271,7 +300,7 @@ def status_notices(
                 "export afterwards.",
             )
         )
-    elif not nothing_locked:
+    elif unlock_count is not None and not nothing_locked:
         out.append(
             Message(
                 "never_unlocked",
@@ -319,7 +348,7 @@ def blocking(found: Sequence[Message]) -> list[Message]:
     return [message for message in found if message.severity == "stop"]
 
 
-def can_unlock(*, inputs: UnlockInputs, unlock_count: int, confirmed: bool) -> bool:
+def can_unlock(*, inputs: UnlockInputs, unlock_count: int | None, confirmed: bool) -> bool:
     """True when a click would actually read the test set."""
     return not blocking(status_notices(inputs=inputs, unlock_count=unlock_count, confirmed=confirmed))
 
@@ -387,7 +416,7 @@ def report_html(
         "<tr>"
         f"<td style='padding:3px 14px 3px 0'>{row.condition}</td>"
         f"<td style='padding:3px 14px 3px 0;font-family:monospace'>{number(row.mean)} ± {number(row.sd)}</td>"
-        f"<td style='padding:3px 0;color:#555'>{row.n_runs} run(s)</td>"
+        f"<td style='padding:3px 0;color:#555'>{counted(row.n_runs, 'run')}</td>"
         "</tr>"
         for row in rows
     )
@@ -562,15 +591,20 @@ class UnlockPanel:
     # -- state ---------------------------------------------------------------------------
 
     @property
-    def unlock_count(self) -> int:
-        """How often this run directory has been unlocked, straight off disk."""
+    def unlock_count(self) -> int | None:
+        """How often this run directory has been unlocked, straight off disk.
+
+        `None` when the counter could not be read at all. It used to be 0, and the correction
+        went only into the log while the notice board went on saying the test partition had
+        never been read -- the one thing this panel exists to be right about.
+        """
         if self.inputs.output_dir is None:
             return 0
         try:
             return int(self.runners.read_unlock_count(self.inputs.output_dir))
         except Exception as exc:
             self._say(f"could not read the unlock counter: {exc}")
-            return 0
+            return None
 
     @property
     def locked_test_present(self) -> bool:
@@ -657,7 +691,9 @@ class UnlockPanel:
         export = self._export_performance(metric)
         paths = {} if export is None else export.written()
         assembled = FinalReport(
-            unlock_count=int(payload.get("unlock_count", self.unlock_count)),
+            # The payload the unlock just wrote is the authority; `self.unlock_count` is only a
+            # fallback, and `or 0` covers the unreadable counter that now reads `None`.
+            unlock_count=int(payload.get("unlock_count", self.unlock_count or 0)),
             metric=metric,
             rows=tuple(condition_rows(payload, metric)),
             macro_mean=macro_mean,
@@ -729,9 +765,16 @@ class UnlockPanel:
             return None
 
 def plain_text(text: str) -> str:
-    """A message's markdown, flattened for a plain-text log line."""
+    """A message's markdown, flattened for a plain-text log line.
+
+    Entities are turned back into the characters they stand for. A note's text is written for
+    the notice board, which is HTML, so a value that carries `<` arrives here already escaped
+    by `theme.as_text`; this log is `ipywidgets.Output.append_stdout`, which is plain text and
+    would print the entity itself. Escaping belongs on the HTML side of the seam and has to
+    come back off on this one.
+    """
     flat = _MARKDOWN_LINK.sub(r"\1 (\2)", text)
-    return flat.replace("**", "").replace("`", "").replace("*", "")
+    return _html.unescape(flat.replace("**", "").replace("`", "").replace("*", ""))
 
 
 def launch(

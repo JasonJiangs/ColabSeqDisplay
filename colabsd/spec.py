@@ -194,14 +194,26 @@ class LibrarySpec:
                 "together so column i still names position i."
             )
         if self.wt_3di is not None:
-            stray = sorted(
-                {character for character in self.wt_3di if not (character.isascii() and character.isalpha())}
-            )
+            # The alphabet itself, not a proxy for it. `character.isalpha()` was standing in for
+            # "is a 3Di state", and it was wrong in both directions: it refused '#', the mask
+            # state foldseek really does write, and it accepted b/j/o/u/x/z, which
+            # `colabsd.structure.validate_three_di` refuses because SaProt maps them to <unk>.
+            # A '#'-bearing string could therefore be scored but never trained.
+            #
+            # Imported inside the function on purpose: this module imports only `.errors`, which
+            # is what keeps `colabsd.spec` at the bottom of the stack with no structure -> spec
+            # edge to come. `__post_init__` has already lower-cased `wt_3di`.
+            from colabsd.structure import THREE_DI_ALPHABET, THREE_DI_STATES
+
+            stray = sorted(set(self.wt_3di) - THREE_DI_ALPHABET)
             if stray:
                 shown = ", ".join(repr(character) for character in stray[:8])
                 raise SpecError(
-                    f"wt_3di contains {shown}, which are not 3Di letters. A Foldseek 3Di string is plain "
-                    "lowercase letters; strip any FASTA header or numbering before passing it."
+                    f"wt_3di contains {shown}, which are not Foldseek 3Di states. The alphabet is "
+                    f"'{THREE_DI_STATES}' -- twenty structural states plus '#', the mask state foldseek "
+                    "writes where a residue has no assignable backbone geometry. Strip any FASTA header "
+                    "or numbering, and build the string with colabsd.structure.three_di_from_structure() "
+                    "or three_di_from_esmfold() rather than by hand."
                 )
             if len(self.wt_3di) != length:
                 raise SpecError(

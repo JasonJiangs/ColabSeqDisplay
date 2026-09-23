@@ -1,12 +1,27 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "colabseqdisplay"
 version = "0.1.0"
-description = "No-code Colab front end for protein sequence-display library optimisation"
+description = "No-code Colab front end for protein sequence-display library optimization"
 readme = "README.md"
+authors = [{ name = "Shiyu Jiang" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    # No license classifier: PEP 639 superseded them by the `license` expression above, and
+    # setuptools>=77 refuses a project that declares both.
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+# CITATION.cff's header rule holds this equal to LICENSE and to `license:` in that file.
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26,<3",
@@ -16,22 +31,56 @@ dependencies = [
     "matplotlib>=3.7,<4",
     "tqdm>=4.66,<5",
     # 2.6, not 2.2: transformers refuses to torch.load a `pytorch_model.bin` on anything
-    # older (CVE-2025-32434), and SaProt publishes .bin rather than safetensors, so half
-    # the offered backbones cannot load below it.
+    # older (CVE-2025-32434), and four of the registered backbones publish .bin rather than
+    # safetensors -- four of the nine the form offers, which cannot load below this floor.
+    # The four are `colabsd.backbones.registry.BIN_ONLY_WEIGHTS`, not "SaProt": the three
+    # SaProts and ProtT5-XL. This comment used to call the caveat SaProt's alone, and to
+    # reach "half" by counting SaProt's three against a form of eight.
     "torch>=2.6,<3",
     "transformers>=4.40",
     "huggingface_hub>=0.23",
     "pyyaml>=6,<7",
+    # The panel's prose is markdown and `colabsd.ui.theme.render_markdown` renders it. Declared
+    # rather than sniffed: with it absent `_fallback_markdown` runs instead, and for three rounds
+    # which of the two a reader got was an accident of their runtime. Colab ships it; the setup
+    # cell installs this package, so a notebook gets it either way.
+    "markdown>=3.4,<4",
     # The notebooks are the product, and the whole panel is built from these two.
     # Colab ships both; a plain install elsewhere does not, and launch() would raise.
     "ipywidgets>=8,<9",
     "ipython>=8",
 ]
 
+[project.urls]
+Homepage = "https://github.com/JasonJiangs/ColabSeqDisplay"
+Repository = "https://github.com/JasonJiangs/ColabSeqDisplay"
+Documentation = "https://github.com/JasonJiangs/ColabSeqDisplay/blob/main/TUTORIAL.md"
+
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
-esmc = ["esm>=3.1"]
-prott5 = ["sentencepiece>=0.1.99,<1"]
+# `build` is here because tests/test_packaging.py is the only thing that proves the wheel
+# carries config/best and examples/, and `pytest.importorskip("build")` made that test skip
+# silently on every machine set up by `pip install -e .[dev]`. It passed during development
+# only because that environment happened to carry `build` for other reasons.
+dev = ["pytest", "ruff", "build"]
+# Upper bound, not decoration: from `esm` 3.4.0 the SDK builds an ESM-C attention block whose
+# `layernorm_qkv` is a custom `EsmcLayerNormLinear` rather than an `nn.Sequential` holding an
+# `nn.Linear`. `colabsd.engine.lora.inject_lora` replaces `nn.Linear` layers, so on 3.4 it reaches
+# `out_proj` and nothing else, and `validate_qkvo_coverage` refuses the run -- after the weights
+# have downloaded and the Train button has been pressed. Verified: 3.2.1 injects all four
+# projections and both real-weight tests pass; 3.4.0 and 3.4.1 fail them. There is no 3.3.
+esmc = ["esm>=3.1,<3.4"]
+# Two packages, not one: `sentencepiece` reads ProtT5's vocabulary and, under transformers 5,
+# the slow T5 tokenizer parses `spiece.model` through `protobuf`. Declared even though most
+# runtimes already have protobuf, because this extra is what `colabsd/backbones/ankh_hf.py`
+# tells a user to install when the tokenizer will not build.
+# Floors, and no ceilings -- which is the measurement, not an oversight. `protobuf<7` used to
+# sit here with no recorded reason and it excluded a combination that works: on protobuf 7.35.1
+# with sentencepiece 0.2.2 and transformers 5.17.0,
+# `T5Tokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50", legacy=False)` builds offline and
+# tokenizes `M K T A Y` to `[19, 14, 11, 3, 18, 1]`. `sentencepiece<1` was never measured against
+# anything, there being no 1.x to measure against. Neither was one of the two load-bearing pins
+# README.md lists, and an unexplained cap is the kind that outlives its reason.
+prott5 = ["sentencepiece>=0.1.99", "protobuf>=3.20"]
 optuna = ["optuna>=3,<5"]
 
 # `config/best/` and `examples/` sit beside the package in the source tree, and a wheel
@@ -60,9 +109,10 @@ packages = [
 
 [tool.setuptools.package-data]
 "colabsd.engine" = ["README.md"]
-"colabsd.config" = ["*.md"]
+# No entry for "colabsd.config" or "colabsd.examples" themselves: `config/` holds only `best/` and
+# `examples/` only `mg8_petases/`, so a `*.md` glob on either matched nothing and read as a promise
+# that loose files there would travel. The two directories that do hold files are named below.
 "colabsd.config.best" = ["*.yaml", "*.md"]
-"colabsd.examples" = ["*.md"]
 "colabsd.examples.mg8_petases" = ["*.csv", "*.fasta", "*.md", "*.xlsx"]
 
 [tool.ruff]

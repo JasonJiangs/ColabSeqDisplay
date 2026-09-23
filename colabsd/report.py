@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -109,7 +109,7 @@ def build_report(
     from colabsd.engine.metrics import TRACKED_METRICS
 
     if metric not in TRACKED_METRICS:
-        raise ReportError(f"Unknown metric {metric!r}. Tracked metrics are {list(TRACKED_METRICS)}.")
+        raise ReportError(f"Unknown metric {metric!r}. Tracked metrics are {_quoted(TRACKED_METRICS)}.")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -233,7 +233,7 @@ def _json_safe(value: Any) -> Any:
 
     One implementation, in `colabsd.bundle`, because the bundle manifest and this report
     publish the same numbers -- the single-run `sd` that is NaN by design among them -- and
-    two sanitisers that drift apart is exactly how one of the two ended up unreadable.
+    two sanitizers that drift apart is exactly how one of the two ended up unreadable.
     """
     return json_safe(value)
 
@@ -365,11 +365,17 @@ def partition_rows(run_result: Any) -> dict[str, int]:
 
     Smallest rather than mean: a metric is misleading if it was truncated in *any* run that
     went into the average.
+
+    Through `_raw_records` like every other reader in this module, not `run_result.runs`: a
+    notebook may report a `run_result.json` it loaded back from disk, and an attribute read
+    finds nothing on a mapping. That silence was invisible -- the row counts simply vanished,
+    and with them the "not a real cut" line in `report.json`, `performance.json` and the
+    archive's README.txt.
     """
     counts: dict[str, list[int]] = {}
-    for record in getattr(run_result, "runs", None) or []:
-        rows = (record or {}).get("partition_rows") if isinstance(record, dict) else None
-        for name, value in (rows or {}).items():
+    for record in _raw_records(run_result):
+        rows = _lookup(record, "partition_rows")
+        for name, value in (rows.items() if isinstance(rows, dict) else ()):
             try:
                 counts.setdefault(str(name), []).append(int(value))
             except (TypeError, ValueError):
@@ -472,10 +478,15 @@ def _report_frame(
             if not entry:
                 continue
             row: dict[str, Any] = {"source": source, "partition": partition, "condition": condition}
+            # `n_runs` is the row's run count -- the most any metric on it was measured over. It
+            # cannot speak for a metric no run could produce (`precision_k` is NaN on a
+            # prediction with no spread), so each metric carries its own `n` beside its mean and
+            # sd, which is the shape the run directory's `validation_summary.csv` already has.
             row["n_runs"] = int(max(item["n"] for item in entry.values()))
             for metric in metrics:
                 row[f"{metric}_mean"] = entry[metric]["mean"]
                 row[f"{metric}_sd"] = entry[metric]["sd"]
+                row[f"{metric}_n"] = int(entry[metric]["n"])
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -761,6 +772,16 @@ def _headline(table: dict, metric: str, n_conditions: int) -> str:
 
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _quoted(names: Iterable[Any]) -> str:
+    """`'p22', 'p42', 'activity'` -- a column list as prose, not as a Python list repr.
+
+    Kept private and duplicated in `colabsd.report` rather than shared: both modules sit below
+    the widget layer and cannot import `colabsd.ui.core`, which holds the panels' copy
+    (`positions_phrase`). The same reason `_plural` is written out twice.
+    """
+    return ", ".join(f"'{name}'" for name in names) or "none"
 
 
 def _footer(n_runs: int, unlock: dict, spec: Any, conditions: list[str]) -> str:

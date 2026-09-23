@@ -38,7 +38,7 @@ authoritative for the details.
 |---|---|---|
 | `colabsd/engine/lora.py` | `seqdisplay_opt/finetuning/lora.py` | The whole module, verbatim: `LoRALinear`, `inject_lora`, `target_roles`, `validate_qkvo_coverage`, `lora_parameters`, `LORA_TARGET_MODULES` and the alias/matching helpers |
 | `colabsd/engine/training.py` | `seqdisplay_opt/finetuning/training.py` | `train_epoch` — the loop that produced every tuned configuration, including its sample-weighted gradient accumulation — plus `batch_indices` and `as_float_tensor` |
-| `colabsd/engine/adapters.py` | `seqdisplay_opt/finetuning/adapters.py` | The `SequenceAdapter` `Protocol` only. Upstream's concrete adapters load `fair-esm` checkpoints from a local model catalogue; `colabsd/backbones/` replaces them |
+| `colabsd/engine/adapters.py` | `seqdisplay_opt/finetuning/adapters.py` | The `SequenceAdapter` `Protocol` only. Upstream's concrete adapters load `fair-esm` checkpoints from a local model catalog; `colabsd/backbones/` replaces them |
 | `colabsd/engine/train_config.py` | `seqdisplay_opt/finetuning/lora_reevaluate.py`, `seqdisplay_opt/finetuning/lora_optuna.py` | `train_eval_config`, `load_lora_best_config`, `SourceTrial`, `LabelScaler`, the model-configuration, state-dict, prediction and split-evaluation helpers |
 | `colabsd/engine/heads.py` | `seqdisplay_opt/models/heads.py`, `utils/device.py` | `BaseHead`, `TorchHeadBase`, `MLPHead` and the target-standardization helper, plus `select_safe_device`. Upstream's `HEAD_REGISTRY`, `register_head` and `create_head` factory are not here: `head: mlp` is the only value a best-config accepts |
 | `colabsd/engine/metrics.py` | `seqdisplay_opt/metrics/evaluation.py`, `seqdisplay_opt/finetuning/validation.py` | `evaluate_predictions`, `precision_k`, `ndcg_k`, `mean_metric`, `TRACKED_METRICS`, `summarize_metrics`, `validation_log_row` |
@@ -56,7 +56,7 @@ authoritative for the details.
 Only what the notebooks reach was copied. Not here, and still upstream's: the Optuna study
 machinery (study databases, trial pruning, the `fcntl` locking that lets two HPC workers
 share a study), every `argparse` command line and console-script entry point, the
-`fair-esm` and local-catalogue checkpoint loaders, the cached-embedding selection CLI, the
+`fair-esm` and local-catalog checkpoint loaders, the cached-embedding selection CLI, the
 whole `seqdisplay_opt.baselines` package, and ten of upstream's eleven regression heads
 together with the registry and factory that choose between them — dropping those also
 drops hard `xgboost` and `sklearn` dependencies — and the whole pooling-strategy layer: the registry, the factory, the five named poolings and the
@@ -66,8 +66,9 @@ protein-region tables they resolve through.
 
 Fidelity is the rule for `colabsd/engine/`: the tuned configurations in `config/best/`
 were selected against upstream's exact code, so a silent behavioral drift would
-invalidate them. Every departure below is deliberate, recorded in the module header, and
-covered by a test.
+invalidate them. Every departure below is deliberate, recorded in the module it changes —
+in that module's header, or, where the reasoning belongs beside the code, in the docstring or
+comment there — and covered by a test.
 
 1. **`micro_batch_size: auto` no longer raises in the config loader.** Upstream's
    `load_lora_best_config` defaults `training.micro_batch_size` to the string `"auto"` and
@@ -154,7 +155,28 @@ covered by a test.
    where its weights are and what to do next. The pre-first-epoch interrupt raises the same
    class. Upstream lets `KeyboardInterrupt` escape, which is correct for a cluster job and
    wrong here: `KeyboardInterrupt` is not an `Exception`, so the panel's guard could not see
-   it and a stop press killed the click with no message at all.
+   it and a stop press killed the click with no message at all. The same machinery puts four
+   keys in `best_checkpoint.pt` that upstream's has not got — `complete`, `stopped_early`,
+   `epochs_run` and `epochs_budget` — because a session that vanished leaves that file and
+   nothing else, and `colabsd.train.recover_runs` reads all four back out of it. Every key
+   upstream writes is written unchanged.
+
+12. **`evaluate_split` also returns the validation loss.** Upstream returns
+   `(pred, metrics)`. The vendored copy returns `(pred, metrics, loss)`, where `loss` is the
+   mean squared error against the *z-scored* targets — the same quantity `train_epoch`
+   minimizes, so the training and validation curves can be drawn on one axis. It is returned
+   separately rather than added to `metrics`, whose keys are condition names: a float under a
+   non-condition key there would reach `summarize_metrics` as a condition called "loss". The
+   reasoning is in the function's own docstring. The value is then recorded under `val_loss`
+   in every per-epoch row of `training_log.json`, which is the only key in those rows upstream
+   does not write and which `colabsd.curves` reads as `val_loss_mse` to draw the validation
+   panel. Nothing upstream computes is changed; a caller that wants the original pair unpacks
+   the first two.
+
+13. **The run's own `metrics.json` carries three keys upstream's does not** —
+   `epochs_run`, `stopped_early` and `partition_rows` — which is what lets the panel say a run
+   was cut short and what `report.json`'s per-partition row counts are read from. Upstream's
+   own keys are unchanged, value for value.
 
 Three upstream quirks were **kept on purpose**, because changing them would move a
 guard or a number: `create_split` still caches on the output directory alone (`colabsd.data`
@@ -172,11 +194,13 @@ run them side by side on real input — the bundled 124-variant MG8 PETase libra
 shipped configs, a full LoRA fine-tune — asserting equal outputs rather than equal source.
 `tests/test_engine_fidelity.py` compares the two source trees definition by definition, so
 a departure that is not one of the numbered ones above fails the build rather than the
-reader's expectations. Four names in `colabsd/engine/train_config.py` are compared against
+reader's expectations. Eight names in `colabsd/engine/train_config.py` are compared against
 nothing because they are ours and have no upstream counterpart: `TrainingStopped`,
-`_finalise_run`, `configured_target_names` and `relabel_per_target`. `evaluate_split` and
-every other shared definition in that module are still held to upstream byte for byte, after
-the normalization the test describes.
+`_finalise_run`, `configured_target_names`, `relabel_per_target`, `epoch_batch_callback`,
+`resolve_micro_batch_size`, `build_checkpoint` and `write_checkpoint_atomically`.
+`evaluate_split` returns one value more than upstream does — departure 12 below — and every
+other shared definition in that module is held to upstream byte for byte, after the
+normalization the test describes.
 
 **Those files are not in the published distribution.** What is published at
 <https://github.com/JasonJiangs/ColabSeqDisplay> is what a notebook runs — the `colabsd`
@@ -187,11 +211,14 @@ in the development tree the distribution is extracted from; ask the authors for 
 want to run the comparisons rather than read about them.
 
 They also need the research checkout. They locate it by importing `seqdisplay_opt` and then
-by the `SEQDISPLAY_OPT_ROOT` environment variable, and **skip cleanly when neither is
-available**, so the suite is green for somebody who has the development tree but not the
-research one: the skips are then exactly these comparisons plus the ones that want
-HuggingFace weights. With a checkout reachable, around sixty more tests run. In the
-development tree:
+by the `SEQDISPLAY_OPT_ROOT` environment variable, which the test harness fills in by itself
+from a checkout sitting beside this repository — so around fifty comparisons that used to wait
+on a variable nobody set now run in the project's own verification command, and the run's first
+lines say which checkout they ran against. An explicit `SEQDISPLAY_OPT_ROOT` always wins, and
+they **skip cleanly when there is no checkout at all**, so the suite is still green for somebody
+who has the development tree and not the research one: the skips are then exactly these
+comparisons plus the ones that want HuggingFace weights. In the development tree, to name the
+checkout by hand:
 
 ```bash
 SEQDISPLAY_OPT_ROOT=/path/to/SequenceDisplay-Workflow-Optimization python -m pytest tests/ -q
@@ -222,7 +249,7 @@ table was built and what is known about it.
 
 **`config/best/`** is entirely derived from upstream's study, which ran twice — once per
 pooling. The twenty entries marked `status: tuned` are its selected LoRA configurations:
-the `cosine_p90_mean` half from `results/p90_mean/lora/selected_lora_configs.csv`, whose
+the `cosine_p90_mean` half from `results/p90_lora/selected_lora_configs.csv`, whose
 top three trials were re-trained across 3 split seeds × 3 model seeds, and the
 `mutation_site_mean` half — the only half this pipeline reads — from
 `results/mutation_site_mean/lora/selected_lora_configs.csv`, whose single selected trial
@@ -236,7 +263,7 @@ it is and, for a tuned one, the upstream file it came from.
 figures in `README.md`, in `config/best/README.md`, in each `_meta` block and in the
 notebook's own dropdown — 0.5478 to 0.5636 on SlugCas9 5NNK — are upstream's
 re-evaluation results, not measurements made here. Exactly one training run has ever gone
-through `colabsd`'s own path end to end, and it is labelled as an illustration where it
+through `colabsd`'s own path end to end, and it is labeled as an illustration where it
 appears. That run's numbers, and the single timed forward pass
 `colabsd.ui.core.TIMED_PASS` records, are this repository's own.
 

@@ -7,8 +7,9 @@ whether its test set was ever unlocked. `describe_bundle` reads that out of the 
 `bundle_html` puts it on screen before a single variant is scored.
 
 Everything said about the backbone comes from `colabsd.backbones.registry`, not from the
-bundle's name. `offered_backbones()` asks the registry what the notebooks list rather than
-keeping a copy of it, and a bundle built from a backbone they stopped offering is told so and
+bundle's name. `is_offered()` asks the registry whether the notebooks still list one rather
+than keeping a copy of the list, and `colabsd.ui.core.offered_backbones_phrase()` is what
+names the alternatives, so a bundle built from a backbone they stopped offering is told so and
 scored anyway: narrowing a dropdown must not break work already saved.
 
 Two archives come out of one export step, so the commonest upload mistake is the wrong one of
@@ -24,6 +25,7 @@ broken. Presentation is `colabsd.ui.theme` and `colabsd.ui.core.Message`.
 
 from __future__ import annotations
 
+import html as _html
 import re
 import zipfile
 from collections.abc import Callable, Sequence
@@ -33,6 +35,7 @@ from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any
 
+from colabsd import bundle as bundle_module
 from colabsd.backbones import registry
 from colabsd.backbones.registry import BACKBONES, BackboneEntry
 from colabsd.bundle import HEAD_NAME, LORA_NAME, MANIFEST_NAME
@@ -40,7 +43,9 @@ from colabsd.errors import BackboneError
 from colabsd.ui import core, exports, theme
 from colabsd.ui.core import (
     COLAB_SESSION_MINUTES,
+    UNDER_A_MINUTE,
     Message,
+    counted,
     format_minutes,
     render_messages,
     set_display,
@@ -52,10 +57,51 @@ ASSUMED_LENGTH = 1000
 RANKINGS = ("pred_mean", "pred_min")
 
 #: What the ranked table is called when the box is left alone. A name with a folder in it is
-#: honoured -- the folder is made under the working directory -- rather than lost.
+#: honored -- the folder is made under the working directory -- rather than lost.
 DEFAULT_OUTPUT_NAME = "ranked_variants.csv"
 
 VARIANT_SOURCES = ("upload_variants_csv", "random_combinations", "rows_of_a_library_csv")
+
+#: Where the bundle comes from, in the order the radio group offers it.
+BUNDLE_SOURCES = ("upload_model_bundle_zip", "file_in_the_working_folder")
+
+#: What a reader reads beside each button of those three groups. The values above are what
+#: `PredictState` carries and what every branch in this module tests against; these are the only
+#: thing on screen. The training panel has labeled every one of its controls in English since
+#: it was written -- `("Random combinations of residues", "random_combinations")` -- while this
+#: panel put the bare identifiers in front of a biologist and asked them to choose between
+#: `rows_of_a_library_csv` and `upload_variants_csv`. Written out per value rather than
+#: prettified from the identifier, because "Rows of a library csv" is not a sentence anybody
+#: would have written, and `pred_min` does not become "the worst condition" by title-casing.
+BUNDLE_SOURCE_LABELS: dict[str, str] = {
+    "upload_model_bundle_zip": f"Upload a {exports.DEFAULT_BUNDLE_NAME}",
+    "file_in_the_working_folder": "A file already in the working folder",
+}
+
+VARIANT_SOURCE_LABELS: dict[str, str] = {
+    "upload_variants_csv": "A variants CSV of my own",
+    "random_combinations": "Random combinations of residues",
+    "rows_of_a_library_csv": "The first rows of a library CSV",
+}
+
+#: The same wording the training panel's own *Rank by* dropdown uses, so a reader who has seen
+#: both pages is choosing between the same two things twice and not between two vocabularies.
+RANKING_LABELS: dict[str, str] = {
+    "pred_mean": "Average over conditions (pred_mean)",
+    "pred_min": "Worst condition (pred_min)",
+}
+
+
+def labeled(values: Sequence[str], labels: dict[str, str]) -> list[tuple[str, str]]:
+    """`[(what a reader reads, what the state carries)]`, for an ipywidgets `options=`.
+
+    A value with no label of its own keeps its identifier rather than dropping off the form, so
+    a source added to `VARIANT_SOURCES` and not written out above is a shabby label and not a
+    missing option; `tests/test_ui_side.py` holds every value to having one.
+    """
+    return [(labels.get(value, value), value) for value in values]
+
+
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 
 #: Fields that decide which variants **Prepare the variants** builds. Changing one makes the
@@ -71,12 +117,12 @@ BUNDLE_INPUTS = frozenset({"bundle_source", "bundle_filename"})
 BUNDLE_MEMBERS: tuple[str, ...] = (MANIFEST_NAME, LORA_NAME, HEAD_NAME)
 
 #: What the other archive the main notebook exports holds, named by `colabsd.ui.exports` —
-#: the module that writes it. A copy of the names here would drift within a release.
-PERFORMANCE_MEMBERS: tuple[str, ...] = (
-    exports.MANIFEST_NAME,
-    exports.README_NAME,
-    *exports.REPORT_MEMBERS.values(),
-)
+#: the module that writes it. Taken whole rather than rebuilt from parts: assembled here from
+#: the manifest, the README and `REPORT_MEMBERS`, it came to five names for an archive of seven,
+#: because the two training-curve files reach the zip through `extra_files` and never appear in
+#: `REPORT_MEMBERS`. `exports.ARCHIVE_MEMBERS` is the list the module that writes the archive
+#: keeps, and the one the main panel, TUTORIAL.md and the generated notebook all read.
+PERFORMANCE_MEMBERS: tuple[str, ...] = exports.ARCHIVE_MEMBERS
 
 #: The three report files inside it, which is what a user calls "the performance report".
 REPORT_MEMBERS: tuple[str, ...] = tuple(exports.REPORT_MEMBERS.values())
@@ -89,15 +135,6 @@ SHARED_MODULES: tuple[str, ...] = ("colabsd.ui.core", "colabsd.ui.prepare_workfl
 # ----------------------------------------------------------------------------------------
 # What the registry offers, and what it merely still knows.
 # ----------------------------------------------------------------------------------------
-
-
-def offered_backbones() -> list[str]:
-    """The backbones the notebooks let a user choose — `colabsd.backbones.registry.offered()`.
-
-    Not a list of names here, and not `BACKBONES` either: the registry still builds every
-    backbone whose adapter ships, while the notebooks put a shorter list on screen.
-    """
-    return registry.offered()
 
 
 def is_offered(backbone: str) -> bool:
@@ -116,16 +153,6 @@ def withheld_note(backbone: str) -> str:
         return registry.withheld_note(backbone)
     except BackboneError:
         return f"`{backbone}` is in this colabsd, but the notebooks do not offer it."
-
-
-def families_phrase() -> str:
-    """`the ESM2 and SaProt families`, from the registry, however many there turn out to be."""
-    families = list(registry.OFFERED_FAMILIES)
-    if not families:  # pragma: no cover - a registry that offers nothing at all
-        return "no backbones at all"
-    if len(families) == 1:
-        return f"the {families[0]} family"
-    return "the " + ", ".join(families[:-1]) + f" and {families[-1]} families"
 
 
 # ----------------------------------------------------------------------------------------
@@ -175,12 +202,12 @@ def upload_wait_text(what: str) -> str:
     return core.upload_notice(what)
 
 
-def upload_cancelled_text(what: str) -> str:
+def upload_canceled_text(what: str) -> str:
     """What to say when the picker came back with nothing in it.
 
     `colabsd.ui.core`'s words again: two wordings for one outcome drift.
     """
-    return core.upload_cancelled_notice(what)
+    return core.upload_canceled_notice(what)
 
 
 # ----------------------------------------------------------------------------------------
@@ -219,20 +246,26 @@ def load_failure_text(path: Path | str, error: Exception) -> str:
 
     Both archives are zips written by the same export step, so uploading the wrong one is the
     mistake to expect; "missing manifest.json" is nothing the holder of one can act on.
+
+    `error` is escaped once, here, because what comes back is rendered as HTML by the notice
+    board: a loader complaining about `<manifest.json>` had that word eaten by the browser.
+    The file names stay unescaped inside their backticks -- both renderers escape the contents
+    of a code span themselves, and escaping as well prints `&lt;` on the page.
     """
     path = Path(path)
+    reason = theme.as_text(error)
     kind = identify_upload(path)
     if kind == "performance_report":
         also_called = "" if path.name == exports.DEFAULT_ARCHIVE_NAME else f" (`{exports.DEFAULT_ARCHIVE_NAME}`)"
         return (
             f"`{path.name}` is the **performance archive**{also_called}, not the model bundle: it holds "
-            f"`{'`, `'.join(REPORT_MEMBERS)}` and no model weights. Upload the other archive that export "
+            f"`{'`, `'.join(PERFORMANCE_MEMBERS)}` and no model weights. Upload the other archive that export "
             f"step wrote, `{exports.DEFAULT_BUNDLE_NAME}`, which holds `{'`, `'.join(BUNDLE_MEMBERS)}`."
         )
     if kind == "missing":
         return (
             f"There is no file at `{path}`. Check the name, or switch **Bundle** back to "
-            "`upload_model_bundle_zip` and upload it."
+            f"**{BUNDLE_SOURCE_LABELS['upload_model_bundle_zip']}** and upload it."
         )
     if kind == "not_a_zip":
         return (
@@ -242,9 +275,9 @@ def load_failure_text(path: Path | str, error: Exception) -> str:
     if kind == "unknown":
         return (
             f"`{path.name}` is a zip, but it carries none of `{'`, `'.join(BUNDLE_MEMBERS)}`, so it was "
-            f"not written by ColabSeqDisplay's export step ({error})."
+            f"not written by ColabSeqDisplay's export step ({reason})."
         )
-    return f"`{path.name}` looks like a model bundle but could not be loaded: {error}"
+    return f"`{path.name}` looks like a model bundle but could not be loaded: {reason}"
 
 
 @dataclass(frozen=True)
@@ -271,8 +304,17 @@ class BundleFacts:
     torch_version: str
     notes: str | None
     hyperparameters: tuple[tuple[str, Any], ...]
-    source_path: str | None
-    entry: BackboneEntry | None
+    #: `colabsd.bundle.budget_line` over the manifest's `training_budget`. Rendered here rather
+    #: than left to the template because `effective_batch_size` is both a hyperparameter and one
+    #: of the four fields a user may set, so the hyperparameters row above can label the user's
+    #: own number a PROVISIONAL placeholder. This row is where the manifest says whose it was.
+    budget: str = ""
+    #: `colabsd.bundle.training_status_line` over the manifest's `training_status`. Nothing in
+    #: `colabsd.ui` read it, so the one screen a colleague opens a bundle on could not say that
+    #: these weights came from a run stopped by hand at 2 of 20 epochs.
+    epochs_trained: str = ""
+    source_path: str | None = None
+    entry: BackboneEntry | None = None
 
     @property
     def k(self) -> int:
@@ -341,10 +383,18 @@ class BundleFacts:
 
 
 def span_of(low_minutes: float, high_minutes: float) -> str:
-    """A low-to-high duration, collapsed when the whole range is under a minute."""
+    """A low-to-high duration in one register.
+
+    "under a minute to 2 min" was two registers in one range -- words on one side of it and a
+    unit on the other -- and "under a minute to 1 min" was barely a range at all. When the low
+    end has no number to give, the range has only an upper bound, so say that.
+    """
     if high_minutes < 1.0:
-        return "under a minute"
-    return f"{format_minutes(low_minutes)} to {format_minutes(high_minutes)}"
+        return UNDER_A_MINUTE
+    low, high = format_minutes(low_minutes), format_minutes(high_minutes)
+    if low == UNDER_A_MINUTE or low == high:
+        return f"up to {high}"
+    return f"{low} to {high}"
 
 
 @dataclass(frozen=True)
@@ -366,9 +416,18 @@ class RuntimeEstimate:
         """One line a biologist can act on."""
         if self.n_variants <= 0:
             return "No variants chosen yet."
+        # `counted` for the variants, which is a count of them; not for the length, which is
+        # an approximation of one variant's own size -- "of ~287 residues" is describing each
+        # sequence, not counting residues in this sentence.
+        #
+        # Grouped all the same. Not pluralizing it and not grouping it are two decisions, and
+        # only the first one follows from the above: `bundle_html` prints the same wild type two
+        # rows up as "1,054 residues", so leaving this one bare showed a reader the same protein
+        # as "1,054" and "1054" on one screen -- the exact pair of renderings that read as two
+        # different proteins across the two panels before `counted` was given the separator.
         about = (
-            f"{self.n_variants:,} variants of ~{self.length} residues through {self.size_label} "
-            f"on the {self.device}"
+            f"{counted(self.n_variants, 'variant')} of ~{self.length:,} residues through "
+            f"{self.size_label} on the {self.device}"
         )
         if self.low_minutes is None or self.high_minutes is None:
             return (
@@ -436,6 +495,8 @@ def describe_bundle(bundle: Any) -> BundleFacts:
         torch_version=str(provenance.get("torch_version", "unknown")),
         notes=provenance.get("notes"),
         hyperparameters=tuple(sorted((manifest.get("hyperparameters", {}) or {}).items())),
+        budget=bundle_module.budget_line(getattr(bundle, "training_budget", None)),
+        epochs_trained=bundle_module.training_status_line(getattr(bundle, "training_status", None)),
         source_path=None if getattr(bundle, "path", None) is None else str(bundle.path),
         entry=BACKBONES.get(str(getattr(bundle, "adapter_name", ""))),
     )
@@ -538,7 +599,7 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "stop",
                 f"This bundle names the backbone `{facts.backbone}`, which is not in this colabsd's registry, "
                 "so nothing here can rebuild it and it cannot be scored. Upgrading colabsd is the usual fix; "
-                f"this one offers {', '.join(offered_backbones())}.",
+                f"this one offers {core.offered_backbones_phrase()}.",
             )
         )
     elif facts.needs_structure and not facts.carries_three_di:
@@ -557,7 +618,9 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "backbone_not_offered",
                 "info",
                 withheld_note(facts.backbone)
-                + f" ColabSeqDisplay.ipynb offers {families_phrase()} now. This bundle still loads and "
+                + " ColabSeqDisplay.ipynb offers "
+                + core.offered_backbones_phrase()
+                + " now. This bundle still loads and "
                 "scores exactly as it did; what you cannot do any more is train a new one on this backbone.",
             )
         )
@@ -568,7 +631,7 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "stop",
                 withheld_note(facts.backbone)
                 + " This bundle cannot be scored: re-training on one of "
-                + ", ".join(offered_backbones())
+                + core.offered_backbones_phrase()
                 + " is the only route to a bundle this panel can run.",
             )
         )
@@ -614,7 +677,7 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "unlocked_repeatedly",
                 "warning",
                 f"This bundle's test set was unlocked **{facts.unlock_count} times**, so it is no longer "
-                "held out. Treat its reported numbers as optimiztic.",
+                "held out. Treat its reported numbers as optimistic.",
             )
         )
     if not facts.has_label_scaler:
@@ -634,10 +697,10 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "random_space",
                 "info",
                 f"Random combinations are drawn from the {space:,} possible residue combinations at "
-                f"{facts.k} sites; duplicates are dropped, so this is a sample, not a screen.",
+                f"{counted(facts.k, 'site')}; duplicates are dropped, so this is a sample, not a screen.",
             )
         )
-    if state.n_variants <= 0:
+    if state.n_variants <= 0 and not state.variant_columns:
         out.append(
             Message(
                 "no_variants",
@@ -647,17 +710,34 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
                 "mutated sites.",
             )
         )
+    elif state.n_variants <= 0:
+        # A table that parsed and holds nothing is not the same as nothing chosen. A header-only
+        # CSV used to be reported as "No variants chosen yet", which sends the reader back to a
+        # step they already took instead of to the file that is empty.
+        out.append(
+            Message(
+                "empty_variants",
+                "stop",
+                f"The variants table has its columns -- `{'`, `'.join(state.variant_columns)}` -- and no rows. "
+                "A header-only CSV loads without complaint; nothing was scored because there is nothing in it. "
+                "Add the variants under that header and press **Prepare the variants** again.",
+            )
+        )
     if state.n_variants > 0 and missing_columns(facts, state.variant_columns):
-        missing = ", ".join(missing_columns(facts, state.variant_columns))
+        missing = missing_columns(facts, state.variant_columns)
         out.append(
             Message(
                 "column_mismatch",
                 "stop",
-                f"Your variants table has no `{missing}` column(s). This bundle was trained on "
+                # The count in front of the noun rather than a `column(s)` after the names: one
+                # missing column is the common case and it was being told it had "column(s)".
+                f"Your variants table is missing {counted(len(missing), 'column')}: "
+                f"`{'`, `'.join(missing)}`. This bundle was trained on "
                 f"`{', '.join(facts.mutation_columns)}`; rename your columns to match.",
             )
         )
-    if estimate is not None and estimate.n_variants > 0 and not state.has_gpu:
+    cost_already_said = estimate is not None and estimate.n_variants > 0 and not state.has_gpu
+    if cost_already_said:
         out.append(
             Message(
                 "no_gpu",
@@ -666,14 +746,28 @@ def notices(state: PredictState, *, estimate: RuntimeEstimate | None = None) -> 
             )
         )
     if estimate is not None and estimate.high_minutes is not None and estimate.high_minutes > COLAB_SESSION_MINUTES:
+        # The cost estimate is said once. On a CPU runtime both of these fire, and this one used
+        # to parenthesize the same sentence the warning directly above it had just made -- the
+        # identical hundred-odd characters, twice, one line apart. When the CPU warning has
+        # already given the numbers, point at them instead of repeating them.
+        cost = (
+            "The estimate above runs past it."
+            if cost_already_said
+            else estimate.sentence()
+        )
         out.append(
             Message(
                 "long_run",
                 "warning",
-                "This could outlast a Colab session (" + estimate.sentence() + ") Score fewer variants. "
+                f"This could outlast a Colab session. {cost} Score fewer variants. "
                 "There is no progress display, so a long run looks like a frozen cell until it finishes.",
             )
         )
+    # Worst first, as every other board on both pages is. The red Stop that blocks Score was
+    # last, under three infos and a warning, because this one function appended in narrative
+    # order and nothing sorted it. list.sort is stable, so the narrative order survives inside
+    # each severity.
+    out.sort(key=lambda item: theme.SEVERITY_RANK[item.severity])
     return out
 
 
@@ -693,8 +787,8 @@ def intro_html() -> str:
         "bundle needs nothing else: it carries its backbone, LoRA weights, head, library spec, mutated "
         "sites and provenance.\n\n"
         f"ColabSeqDisplay.ipynb exports two archives. This step wants `{exports.DEFAULT_BUNDLE_NAME}`; the "
-        f"other, `{exports.DEFAULT_ARCHIVE_NAME}`, holds the performance report "
-        "(`" + "`, `".join(REPORT_MEMBERS) + "`) and carries no weights."
+        f"other, `{exports.DEFAULT_ARCHIVE_NAME}`, holds the performance report and the training curves "
+        "(`" + "`, `".join(PERFORMANCE_MEMBERS) + "`) and carries no weights."
     )
 
 
@@ -711,7 +805,7 @@ def bundle_html(facts: BundleFacts) -> str:
     status_color = theme.SEVERITY_COLOR["stop"] if facts.is_provisional else "inherit"
     unlock_color = theme.SEVERITY_COLOR["stop"] if facts.unlock_count == 0 else "inherit"
     readout = (
-        f"mean of the embeddings at {facts.n_pooled_positions} mutated sites"
+        f"mean of the embeddings at {counted(facts.n_pooled_positions, 'mutated site')}"
         if facts.n_pooled_positions
         else "no mutated sites recorded"
     )
@@ -731,17 +825,21 @@ def bundle_html(facts: BundleFacts) -> str:
             f"<b style='color:{status_color}'>{facts.hyperparameter_status}</b><br>"
             f"<span style='font-family:monospace;font-size:12px'>{parameters}</span>",
         ),
+        _row("trained with", f"<span style='font-family:monospace;font-size:12px'>{facts.budget}</span>"),
+        _row("epochs trained", facts.epochs_trained),
         _row("test set", f"<b style='color:{unlock_color}'>unlocked {facts.unlock_count}x</b> during training"),
         _row("conditions", ", ".join(facts.conditions) or "none recorded"),
         _row(
             "variant columns",
             ", ".join(f"<code>{name}</code>" for name in facts.mutation_columns)
-            + f" &nbsp;→ positions {list(facts.positions_1based)}"
+            + f" &nbsp;→ positions {core.positions_phrase(facts.positions_1based)}"
             + (" &nbsp;(residues written as Asn)" if facts.three_letter else " &nbsp;(residues written as N)"),
         ),
         _row(
             "wild type",
-            f"{facts.wt_length} residues" + (" · carries a 3Di string" if facts.carries_three_di else ""),
+            # Grouped, because the training panel's own note about the same wild type says
+            # "1,054 residues" and this row said "1054": one protein read as two.
+            counted(facts.wt_length, "residue") + (" · carries a 3Di string" if facts.carries_three_di else ""),
         ),
         _row("prediction scale", scale_note(facts)),
         _row("written", f"{facts.created_utc} by colabsd {facts.colabsd_version} (torch {facts.torch_version})"),
@@ -760,7 +858,9 @@ def bundle_html(facts: BundleFacts) -> str:
 def result_html(*, n_ranked: int, rank_by: str, facts: BundleFacts, top_value: float, median_value: float) -> str:
     """The line that says what was just produced and what its numbers mean."""
     return theme.note_html(
-        f"Ranked **{n_ranked:,}** variants by `{rank_by}`. {ranking_note(rank_by)}\n\n"
+        # The *How many* box is a BoundedIntText with min=1, so "Ranked **1** variants" is one
+        # click away here just as it was in the training panel's own scoring outlet.
+        f"Ranked **{counted(n_ranked, 'variant')}** by `{rank_by}`. {ranking_note(rank_by)}\n\n"
         f"Top {rank_by} {top_value:.4f}, median {median_value:.4f}, on {scale_note(facts)}.\n\n"
         "These are predictions from a model fitted to one library: they rank variants, they do not "
         "measure them."
@@ -803,7 +903,7 @@ def default_runners() -> PredictRunners:
         (announce or print)(upload_wait_text(what))
         uploaded = files.upload()
         if not uploaded:
-            raise RuntimeError(upload_cancelled_text(what))
+            raise RuntimeError(upload_canceled_text(what))
         return Path(next(iter(uploaded))).resolve()
 
     def download(path: Path) -> None:
@@ -860,8 +960,8 @@ class PredictWizard:
         self.intro = theme.html(intro_html())
         self.fields: dict[str, Any] = {
             "bundle_source": ipywidgets.RadioButtons(
-                options=["upload_model_bundle_zip", "file_in_the_working_folder"],
-                value="upload_model_bundle_zip",
+                options=labeled(BUNDLE_SOURCES, BUNDLE_SOURCE_LABELS),
+                value=BUNDLE_SOURCES[0],
                 description="Bundle:",
                 style=style,
                 layout=ipywidgets.Layout(width="max-content"),
@@ -870,7 +970,7 @@ class PredictWizard:
                 value=exports.DEFAULT_BUNDLE_NAME, description="File name:", style=style, layout=wide()
             ),
             "variants_source": ipywidgets.RadioButtons(
-                options=list(VARIANT_SOURCES),
+                options=labeled(VARIANT_SOURCES, VARIANT_SOURCE_LABELS),
                 value=VARIANT_SOURCES[0],
                 description="Variants:",
                 style=style,
@@ -883,7 +983,11 @@ class PredictWizard:
                 value=0, min=0, max=10_000, description="Seed:", style=style, layout=wide()
             ),
             "rank_by": ipywidgets.Dropdown(
-                options=list(RANKINGS), value="pred_mean", description="Rank by:", style=style, layout=wide()
+                options=labeled(RANKINGS, RANKING_LABELS),
+                value="pred_mean",
+                description="Rank by:",
+                style=style,
+                layout=wide(),
             ),
             "top_n_to_show": ipywidgets.BoundedIntText(
                 value=20, min=1, max=1000, description="Rows to show:", style=style, layout=wide()
@@ -1124,8 +1228,12 @@ class PredictWizard:
             )
         except Exception as exc:
             self.bundle, self.facts = None, None
-            self.load_problem = str(exc)
-            self._say(plain_text(self.load_problem))
+            # `load_problem` becomes a Stop on the notice board, which is HTML; the log line is
+            # plain text. Escape the board's copy only -- entities in the log would be printed
+            # literally. `load_failure_text` below escapes its own, so each value is escaped
+            # exactly once and `notices()` does not escape again.
+            self.load_problem = theme.as_text(exc)
+            self._say(plain_text(str(exc)))
             self.refresh()
             return None
         try:
@@ -1149,7 +1257,7 @@ class PredictWizard:
             return None
         try:
             self.variants = self._build_variants(state)
-            self._say(f"{len(self.variants)} variants ready")
+            self._say(f"{counted(len(self.variants), 'variant')} ready")
             self.runners.show_table(self.variants.head(10))
         except Exception as exc:
             self.variants = None
@@ -1232,9 +1340,16 @@ class PredictWizard:
 
 
 def plain_text(text: str) -> str:
-    """A message's markdown, flattened for a plain-text log line."""
+    """A message's markdown, flattened for a plain-text log line.
+
+    Entities are turned back into the characters they stand for. A note's text is written for
+    the notice board, which is HTML, so a value that carries `<` arrives here already escaped
+    by `theme.as_text`; this log is `ipywidgets.Output.append_stdout`, which is plain text and
+    would print the entity itself. Escaping belongs on the HTML side of the seam and has to
+    come back off on this one.
+    """
     flat = _MARKDOWN_LINK.sub(r"\1 (\2)", text)
-    return flat.replace("**", "").replace("`", "").replace("*", "")
+    return _html.unescape(flat.replace("**", "").replace("`", "").replace("*", ""))
 
 
 def launch(

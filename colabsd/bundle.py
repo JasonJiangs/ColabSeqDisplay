@@ -17,7 +17,7 @@ Layout::
 The residues a model averages are the library's mutated sites, so the manifest
 records them once, as `spec.positions_1based`, and `Bundle.pooling_positions_0based`
 derives the scoring coordinates from that one copy. Schema 1 bundles instead named a
-pooling; this version cannot honour that name, so `load_bundle` refuses them rather
+pooling; this version cannot honor that name, so `load_bundle` refuses them rather
 than quietly averaging different residues.
 
 `save_bundle` takes three keyword arguments beyond the contract, all optional:
@@ -70,9 +70,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: residues they average are unchanged -- and report their budget as not recorded, because
 #: there is nothing in them that says what it was. See `_require_readable_schema` for the one
 #: schema this version refuses.
+#:
+#: The number tracks READ compatibility, not the manifest's shape. A reader of schema N must be
+#: able to open every manifest stamped N, so a block ADDED at the top level -- `training_status`
+#: in the bundle manifest, `runs_stopped_early` in the archive's -- does not bump it: an older
+#: reader finds the keys it knows and reports the rest as not recorded. Only a change that would
+#: make an existing reader wrong -- a key removed, renamed, or given a different meaning -- bumps
+#: it, and then `_OLDER_SCHEMAS` / `_require_readable_schema` gains the entry that says what moved.
 SCHEMA_VERSION = 3
 #: The first schema that fixed the pooling to the library's mutated sites. Anything older named
-#: a pooling instead, and this version cannot honour that name.
+#: a pooling instead, and this version cannot honor that name.
 MUTATION_SITE_SCHEMA = 2
 MANIFEST_NAME = "manifest.json"
 #: Manifest key: what the run actually spent of the budget it was given. Absent from bundles
@@ -249,7 +256,7 @@ def training_status(
     stopped = next((source["stopped_early"] for source in sources if source.get("stopped_early")), None)
     complete = next((source["complete"] for source in sources if source.get("complete") is not None), None)
     if complete is None and isinstance(run, Mapping) and run.get("fingerprint"):
-        # A row in a RunResult exists only for a run that finalised and wrote its numbers.
+        # A row in a RunResult exists only for a run that finalized and wrote its numbers.
         complete = True
     budget = next(
         (source["epochs_budget"] for source in sources if source.get("epochs_budget") is not None),
@@ -277,13 +284,17 @@ def training_status_line(status: Mapping[str, Any] | None) -> str:
         return "epochs actually trained: not recorded"
     ran, budget = status.get("epochs_run"), status.get("epochs_budget")
     of_budget = f" of {budget}" if budget else ""
+    # `epochs` agrees with the number immediately in front of it, which is the budget when there is
+    # one ("1 of 20 epochs") and the count itself when there is not. A schema-2 bundle records no
+    # budget, so the bare form is reachable, and it read "trained 1 epochs".
+    epochs = "epoch" if int((budget if of_budget else ran) or 0) == 1 else "epochs"
     if status.get("stopped_early") == "interrupted":
-        return f"STOPPED EARLY BY HAND: trained {ran}{of_budget} epochs"
+        return f"STOPPED EARLY BY HAND: trained {ran}{of_budget} {epochs}"
     if status.get("complete") is False:
-        return f"DID NOT FINISH: trained {ran}{of_budget} epochs before the session ended"
+        return f"DID NOT FINISH: trained {ran}{of_budget} {epochs} before the session ended"
     if status.get("stopped_early") == "patience":
-        return f"trained {ran}{of_budget} epochs, stopped by early stopping"
-    return f"trained {ran}{of_budget} epochs"
+        return f"trained {ran}{of_budget} {epochs}, stopped by early stopping"
+    return f"trained {ran}{of_budget} {epochs}"
 
 
 def _count(value: Any) -> int | None:
@@ -516,14 +527,47 @@ class Bundle:
         """
         return self.training_status.get("finished") is False
 
+    @property
+    def source_run(self) -> tuple[int, int] | None:
+        """The `(split_seed, model_seed)` of the run these weights came from, when recorded.
+
+        `save_bundle_from_run` exports exactly one run of a multi-run press -- the best
+        validation score -- and has always written it into `metrics["source_run"]`. Nothing
+        read it back, so a bundle built from a 3 x 3 evaluation could not say which of the nine
+        it was, while `training_curve.png` rang all nine. None for a bundle that records none
+        (an older one, or one built straight from a checkpoint), which is its own answer.
+        """
+        recorded = (self.metrics or {}).get("source_run")
+        if not isinstance(recorded, Mapping):
+            return None
+        split_seed, model_seed = recorded.get("split_seed"), recorded.get("model_seed")
+        if split_seed is None or model_seed is None:
+            return None
+        return int(split_seed), int(model_seed)
+
     def describe(self) -> str:
-        """One human-readable line for a notebook."""
+        """One human-readable line for a notebook.
+
+        Every count in it goes through `_plural`, including the two that used to be interpolated
+        bare: a single-site library read "1 mutated sites" and a single-condition one "1
+        conditions". Both are ordinary libraries, and this line is what the Predict panel prints
+        back to a reader who has just loaded a bundle and what the TUTORIAL appendix prints after
+        recovering an interrupted run -- the moment a reader is checking whether the file is the
+        one they meant, which is the worst moment for the writer to look unsure of itself.
+
+        It also names the run the weights came from, when the manifest recorded one. A press of
+        nine runs exports one of them, and nothing anywhere said which: the figure rang all nine
+        kept epochs and the read-out named none. Silent for a bundle that records no source run,
+        rather than guessing at the first.
+        """
         provenance = self.manifest.get("provenance", {})
         status = f"{hyperparameter_status(self.is_provisional)} hyperparameters"
+        source = self.source_run
+        origin = "" if source is None else f" — from split seed {source[0]} / model seed {source[1]}"
         return (
-            f"{self.model_name} · {len(self.pooling_positions_0based)} mutated sites · {status} · "
-            f"{budget_headline(self.training_budget)} · {len(self.condition_columns)} conditions · "
-            f"test unlocked {self.unlock_count}x · written {provenance.get('created_utc', 'unknown')}"
+            f"{self.model_name} · {_plural(len(self.pooling_positions_0based), 'mutated site')} · {status} · "
+            f"{budget_headline(self.training_budget)} · {_plural(len(self.condition_columns), 'condition')} · "
+            f"test unlocked {self.unlock_count}x · written {provenance.get('created_utc', 'unknown')}{origin}"
         )
 
 
@@ -594,7 +638,15 @@ def save_bundle(
         # The budget above is what the run was allowed; this is what it used. A model that was
         # stopped at epoch 2 of 20 says so here, in the file whose purpose is provenance.
         TRAINING_STATUS_KEY: _status_block(status, trained_with, best),
-        "evaluation": dict(getattr(best, "evaluation", {}) or {}),
+        # The registry entry's evaluation *protocol* -- 3 split seeds x 3 model seeds for every
+        # shipped entry -- not what this run did. `metrics.split_seeds`/`model_seeds` beside it
+        # are the run's, and the two held the same key names with different values and nothing
+        # saying which was which. `training_budget` above solves the same problem by labeling
+        # both halves, so this one says whose numbers it is in the block itself.
+        "evaluation": {
+            **dict(getattr(best, "evaluation", {}) or {}),
+            "source": "the config/best entry's evaluation protocol, not this run's seeds",
+        },
         "metrics": metrics,
         "label_scaler": _label_scaler_payload(label_scaler),
         "provenance": {
@@ -614,7 +666,7 @@ def save_bundle(
     }
 
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        # `allow_nan=False` so this can never silently regress: NaN and inf are sanitised to
+        # `allow_nan=False` so this can never silently regress: NaN and inf are sanitized to
         # null by `json_safe`, and anything that slips past raises here rather than writing a
         # manifest only Python's own parser will read.
         archive.writestr(MANIFEST_NAME, json.dumps(json_safe(manifest), indent=2, allow_nan=False))
@@ -711,7 +763,7 @@ def _require_readable_schema(manifest: dict[str, Any], path: Path) -> None:
     chose = f", and it chose {str(recorded)!r}" if recorded is not None else ""
     raise BundleError(
         f"{path} is a schema-{version} bundle: it was written when the pooling was a choice{chose}. This "
-        "colabsd always averages the embeddings at the library's mutated sites and cannot honour that "
+        "colabsd always averages the embeddings at the library's mutated sites and cannot honor that "
         f"choice. Re-create the bundle from its training run with colabsd.bundle.save_bundle_from_run(), "
         f"or score it with the colabsd that wrote it ({wrote})."
     )
@@ -961,6 +1013,11 @@ def _spec_payload(spec: LibrarySpec) -> dict[str, Any]:
             "mutation_columns": [str(column) for column in spec.mutation_columns],
             "condition_columns": [str(column) for column in spec.condition_columns],
             "three_letter": bool(spec.three_letter),
+            # Written because `LibrarySpec`'s default is a column name, not None: a bundle from a
+            # run whose table had no read counts came back claiming `count_column="count"`, and a
+            # caller filtering a new CSV on it got the "min_count was ignored" warning path
+            # instead of the LibraryError that `count_column=None` promises.
+            "count_column": None if spec.count_column is None else str(spec.count_column),
             "wt_3di": None if spec.wt_3di is None else str(spec.wt_3di),
         }
     except AttributeError as exc:
@@ -998,7 +1055,7 @@ def _require_mutated_sites(positions_1based: list[int], length: int) -> None:
 
 def _spec_from_payload(payload: dict[str, Any]) -> LibrarySpec:
     try:
-        from colabsd.spec import LibrarySpec
+        from colabsd.spec import DEFAULT_COUNT_COLUMN, LibrarySpec
     except ImportError as exc:  # pragma: no cover - colabsd.spec is a hard dependency
         raise BundleError(
             f"colabsd.spec is unavailable, so the bundle's library spec cannot be rebuilt ({exc})."
@@ -1010,6 +1067,9 @@ def _spec_from_payload(payload: dict[str, Any]) -> LibrarySpec:
             mutation_columns=list(payload["mutation_columns"]),
             condition_columns=list(payload["condition_columns"]),
             three_letter=bool(payload.get("three_letter", True)),
+            # `.get` with the dataclass default, not `payload["count_column"]`: a bundle written
+            # before this key existed must keep reading exactly as it does today.
+            count_column=payload.get("count_column", DEFAULT_COUNT_COLUMN),
             wt_3di=payload.get("wt_3di"),
         )
     except (KeyError, TypeError, ValueError) as exc:

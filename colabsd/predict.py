@@ -40,8 +40,11 @@ def score_variants(
 ) -> pd.DataFrame:
     """Predict every condition for each row of *variants_df*.
 
-    Returns the spec's mutation columns, one column per condition, and the
-    `pred_mean` / `pred_min` summaries a screening decision is usually made on.
+    Returns the spec's mutation columns, then `pred_<condition>` for each condition, then the
+    `pred_mean` / `pred_min` summaries a screening decision is usually made on. The `pred_`
+    prefix is why a predicted number can never be mistaken for a measured one: the measured
+    columns of *variants_df* are not carried through, and the caller still holds them to join
+    on the mutation columns.
     """
     import pandas as pd
 
@@ -64,12 +67,28 @@ def score_variants(
             "predictions would overwrite the residues they were made from. Re-train with distinct column names."
         )
 
+    # Every predicted column is written under a `pred_` name, so a prediction can never land
+    # in the column the measurement was read from: a library CSV handed straight back to
+    # scoring carries its measured condition column, and overwriting it in place produced a
+    # file whose `activity` column was model output with nothing saying so.
+    predicted = [f"pred_{condition}" for condition in conditions] + ["pred_mean", "pred_min"]
+    taken = sorted(
+        {name for name in predicted if name in columns} | {name for name in predicted if predicted.count(name) > 1}
+    )
+    if taken:
+        raise DataError(
+            f"Scoring would write {taken} twice. The scored table is this bundle's mutation columns "
+            f"{columns}, then `pred_` and each condition name {conditions}, then `pred_mean` and "
+            "`pred_min` -- and those names are already taken. Re-train with column names that do not "
+            "start with `pred_`, and with no condition named `mean` or `min`."
+        )
+
     sequences = build_sequences(spec, variants_df)
     predictions = score_sequences(bundle, sequences, device=device, batch_size=batch_size)
 
     frame = variants_df.loc[:, columns].reset_index(drop=True).copy()
     for index, condition in enumerate(conditions):
-        frame[condition] = predictions[:, index]
+        frame[f"pred_{condition}"] = predictions[:, index]
     frame["pred_mean"] = predictions.mean(axis=1)
     frame["pred_min"] = predictions.min(axis=1)
     return pd.DataFrame(frame)
