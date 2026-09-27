@@ -1,0 +1,1639 @@
+"""Training orchestration across splits x model seeds, with a locked test set.
+
+The vendored `colabsd.engine.train_config.train_eval_config` owns the
+training loop, LoRA injection, early stopping and checkpointing. This module only
+decides *what* to run, keeps the test partition locked, and turns the per-run
+metric dictionaries into a table the report can render.
+
+Locked-test discipline
+----------------------
+`train_eval_config` always evaluates the test partition at the end of a run and
+writes it next to the validation numbers. `finetune` moves every test artifact
+into `output_dir/locked_test/` the moment a run finishes, so nothing a notebook
+touches -- neither `RunResult` nor `runs/<run>/metrics.json` nor
+`runs/<run>/predictions.npz` -- carries test information. Reading it back is
+`unlock_test`, which increments and persists `output_dir/unlock.json`.
+
+What a half-finished run directory means
+----------------------------------------
+A Colab session can end at any moment -- the stop button, or a pre-empted free
+runtime -- so `runs/<split>_<seed>/` has to say which of the two it holds. One rule,
+obeyed by both the writer and the reader:
+
+* A run is **finished** only when it holds a `colabsd_run.json` whose `stopped_early`
+  is not `"interrupted"`. That file is written last, after the test artifacts are
+  locked, so a run that died before it never counts as finished.
+* A **cut short** run -- a stop press (`stopped_early: "interrupted"`), or a session
+  that vanished mid-epoch and left nothing but `best_checkpoint.pt` -- is never reused
+  as a finished result. `finetune(resume=True)` retrains it, and says so in
+  `RunResult.warnings`.
+* Its weights are never destroyed by that retrain. `best_checkpoint.pt` is moved to
+  `unfinished_checkpoint.pt` (numbered if one is already there) *before* the retry's
+  first epoch overwrites anything, and that move is reported too.
+* Those weights stay reachable: `recover_runs(output_dir)` lists every checkpoint under
+  a run directory and says how far each run got, and
+  `colabsd.bundle.save_bundle_from_checkpoint` turns any one of them into a bundle.
+* What actually ran travels with the numbers. Every row in `RunResult.runs` carries
+  `stopped_early`, `epochs_run` and `epochs_budget`, so `run_result.json`,
+  `validation_runs.csv`, the report and the bundle manifest can all say "2 of 20 epochs"
+  rather than publishing the budget as though it had been spent.
+
+Watching a run while it trains
+------------------------------
+Two callbacks, both optional, both fed from the same throttle and never from different
+numbers. `progress(done, total, label)` is the sentence a notebook prints; `on_event` is a
+`TrainingEvent` -- the same epoch close or batch tick with its numbers still numbers, for a
+caller that draws them (`colabsd.curves`). Neither is constructed when it was not asked for,
+so a run that passes neither trains exactly what it always did, and an `on_event` that raises
+costs the run its picture and nothing else.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import time
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+from colabsd.bestconfig import BudgetOverrides, BudgetSettings, resolve_budget
+
+# `json_safe` and nothing else. `colabsd.bundle` imports `colabsd`, `colabsd.bestconfig`,
+# `colabsd.errors` and `colabsd.spec`, never this module, so this edge closes no cycle. It is
+# the same writer `bundle.save_bundle` and `report.build_report` already use, which is the
+# point: `run_result.json` was the one artifact of the four written with bare NaN tokens.
+from colabsd.bundle import json_safe
+from colabsd.errors import ColabSDError, ConfigError, DataError
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import pandas as pd
+
+    from colabsd.bestconfig import BestConfig
+    from colabsd.engine.train_config import BatchProgress, EpochProgress
+    from colabsd.spec import LibrarySpec
+
+PROTEIN_ID = "user_protein"
+LOCKED_DIRNAME = "locked_test"
+UNLOCK_FILENAME = "unlock.json"
+RUNS_DIRNAME = "runs"
+#: Where the weights of a run that never finished are moved, so that retraining the same split
+#: and seed cannot overwrite them. `recover_runs` reads these as readily as `best_checkpoint.pt`.
+UNFINISHED_CHECKPOINT_NAME = "unfinished_checkpoint.pt"
+#: The one value of `stopped_early` that means a person (or a dying session) ended the run,
+#: rather than early stopping doing its job.
+INTERRUPTED = "interrupted"
+METRICS = ("R2", "Pearson", "Spearman", "P@10", "P@50", "NDCG@10", "NDCG@50")
+SKIPPED_FINGERPRINT = "interrupted"
+LOCKED_WARNING = "Locked test partition. Read it through colabsd.train.unlock_test, which records every unlock."
+
+# The engine reports every micro-batch, and an epoch on a real backbone runs to thousands of
+# them, each a few milliseconds apart. One widget write per batch would flood the notebook's
+# comm channel and slow down the very run it is describing, so a batch line that lands within
+# this many seconds of the last one sent is dropped. Four updates a second already read as
+# continuous motion to someone watching the panel.
+PROGRESS_MIN_INTERVAL_S = 0.25
+
+ProgressFn = Callable[[int, int, str], None]
+
+
+@dataclass(frozen=True)
+class TrainingEvent:
+    """One moment of a run, as numbers rather than as a sentence.
+
+    `progress(done, total, label)` says the same two things in words. A panel that wants to
+    *draw* what is happening cannot get them back out of that label -- which is asserted
+    character for character by the tests, so it cannot be widened either -- so this is a
+    second channel carrying the same two moments undigested. The channel is off unless it is
+    asked for: a caller that passes no `on_event` constructs none of these.
+
+    `kind` is `"epoch"` when an epoch has closed and `"batch"` while one is running. An epoch
+    event carries `score`, the validation number that epoch is kept or discarded on, and no
+    `step`; a batch event carries `step` and `n_batches` and no `score`.
+
+    Numbering follows the engine rather than the progress line. `epoch` is **0-based**, the
+    same number `training_log.json` records and `colabsd.curves.curve_frame` puts in its
+    `epoch` column, while the text line prints `epoch + 1`. `step` is the 1-based micro-batch,
+    so `step == n_batches` is the last batch of the epoch -- and because the engine's batch
+    loss is the epoch's running mean MSE, that last batch's `loss` *is* the epoch's
+    `train_loss`. A batch point drawn at `epoch - 1 + step / n_batches` therefore lands exactly
+    on that epoch's own marker when `step == n_batches`, on the same 0-based axis `curve_frame`
+    uses, and the first epoch's points span the width of one epoch before it closes.
+
+    `loss` is training MSE either way, `metric` names the validation metric `score` is measured
+    in (`RunResult.selection_metric`, e.g. `"Spearman"`), `run_index` is the 0-based index of
+    the run under way among `n_runs`, and `elapsed_s` is seconds since this run started -- the
+    clock the text line's `2m14s` is formatted from.
+    """
+
+    kind: str
+    run_index: int
+    n_runs: int
+    split_seed: int
+    model_seed: int
+    epoch: int
+    max_epochs: int
+    loss: float
+    metric: str
+    score: float | None = None
+    #: The epoch's MSE on the validation split, in the same scaled space as `loss`. Epoch
+    #: events only; NaN when the engine is older than this field.
+    val_loss: float | None = None
+    step: int | None = None
+    n_batches: int | None = None
+    elapsed_s: float = 0.0
+
+
+EventFn = Callable[[TrainingEvent], None]
+
+#: What `RunResult.warnings` -- and so the panel's log -- says when `on_event` raised. The
+#: cause is appended to it. Training is unaffected: the picture is the convenience, the model
+#: is the point.
+EVENT_FAILURE_WARNING = (
+    "The live training curve stopped updating because the callback watching this run raised. "
+    "Training itself was unaffected and the run finished normally; the same curves are in the "
+    "performance report as training_curve.png."
+)
+
+
+@dataclass
+class RunResult:
+    """Everything a report needs about one `finetune` call.
+
+    Attributes:
+        model_name: upstream model key the best-config registry was keyed on.
+        adapter_name: backbone registry name the adapter was built from.
+        condition_columns: measured conditions, in target-column order.
+        params: the seven LoRA hyperparameters actually trained with.
+        fixed: the training block (epochs, patience, batch sizes, ...).
+        budget: the epochs, patience and batch sizes the run actually used, alongside
+            what the lookup declared and which of them the user set for themselves.
+            `finetune` always fills it in; it is `None` only on a hand-built `RunResult`.
+        is_provisional: True when the hyperparameters are a placeholder.
+        runs: one dict per (split seed, model seed), validation metrics only.
+        aggregate: tidy frame with columns
+            partition / condition / metric / mean / sd / n_runs.
+        validation_summary: macro mean over conditions, mean +- sd across runs.
+        test_runs, test_aggregate: None until `unlock_test` fills them in.
+        unlock_count: how often the test partition has been read.
+        n_reused: runs answered from a finished run already in `output_dir` rather than
+            trained again. A press where this equals `n_runs` trained nothing at all.
+        paths: files written by `finetune`.
+    """
+
+    model_name: str
+    adapter_name: str
+    condition_columns: list[str]
+    params: dict[str, Any]
+    fixed: dict[str, Any]
+    is_provisional: bool
+    selection_metric: str
+    split_seeds: list[int]
+    model_seeds: list[int]
+    runs: list[dict[str, Any]]
+    aggregate: pd.DataFrame
+    validation_summary: dict[str, dict[str, float]]
+    output_dir: Path
+    run_dirs: list[Path]
+    locked_dir: Path
+    paths: dict[str, Path]
+    n_sequences: int
+    created_utc: str
+    unlock_count: int = 0
+    n_reused: int = 0
+    test_runs: list[dict[str, Any]] | None = None
+    test_aggregate: pd.DataFrame | None = None
+    minutes: float = 0.0
+    budget: BudgetSettings | None = None
+    warnings: list[str] = field(default_factory=list)
+    adapter_dtype: str | None = None
+    adapter_hf_id: str | None = None
+
+    @property
+    def n_runs(self) -> int:
+        return len(self.runs)
+
+    @property
+    def test_unlocked(self) -> bool:
+        return self.test_runs is not None
+
+    def best_run(self) -> dict[str, Any]:
+        """Return the run with the highest validation selection score."""
+        if not self.runs:
+            raise ColabSDError("This RunResult has no runs; call finetune() before asking for the best one.")
+        return max(self.runs, key=lambda row: row["best_validation_score"])
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "model_name": self.model_name,
+            "adapter_name": self.adapter_name,
+            "condition_columns": list(self.condition_columns),
+            "params": self.params,
+            "fixed": self.fixed,
+            "budget": self.budget.to_dict() if self.budget is not None else None,
+            "is_provisional": self.is_provisional,
+            "selection_metric": self.selection_metric,
+            "split_seeds": list(self.split_seeds),
+            "model_seeds": list(self.model_seeds),
+            "n_sequences": self.n_sequences,
+            "n_runs": self.n_runs,
+            "n_reused": self.n_reused,
+            "created_utc": self.created_utc,
+            "minutes": self.minutes,
+            "unlock_count": self.unlock_count,
+            "test_unlocked": self.test_unlocked,
+            "runs": self.runs,
+            "validation_summary": self.validation_summary,
+            "aggregate": self.aggregate.to_dict(orient="records"),
+            "output_dir": str(self.output_dir),
+            "run_dirs": [str(path) for path in self.run_dirs],
+            "warnings": list(self.warnings),
+            "adapter_dtype": self.adapter_dtype,
+            "adapter_hf_id": self.adapter_hf_id,
+        }
+        if self.test_runs is not None:
+            payload["test_runs"] = self.test_runs
+        if self.test_aggregate is not None:
+            payload["test_aggregate"] = self.test_aggregate.to_dict(orient="records")
+        return payload
+
+    def save(self) -> dict[str, Path]:
+        """Write `run_result.json` plus the two CSV views; returns the paths."""
+        import pandas as pd
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        result_path = self.output_dir / "run_result.json"
+        # `json_safe` plus `allow_nan=False`, exactly as `colabsd.bundle.save_bundle` and
+        # `colabsd.report` write theirs. The sd of a single run is NaN, which `json.dumps`
+        # writes as the bare token `NaN`: valid for Python's own reader, refused by every
+        # strict JSON reader there is, so a file nobody outside Python could open. `json_safe`
+        # turns those into `null` and `allow_nan=False` turns anything it missed into an
+        # exception here rather than into an unreadable file on disk.
+        result_path.write_text(json.dumps(json_safe(self.to_dict()), indent=2, allow_nan=False))
+        runs_path = self.output_dir / "validation_runs.csv"
+        pd.DataFrame(_flatten_runs(self.runs, self.condition_columns)).to_csv(runs_path, index=False)
+        summary_path = self.output_dir / "validation_summary.csv"
+        self.aggregate.to_csv(summary_path, index=False)
+        self.paths.update({"run_result": result_path, "runs_csv": runs_path, "summary_csv": summary_path})
+        if self.test_aggregate is not None:
+            test_path = self.output_dir / "test_summary.csv"
+            self.test_aggregate.to_csv(test_path, index=False)
+            self.paths["test_summary_csv"] = test_path
+        return dict(self.paths)
+
+
+def finetune(
+    *,
+    spec: LibrarySpec,
+    sequences: Sequence[str],
+    targets: np.ndarray,
+    adapter: Any,
+    best: BestConfig,
+    splits: dict[int, dict[str, list[int]]],
+    output_dir: str | Path,
+    model_seeds: Sequence[int] | None = None,
+    budget: BudgetOverrides | dict[str, Any] | None = None,
+    progress: ProgressFn | None = None,
+    on_event: EventFn | None = None,
+    config: dict[str, Any] | None = None,
+    resume: bool = True,
+) -> RunResult:
+    """Train `splits x model_seeds` LoRA runs and report validation only.
+
+    `budget` is how long the user is willing to train and what fits on their card:
+    `max_epochs`, `early_stopping_patience`, `effective_batch_size` and `micro_batch_size`,
+    as a `colabsd.bestconfig.BudgetOverrides` or the same fields as a mapping. Anything left
+    out keeps the looked-up value, and no other hyperparameter can be set this way. The result
+    carries `budget`, which says what ran and which of it was the user's.
+
+    `on_event` is the same two moments `progress` reports -- an epoch closing, a batch
+    passing -- handed over as `TrainingEvent` numbers instead of a formatted line, for a caller
+    that draws them rather than printing them (`colabsd.curves`). It fires on the same throttle
+    as the text line and just after it, so a slow watcher cannot hold up the line that says the
+    run is alive. It is guarded: the first exception it raises ends the event stream for the
+    rest of this call and adds a `RunResult.warnings` line, never the run. A run that `resume`
+    reuses trains nothing and so reports nothing; its curve is in its `training_log.json`.
+
+    `config` overrides the runtime config that would otherwise be built through
+    `colabsd.protein_db`; `resume` reuses a *finished* run only when its fingerprint --
+    the model, the backbone and the dtype it was built at, the hyperparameters, the mutated
+    sites, the wild-type 3Di string, the split and a hash of the sequences and targets
+    themselves -- is identical, so a changed library, a changed structure or a changed
+    backbone always retrains. A run that was cut short is never reused, and its weights are
+    moved to `unfinished_checkpoint.pt` before it is retrained rather than overwritten; see
+    the module docstring and `recover_runs`. Test metrics are never returned: call
+    `unlock_test` for those.
+
+    Two refusals guard the numbers themselves. An adapter built at `dtype="float16"` is refused
+    before anything loads: float16's smallest number is larger than AdamW's epsilon, so the
+    first optimizer step divides by zero and the run finishes with an all-NaN model whose
+    correlation the engine reports as 0.0000. And any run whose loss curve or validation
+    predictions come back non-finite is refused after it trains, rather than published -- the
+    metrics cannot be asked, because `colabsd.engine.metrics` coerces a correlation it could not
+    compute to 0.0, which is a finite number no check of the metrics can tell from a measured
+    zero. Neither refusal writes a `RunResult`, so nothing downstream ever holds the number and
+    the next call retrains rather than reuses.
+    """
+    from colabsd.engine.train_config import TrainingStopped, train_eval_config
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sequences = [str(item) for item in sequences]
+    targets = np.asarray(targets, dtype=np.float32)
+    condition_columns = list(spec.condition_columns)
+    _validate_inputs(sequences, targets, condition_columns, splits, spec)
+    # `==`, never `in`: "float16" is a substring of "bfloat16", and bfloat16 trains.
+    if _text_attr(adapter, "dtype") == "float16":
+        raise ColabSDError(
+            "float16 cannot train a model. AdamW's epsilon (1e-8) is smaller than the smallest "
+            "number float16 can hold, so the first optimizer step divides by zero and every "
+            "weight becomes NaN: the run finishes, and its validation Spearman is reported as "
+            "0.0000, which is the dead model and not a score. Build the adapter with "
+            "dtype='bfloat16' -- the same two bytes per weight, so the same memory -- or with "
+            "dtype='float32'. float16 is still fine for scoring a bundle that was trained in "
+            "something else."
+        )
+
+    seeds = _unique([int(seed) for seed in (model_seeds if model_seeds else _default_model_seeds(best))])
+    try:
+        splits = {int(seed): split for seed, split in splits.items()}
+    except (TypeError, ValueError) as exc:
+        raise DataError(
+            f"splits must be keyed by integer split seeds ({exc}). Pass the mapping returned by "
+            "colabsd.data.make_splits(n, seeds, out_dir) unchanged."
+        ) from exc
+    split_seeds = sorted(splits)
+    # Every split is checked before the first one trains: a user who mistyped a batch size
+    # should hear about it now, not three runs into an hour of GPU time.
+    cleaned_splits = {seed: _clean_split(splits[seed], len(sequences), seed) for seed in split_seeds}
+    smallest_train = min(len(split["train_idx"]) for split in cleaned_splits.values())
+    runtime, settings = _runtime_config(
+        spec=spec,
+        best=best,
+        output_dir=output_dir,
+        split_seeds=split_seeds,
+        model_seeds=seeds,
+        override=config,
+        budget=budget,
+        n_train=smallest_train,
+    )
+    params = {**dict(best.params), "effective_batch_size": settings.effective_batch_size}
+    fixed = dict(runtime["fixed"])
+    max_epochs = int(fixed.get("max_epochs", 0) or 0)
+    selection_metric = _selection_metric(runtime)
+    pooled_positions = _pooled_positions(adapter, spec, runtime)
+    data_digest = _data_digest(sequences, targets)
+
+    locked_dir = output_dir / LOCKED_DIRNAME
+    runs_root = output_dir / RUNS_DIRNAME
+    total = len(split_seeds) * len(seeds)
+    _notify(progress, 0, total, "starting")
+
+    rows: list[dict[str, Any]] = []
+    run_dirs: list[Path] = []
+    # A press that finds every run already finished in `output_dir` trains nothing, and used
+    # to report itself in exactly the words a real fit uses. Counted here because the loop
+    # below is the only place the distinction exists.
+    reused = 0
+    notes: list[str] = []
+    # One guard for the whole call, not one per run and not one per layer below this: a
+    # watcher that raised once will raise again on every event for the rest of the job.
+    watcher = _EventGuard(on_event)
+    started = time.time()
+    try:
+        for split_seed in split_seeds:
+            split = cleaned_splits[split_seed]
+            for model_seed in seeds:
+                name = f"split{split_seed}_seed{model_seed}"
+                run_dir = runs_root / name
+                fingerprint = _fingerprint(
+                    model=str(best.model),
+                    # What the adapter actually is, not just which registry entry was looked up.
+                    # A SaProt adapter interleaves the 3Di string into every token, so two runs
+                    # with different structures are two different models; the dtype and the
+                    # HuggingFace id decide which weights are loaded. All three reach
+                    # `create_adapter`, and leaving them out here made changing any of them a
+                    # silent reuse of the previous model's weights and numbers.
+                    adapter=_adapter_name(adapter, best),
+                    adapter_dtype=_text_attr(adapter, "dtype"),
+                    adapter_hf_id=_text_attr(adapter, "hf_id"),
+                    wt_3di=str(getattr(spec, "wt_3di", "") or ""),
+                    params=params,
+                    fixed=fixed,
+                    split=split,
+                    data=data_digest,
+                    pooled_positions=pooled_positions,
+                    n_sequences=len(sequences),
+                    n_targets=int(targets.shape[1]),
+                    split_seed=split_seed,
+                    model_seed=model_seed,
+                )
+                cached = _cached_row(run_dir, fingerprint) if resume else None
+                if cached is None:
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    _lock_interrupted_artifacts(run_dir, locked_dir / name, condition_columns)
+                    notes.extend(_preserve_unfinished_checkpoint(run_dir, name))
+                    t0 = time.time()
+                    on_epoch, on_batch = _run_reporters(
+                        progress,
+                        len(rows),
+                        total,
+                        t0,
+                        on_event=watcher.sink(),
+                        split_seed=split_seed,
+                        model_seed=model_seed,
+                        metric=selection_metric,
+                    )
+                    metrics = train_eval_config(
+                        adapter=adapter,
+                        sequences=sequences,
+                        targets=targets,
+                        split=split,
+                        params=params,
+                        config=runtime,
+                        split_seed=split_seed,
+                        seed=model_seed,
+                        output_dir=run_dir,
+                        source_trial=None,
+                        on_epoch=on_epoch,
+                        on_batch=on_batch,
+                    )
+                    _refuse_nonfinite_run(run_dir, name)
+                    minutes = (time.time() - t0) / 60.0
+                    _lock_test_artifacts(
+                        run_dir=run_dir,
+                        locked_run_dir=locked_dir / name,
+                        metrics=metrics,
+                        fingerprint=fingerprint,
+                        condition_columns=condition_columns,
+                    )
+                    row = _visible_row(
+                        metrics=metrics,
+                        condition_columns=condition_columns,
+                        split_seed=split_seed,
+                        model_seed=model_seed,
+                        run_dir=run_dir,
+                        minutes=minutes,
+                        fingerprint=fingerprint,
+                        max_epochs=max_epochs,
+                    )
+                    _write_visible_metrics(run_dir, row)
+                    notes.extend(_cut_short_warning(row, name))
+                else:
+                    row = cached
+                    reused += 1
+                rows.append(row)
+                run_dirs.append(run_dir)
+                _notify(progress, len(rows), total, name)
+
+        notes.extend(watcher.warnings)
+        # Read before the RunResult is built, not inside its argument list. Every run has
+        # trained, been locked and been written to disk by the time this line runs, so a
+        # ColabSDError escaping from here threw away a finished job over a bookkeeping file:
+        # `run_result.json` was never written while `runs/` and `locked_test/` sat there
+        # complete. The counter falls back to zero, and the note is what stops that zero
+        # travelling on its own as a claim that the test partition has never been read.
+        try:
+            unlocks = read_unlock_count(output_dir)
+        except ColabSDError as exc:
+            unlocks = 0
+            notes.append(
+                f"The unlock counter could not be read ({exc}), so this result records the test "
+                "partition as never unlocked. Every run finished and is on disk; delete "
+                f"{output_dir / UNLOCK_FILENAME} to reset the counter, and say so in the report."
+            )
+        aggregate = _aggregate(rows, condition_columns, partition="validation")
+        result = RunResult(
+            model_name=str(best.model),
+            adapter_name=_adapter_name(adapter, best),
+            condition_columns=condition_columns,
+            params=params,
+            fixed=fixed,
+            budget=settings,
+            is_provisional=bool(getattr(best, "is_provisional", False)),
+            selection_metric=selection_metric,
+            split_seeds=split_seeds,
+            model_seeds=seeds,
+            runs=rows,
+            aggregate=aggregate,
+            validation_summary=_macro_summary(rows, "validation"),
+            output_dir=output_dir,
+            run_dirs=run_dirs,
+            locked_dir=locked_dir,
+            paths={},
+            n_sequences=len(sequences),
+            created_utc=_utc_now(),
+            unlock_count=unlocks,
+            n_reused=reused,
+            minutes=(time.time() - started) / 60.0,
+            warnings=_provisional_warning(best) + _budget_warning(settings) + notes,
+            adapter_dtype=_text_attr(adapter, "dtype"),
+            adapter_hf_id=_text_attr(adapter, "hf_id"),
+        )
+        result.save()
+        return result
+    except KeyboardInterrupt:
+        # The stop button, landing between one run's last epoch and the next run's first --
+        # in the artifact locking, the bookkeeping or the aggregation, all of which are
+        # outside `train_eval_config`'s own reach. Re-raised as an exception the notebook's
+        # guard can catch, because a `KeyboardInterrupt` here goes straight past `except
+        # Exception` and kills the run with an empty log and a frozen progress line.
+        raise TrainingStopped(
+            f"Stopped between runs, while {output_dir} was being written. Nothing is corrupt: every run that "
+            "finished is recorded, and any run that did not keeps the weights of its best epoch. "
+            "colabsd.train.recover_runs(output_dir) says which is which, and pressing Train again retrains "
+            "only the runs that did not finish."
+        ) from None
+
+
+def unlock_test(run_result: RunResult, *, output_dir: str | Path) -> dict[str, Any]:
+    """Read the locked test partition once, incrementing the persisted unlock count.
+
+    Every call is recorded in `output_dir/unlock.json` and echoed into the returned
+    payload, `output_dir/test_metrics.json` and the updated `RunResult`.
+    """
+    output_dir = Path(output_dir)
+    locked_dir = output_dir / LOCKED_DIRNAME
+    payloads = sorted(locked_dir.glob("*/test_metrics.json")) if locked_dir.is_dir() else []
+    if not payloads:
+        raise ColabSDError(
+            f"No locked test results under {locked_dir}. Run finetune(..., output_dir={output_dir!s}) first, "
+            "and pass that same output_dir here."
+        )
+
+    condition_columns = list(run_result.condition_columns)
+    if not run_result.runs:
+        raise ColabSDError("This RunResult has no runs, so there is nothing to unlock. Call finetune() first.")
+    wanted = {(int(run["split_seed"]), int(run["model_seed"])): run.get("fingerprint") for run in run_result.runs}
+    rows: list[dict[str, Any]] = []
+    for path in payloads:
+        locked = json.loads(path.read_text())
+        key = (int(locked["split_seed"]), int(locked["model_seed"]))
+        if key not in wanted:
+            continue
+        _require_matching_fingerprint(path, locked.get("fingerprint"), wanted[key], key, output_dir)
+        per_condition = _rename_targets(locked["test"]["per_target"], condition_columns)
+        rows.append(
+            {
+                "split_seed": int(locked["split_seed"]),
+                "model_seed": int(locked["model_seed"]),
+                "run_dir": locked.get("run_dir", ""),
+                "test": {
+                    "mean": _macro_without_unmeasured(locked["test"]["mean"], locked["test"]["per_target"]),
+                    "per_condition": per_condition,
+                },
+            }
+        )
+    rows.sort(key=lambda row: (row["split_seed"], row["model_seed"]))
+    if not rows:
+        raise ColabSDError(
+            f"{locked_dir} holds locked results, but none of them belong to this RunResult "
+            f"(split seeds {run_result.split_seeds}, model seeds {run_result.model_seeds}). "
+            "Pass the output_dir that finetune() wrote this result to."
+        )
+
+    count = _record_unlock(output_dir, n_runs=len(rows), model_name=run_result.model_name)
+    aggregate = _aggregate(rows, condition_columns, partition="test")
+    payload = {
+        "unlock_count": count,
+        "unlocked_utc": _utc_now(),
+        "model_name": run_result.model_name,
+        "is_provisional": run_result.is_provisional,
+        "condition_columns": condition_columns,
+        "n_runs": len(rows),
+        "runs": rows,
+        "summary": _macro_summary(rows, "test"),
+        "aggregate": aggregate.to_dict(orient="records"),
+        "output_dir": str(output_dir),
+    }
+    (output_dir / "test_metrics.json").write_text(json.dumps(payload, indent=2))
+    run_result.test_runs = rows
+    run_result.test_aggregate = aggregate
+    run_result.unlock_count = count
+    run_result.save()
+    return payload
+
+
+@dataclass(frozen=True)
+class RecoveredRun:
+    """One checkpoint found under a run directory, and how far the run that wrote it got.
+
+    `status` is the contract in one word:
+
+    * `"finished"` -- the epoch loop ran to its budget or to early stopping, and the run wrote
+      its metrics. These weights are what `finetune` would have exported.
+    * `"interrupted"` -- a stop press ended the epoch loop. The weights are the best epoch of
+      however many epochs ran, and `epochs_run` says how many.
+    * `"unfinished"` -- the run never got to write its numbers: the session died, or a stop
+      press landed after the epoch loop. Real, loadable weights; no metrics beside them.
+    """
+
+    run_dir: Path
+    checkpoint: Path
+    status: str
+    split_seed: int | None
+    model_seed: int | None
+    model_name: str | None
+    selection_metric: str | None
+    best_epoch: int | None
+    best_validation_score: float | None
+    epochs_run: int | None
+    stopped_early: str | None
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status == "finished"
+
+    def describe(self) -> str:
+        """One line for a notebook: which run, how it ended, what it scored, where it is."""
+        ran = f" after {self.epochs_run} epoch{'' if self.epochs_run == 1 else 's'}" if self.epochs_run else ""
+        best = "" if self.best_epoch is None else f" · best epoch {self.best_epoch + 1}"
+        score = (
+            ""
+            if self.best_validation_score is None or not np.isfinite(self.best_validation_score)
+            else f" · validation {self.selection_metric or 'score'} {self.best_validation_score:.4f}"
+        )
+        return f"{self.run_dir.name} · {self.status}{ran}{best}{score} · {self.checkpoint}"
+
+
+def recover_runs(output_dir: str | Path) -> list[RecoveredRun]:
+    """Every checkpoint under *output_dir*, whether the run that wrote it finished or not.
+
+    This is the reader the per-epoch checkpoint exists for. A session that is pre-empted at hour
+    two of three leaves `runs/<split>_<seed>/best_checkpoint.pt` and nothing else -- no
+    `metrics.json`, no `RunResult`, nothing any other entry point in this package will accept.
+    Point this at the same `output_dir` in the next session and it says what survived and how
+    far each run got; `colabsd.bundle.save_bundle_from_checkpoint` turns any one of them into a
+    model bundle.
+
+    Weights moved aside by a later retrain (`unfinished_checkpoint*.pt`) are listed too, so
+    nothing that was ever written becomes unreachable.
+    """
+    import torch
+
+    output_dir = Path(output_dir)
+    roots = [output_dir / RUNS_DIRNAME, output_dir]
+    seen: set[Path] = set()
+    found: list[RecoveredRun] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for run_dir in sorted([root, *(path for path in root.iterdir() if path.is_dir())]):
+            if run_dir.name == LOCKED_DIRNAME:
+                continue
+            for checkpoint in sorted(run_dir.glob("*checkpoint*.pt")):
+                resolved = checkpoint.resolve()
+                if resolved in seen or checkpoint.name.endswith(".partial"):
+                    continue
+                seen.add(resolved)
+                try:
+                    blob = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                except (RuntimeError, ValueError, EOFError, AttributeError):
+                    continue
+                if not isinstance(blob, dict) or "lora_state_dict" not in blob:
+                    continue
+                found.append(_recovered(run_dir, checkpoint, blob))
+    return found
+
+
+def _recovered(run_dir: Path, checkpoint: Path, blob: dict[str, Any]) -> RecoveredRun:
+    recorded = _recorded_json(run_dir, "colabsd_run.json") or {}
+    moved_aside = checkpoint.name != _checkpoint_name()
+    stopped = blob.get("stopped_early", recorded.get("stopped_early"))
+    if moved_aside or not blob.get("complete", False):
+        status = "unfinished"
+    elif stopped == INTERRUPTED:
+        status = INTERRUPTED
+    elif not moved_aside and not recorded and not (run_dir / "metrics.json").is_file():
+        # Complete weights, but the run never wrote the numbers that go beside them.
+        status = "unfinished"
+    else:
+        status = "finished"
+    score = blob.get("best_validation_score")
+    return RecoveredRun(
+        run_dir=run_dir,
+        checkpoint=checkpoint,
+        status=status,
+        split_seed=_as_int(blob.get("split_seed")),
+        model_seed=_as_int(blob.get("seed")),
+        model_name=None if blob.get("model_name") is None else str(blob["model_name"]),
+        selection_metric=None if blob.get("selection_metric") is None else str(blob["selection_metric"]),
+        best_epoch=_as_int(blob.get("best_epoch")),
+        best_validation_score=None if score is None else float(score),
+        epochs_run=_as_int(blob.get("epochs_run")) or _as_int(recorded.get("epochs_run")),
+        stopped_early=None if stopped is None else str(stopped),
+    )
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_matching_fingerprint(
+    path: Path,
+    found: str | None,
+    expected: str | None,
+    key: tuple[int, int],
+    output_dir: Path,
+) -> None:
+    """Refuse to hand back test numbers produced by a different configuration.
+
+    Run directories are keyed by (split seed, model seed) alone, so a second `finetune` into the same
+    `output_dir` with different hyperparameters overwrites the locked payload. Without this check the
+    older `RunResult` would silently report the newer model's test metrics.
+    """
+    if not found or not expected or found == SKIPPED_FINGERPRINT:
+        return
+    if found == expected:
+        return
+    raise ColabSDError(
+        f"{path} holds the test metrics of a different training configuration for split seed {key[0]}, model "
+        f"seed {key[1]} (fingerprint {found} rather than {expected}): {output_dir} was reused by a later "
+        "finetune() call with different hyperparameters, data or splits. Re-run finetune() for this "
+        "configuration, or give each configuration its own output_dir."
+    )
+
+
+def read_unlock_count(output_dir: str | Path) -> int:
+    """Return how often the test partition under *output_dir* has been unlocked."""
+    return _read_unlock_payload(Path(output_dir))[0]
+
+
+def _read_unlock_payload(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
+    path = output_dir / UNLOCK_FILENAME
+    if not path.is_file():
+        return 0, []
+    try:
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict):
+            raise TypeError(f"expected a JSON object, got {type(payload).__name__}")
+        count = int(payload.get("unlock_count", 0))
+        history = payload.get("history", [])
+        if not isinstance(history, list):
+            raise TypeError(f"'history' must be a list, got {type(history).__name__}")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ColabSDError(
+            f"{path} is not readable as an unlock record ({exc}). Delete it to reset the unlock counter to zero, "
+            "and say so in the report."
+        ) from exc
+    return count, list(history)
+
+
+def _record_unlock(output_dir: Path, *, n_runs: int, model_name: str) -> int:
+    path = output_dir / UNLOCK_FILENAME
+    previous, history = _read_unlock_payload(output_dir)
+    count = previous + 1
+    history.append({"unlock_count": count, "utc": _utc_now(), "model": model_name, "n_runs": n_runs})
+    path.write_text(json.dumps({"unlock_count": count, "history": history}, indent=2))
+    return count
+
+
+def _lock_test_artifacts(
+    *,
+    run_dir: Path,
+    locked_run_dir: Path,
+    metrics: dict[str, Any],
+    fingerprint: str,
+    condition_columns: list[str],
+) -> None:
+    locked_run_dir.mkdir(parents=True, exist_ok=True)
+    locked_run_dir.joinpath("test_metrics.json").write_text(
+        json.dumps(
+            {
+                "_warning": LOCKED_WARNING,
+                "model": metrics["model"],
+                "split_seed": int(metrics["split_seed"]),
+                "model_seed": int(metrics["seed"]),
+                "run_dir": str(run_dir),
+                "fingerprint": fingerprint,
+                "condition_columns": condition_columns,
+                "test": metrics["test"],
+            },
+            indent=2,
+        )
+    )
+    _strip_test_from_metrics_json(run_dir)
+    predictions = run_dir / "predictions.npz"
+    if predictions.is_file():
+        with np.load(predictions) as blob:
+            arrays = {key: blob[key] for key in blob.files}
+        np.savez_compressed(
+            locked_run_dir / "test_predictions.npz",
+            **{key: value for key, value in arrays.items() if key.startswith("test_")},
+        )
+        np.savez_compressed(
+            predictions,
+            **{key: value for key, value in arrays.items() if not key.startswith("test_")},
+        )
+    metrics.pop("test", None)
+
+
+def _strip_test_from_metrics_json(run_dir: Path) -> None:
+    """Replace the test block upstream just wrote with the locked-partition notice."""
+    path = run_dir / "metrics.json"
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text())
+    except ValueError:
+        return
+    if not isinstance(payload, dict):
+        return
+    payload["test"] = LOCKED_WARNING
+    payload["test_locked"] = True
+    path.write_text(json.dumps(payload, indent=2))
+
+
+def _lock_interrupted_artifacts(run_dir: Path, locked_run_dir: Path, condition_columns: list[str]) -> None:
+    """Quarantine test artifacts left behind by a run that died before they were locked."""
+    path = run_dir / "metrics.json"
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text())
+    except ValueError:
+        return
+    if not isinstance(payload.get("test"), dict):
+        return
+    _lock_test_artifacts(
+        run_dir=run_dir,
+        locked_run_dir=locked_run_dir,
+        metrics=payload,
+        fingerprint=SKIPPED_FINGERPRINT,
+        condition_columns=condition_columns,
+    )
+
+
+def _visible_row(
+    *,
+    metrics: dict[str, Any],
+    condition_columns: list[str],
+    split_seed: int,
+    model_seed: int,
+    run_dir: Path,
+    minutes: float,
+    fingerprint: str,
+    max_epochs: int = 0,
+) -> dict[str, Any]:
+    """One run as everything downstream sees it: the numbers, and what produced them.
+
+    `stopped_early`, `epochs_run` and `epochs_budget` travel with the metrics rather than
+    staying behind in `metrics.json`, because every surface that publishes the numbers -- the
+    resume cache, `run_result.json`, `validation_runs.csv`, the report and the bundle manifest
+    -- has to be able to say that a run trained 2 of its 20 epochs.
+    """
+    validation = metrics["validation"]
+    rows = metrics.get("partition_rows") or {}
+    return {
+        "split_seed": int(split_seed),
+        # Carried for the same reason as the epoch counts: a ranking metric is only the cut it
+        # names while the partition is longer than that cut, and the report is where somebody
+        # reads `P@50` without ever seeing how many rows it ranked.
+        "partition_rows": {str(k): int(v) for k, v in rows.items()},
+        "model_seed": int(model_seed),
+        "model": metrics["model"],
+        "selection_metric": metrics["selection_metric"],
+        "best_epoch": int(metrics["best_epoch"]),
+        "best_validation_score": float(metrics["best_validation_score"]),
+        "minutes": float(minutes),
+        "run_dir": str(run_dir),
+        "checkpoint": str(run_dir / _checkpoint_name()),
+        "fingerprint": fingerprint,
+        "stopped_early": metrics.get("stopped_early"),
+        "epochs_run": int(metrics.get("epochs_run", 0) or 0),
+        "epochs_budget": int(max_epochs or metrics.get("epochs_run", 0) or 0),
+        "test_locked": True,
+        "validation": {
+            "mean": _macro_without_unmeasured(validation["mean"], validation["per_target"]),
+            "per_condition": _rename_targets(validation["per_target"], condition_columns),
+        },
+    }
+
+
+def _write_visible_metrics(run_dir: Path, row: dict[str, Any]) -> None:
+    path = run_dir / "metrics.json"
+    payload = json.loads(path.read_text()) if path.is_file() else {}
+    payload["test"] = LOCKED_WARNING
+    payload["test_locked"] = True
+    payload["fingerprint"] = row["fingerprint"]
+    payload["validation_per_condition"] = row["validation"]["per_condition"]
+    path.write_text(json.dumps(payload, indent=2))
+    (run_dir / "colabsd_run.json").write_text(json.dumps(row, indent=2))
+
+
+def _cached_row(run_dir: Path, fingerprint: str) -> dict[str, Any] | None:
+    """The finished run in *run_dir*, if it is this exact run and it really finished.
+
+    `colabsd_run.json` is written only after a run returns, so its presence used to be taken
+    as proof that the run was complete. It is not: a stop press inside the epoch loop ends
+    that loop and the run finalizes normally, marker file and all, having trained two epochs
+    of the twenty that were asked for. Reusing that as the finished answer makes the obvious
+    remedy -- press Train again -- do nothing at all, so a run that records
+    `stopped_early: "interrupted"` is never a cache hit.
+    """
+    marker = run_dir / "colabsd_run.json"
+    if not marker.is_file():
+        return None
+    try:
+        row = json.loads(marker.read_text())
+    except ValueError:
+        return None
+    if not isinstance(row, dict) or row.get("fingerprint") != fingerprint:
+        return None
+    if row.get("stopped_early") == INTERRUPTED:
+        return None
+    checkpoint = run_dir / _checkpoint_name()
+    if not checkpoint.is_file():
+        return None
+    row["run_dir"] = str(run_dir)
+    row["checkpoint"] = str(checkpoint)
+    return row
+
+
+def _checkpoint_name() -> str:
+    """`best_checkpoint.pt`, spelled once, where the engine spells it."""
+    from colabsd.engine.train_config import CHECKPOINT_NAME
+
+    return CHECKPOINT_NAME
+
+
+def _recorded_json(run_dir: Path, name: str) -> dict[str, Any] | None:
+    """One of a run directory's bookkeeping files, or None if it is absent or unreadable."""
+    path = run_dir / name
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _preserve_unfinished_checkpoint(run_dir: Path, name: str) -> list[str]:
+    """Move a cut-short run's weights aside before this run trains over them.
+
+    The per-epoch checkpoint exists so that a session which dies at hour two of three leaves
+    something behind. It only does if the obvious next action -- reconnect and press Train --
+    cannot destroy it, and that action retrains the same split and seed into the same
+    directory, whose very first improving epoch (epoch 0 always improves) writes over
+    `best_checkpoint.pt`. So anything that is not a finished run's own checkpoint is renamed
+    first, and nothing here ever deletes a file.
+    """
+    checkpoint = run_dir / _checkpoint_name()
+    if not checkpoint.is_file():
+        return []
+    blob = _checkpoint_header(checkpoint)
+    recorded = _recorded_json(run_dir, "colabsd_run.json")
+    if _finished_weights(blob, recorded):
+        # A finished run's own weights, superseded by a deliberate change of configuration.
+        return []
+    target = _free_path(run_dir, UNFINISHED_CHECKPOINT_NAME)
+    checkpoint.replace(target)
+    how_far = _how_far(blob, recorded or _recorded_json(run_dir, "metrics.json"))
+    return [
+        f"Run {name} did not finish{how_far}. Its weights were moved to `{target}` and it is being "
+        "retrained now; read them back with colabsd.train.recover_runs(output_dir), or keep them with "
+        "colabsd.bundle.save_bundle_from_checkpoint()."
+    ]
+
+
+def _checkpoint_header(path: Path) -> dict[str, Any] | None:
+    """What a checkpoint says about itself, or None when it cannot be read at all."""
+    import torch
+
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=True)
+    except (RuntimeError, ValueError, EOFError, AttributeError, OSError):
+        return None
+    return blob if isinstance(blob, dict) else None
+
+
+def _finished_weights(blob: dict[str, Any] | None, recorded: dict[str, Any] | None) -> bool:
+    """True only when the checkpoint on disk is the product of a run that ran to the end.
+
+    The checkpoint is asked first, because it is the file about to be overwritten and it says
+    what it is (`complete`, `stopped_early`). The run directory's `colabsd_run.json` can belong
+    to an *earlier* run of the same split and seed -- a finished one, followed by a session that
+    died half way through a re-run -- so trusting it alone would throw away exactly the weights
+    this exists to keep. A checkpoint that cannot be read at all is treated as unfinished:
+    moving a file aside costs nothing, and deleting it is irreversible.
+    """
+    if blob is None:
+        return False
+    if "complete" in blob or "stopped_early" in blob:
+        return bool(blob.get("complete", False)) and blob.get("stopped_early") != INTERRUPTED
+    # Written by a colabsd that recorded neither: fall back to the directory's own bookkeeping.
+    return recorded is not None and recorded.get("stopped_early") != INTERRUPTED
+
+
+def _how_far(blob: dict[str, Any] | None, recorded: dict[str, Any] | None) -> str:
+    """` (2 of 20 epochs)`, as far as the checkpoint and the run directory agree on it.
+
+    The checkpoint wins on how many epochs ran, because the bookkeeping beside it may belong to
+    an earlier run of the same split and seed; the budget is only quoted when the two agree
+    that they are describing the same run.
+    """
+    ran = (blob or {}).get("epochs_run") or (recorded or {}).get("epochs_run")
+    if not ran:
+        return ""
+    budget = (recorded or {}).get("epochs_budget")
+    same_run = (recorded or {}).get("epochs_run") == ran
+    if budget and same_run:
+        return f" ({int(ran)} of {int(budget)} epoch{'' if int(budget) == 1 else 's'})"
+    return f" ({int(ran)} epoch{'' if int(ran) == 1 else 's'} trained)"
+
+
+def _free_path(directory: Path, name: str) -> Path:
+    """`name`, or `name_2`, `name_3`, ...: the first spelling that is not already taken."""
+    candidate = directory / name
+    stem, suffix = candidate.stem, candidate.suffix
+    index = 1
+    while candidate.exists():
+        index += 1
+        candidate = directory / f"{stem}_{index}{suffix}"
+    return candidate
+
+
+def _cut_short_warning(row: dict[str, Any], name: str) -> list[str]:
+    """Say, on the page and in `run_result.json`, that these numbers came from a short run."""
+    if row.get("stopped_early") != INTERRUPTED:
+        return []
+    ran, budget = int(row.get("epochs_run", 0) or 0), int(row.get("epochs_budget", 0) or 0)
+    return [
+        f"Run {name} was stopped by hand after {ran} of {budget} epochs. Its numbers are this "
+        "short run's, not the budget's; the next Train press retrains it rather than reusing it, "
+        "and moves these weights aside first."
+    ]
+
+
+def _nonfinite_reason(run_dir: Path) -> str | None:
+    """Why this run's numbers are not a measurement, or None when they are.
+
+    Asked of the loss curve and of the predictions, never of the metrics: the engine's
+    `_safe_corr` reports 0.0 for a correlation it could not compute, so an all-NaN model
+    leaves `metrics.json` saying `Spearman: 0.0` -- a finite number no check of the metrics
+    can tell from a measured zero.
+    """
+    log_path = run_dir / "training_log.json"
+    if log_path.is_file():
+        try:
+            rows = json.loads(log_path.read_text())
+        except ValueError:
+            rows = []
+        for row in rows if isinstance(rows, list) else []:
+            for key in ("train_loss", "val_loss"):
+                value = row.get(key)
+                if value is None or not np.isfinite(float(value)):
+                    return f"{key} is {value} at epoch {int(row.get('epoch', 0))}"
+    npz_path = run_dir / "predictions.npz"
+    if npz_path.is_file():
+        with np.load(npz_path) as blob:
+            preds = np.asarray(blob["validation_predictions"], dtype=np.float64)
+        bad = int((~np.isfinite(preds)).sum())
+        if bad:
+            return f"{bad} of {preds.size} validation predictions are not finite"
+    return None
+
+
+def _refuse_nonfinite_run(run_dir: Path, name: str) -> None:
+    """Refuse a run whose numbers are not finite, instead of publishing a dead model's 0.0000."""
+    reason = _nonfinite_reason(run_dir)
+    if reason is None:
+        return
+    raise ColabSDError(
+        f"Run {name} trained a model whose numbers are not finite: {reason}. This is a dead "
+        "model, not a score of zero -- the correlation of an all-NaN prediction is reported as "
+        "0.0000, which is why it is refused here instead of published. The usual cause is "
+        "numeric precision float16, whose smallest number is larger than the optimizer's "
+        "epsilon: train in bfloat16, which is the same two bytes per weight and the same "
+        "memory, or in float32. Nothing on the page will show these numbers and nothing will "
+        f"reuse this run -- pressing Train again retrains it. What the engine wrote is in "
+        f"{run_dir}: training_log.json holds the loss curve this refusal read."
+    )
+
+
+def _validate_inputs(
+    sequences: list[str],
+    targets: np.ndarray,
+    condition_columns: list[str],
+    splits: dict[int, dict[str, list[int]]],
+    spec: LibrarySpec | None = None,
+) -> None:
+    if targets.ndim != 2:
+        raise DataError(f"targets must be 2-D (N, T); got shape {targets.shape}.")
+    if len(sequences) != targets.shape[0]:
+        raise DataError(
+            f"{len(sequences)} sequences but {targets.shape[0]} target rows. "
+            "Both come from load_library(); pass its outputs unchanged."
+        )
+    if targets.shape[1] != len(condition_columns):
+        raise DataError(
+            f"targets has {targets.shape[1]} columns but the spec lists {len(condition_columns)} "
+            f"condition_columns ({condition_columns}). Rebuild the targets with load_library()."
+        )
+    if not isinstance(splits, dict) or not splits:
+        raise DataError(
+            "splits must be the {split_seed: split} mapping returned by colabsd.data.make_splits(); got "
+            f"{type(splits).__name__}."
+        )
+    lengths = {len(seq) for seq in sequences}
+    if len(lengths) > 1:
+        raise DataError(
+            f"Sequences have {len(lengths)} different lengths; every variant must be the full-length WT with "
+            "substitutions. Rebuild them with load_library()."
+        )
+    wt = str(getattr(spec, "wt_sequence", "") or "")
+    if wt and lengths and lengths != {len(wt)}:
+        raise DataError(
+            f"The variant sequences are {sorted(lengths)[0]} residues but spec.wt_sequence is {len(wt)}. "
+            "The mutated positions are wild-type coordinates, so a length mismatch averages the wrong "
+            "residues: rebuild the sequences with load_library(csv, spec)."
+        )
+
+
+def _clean_split(split: dict[str, list[int]], n: int, split_seed: int) -> dict[str, list[int]]:
+    missing = [key for key in ("train_idx", "val_idx", "test_idx") if key not in split]
+    if missing:
+        raise DataError(f"Split seed {split_seed} is missing {missing}; build splits with colabsd.data.make_splits().")
+    cleaned = {key: [int(index) for index in split[key]] for key in ("train_idx", "val_idx", "test_idx")}
+    for key, indices in cleaned.items():
+        if not indices:
+            raise DataError(f"Split seed {split_seed} has an empty {key}; the library is too small to split 8:1:1.")
+        if len(indices) < 2:
+            raise DataError(
+                f"Split seed {split_seed} gives {key} only {len(indices)} of this library's {n} variants, "
+                "and every metric here needs at least two rows: NDCG is undefined on one document and "
+                "Spearman has nothing to rank. An 8:1:1 split is 80/10/10 rounded down, so the validation "
+                "partition reaches two rows at 20 variants -- and at 20 for every split seed, because the "
+                "partition sizes depend on the library size alone. This library needs at least 20 variants "
+                "to train."
+            )
+        if min(indices) < 0 or max(indices) >= n:
+            raise DataError(
+                f"Split seed {split_seed} indexes row {max(indices)} of a {n}-row library. "
+                "Rebuild the splits after filtering the library."
+            )
+        if len(set(indices)) != len(indices):
+            raise DataError(
+                f"Split seed {split_seed} lists the same row twice in {key}. Rebuild the splits with "
+                "colabsd.data.make_splits(); a repeated row is counted twice in every metric."
+            )
+    for left, right in (("train_idx", "val_idx"), ("train_idx", "test_idx"), ("val_idx", "test_idx")):
+        shared = sorted(set(cleaned[left]) & set(cleaned[right]))
+        if shared:
+            raise DataError(
+                f"Split seed {split_seed} puts {len(shared)} rows (for example {shared[:5]}) in both {left} and "
+                f"{right}. That leaks the held-out data into training and makes every number optimistic: "
+                "rebuild the splits with colabsd.data.make_splits()."
+            )
+    return cleaned
+
+
+def _unique(values: list[int]) -> list[int]:
+    """Keep the first occurrence of each seed: a repeated seed would train twice into one run directory."""
+    seen: set[int] = set()
+    return [value for value in values if not (value in seen or seen.add(value))]
+
+
+def _default_model_seeds(best: BestConfig) -> list[int]:
+    evaluation = dict(getattr(best, "evaluation", {}) or {})
+    seeds = evaluation.get("model_seeds") or [0]
+    return [int(seed) for seed in seeds]
+
+
+def _adapter_name(adapter: Any, best: BestConfig) -> str:
+    return str(getattr(adapter, "model_name", None) or best.model)
+
+
+def _text_attr(adapter: Any, name: str) -> str | None:
+    value = getattr(adapter, name, None)
+    return None if value is None else str(value)
+
+
+def _provisional_warning(best: BestConfig) -> list[str]:
+    if getattr(best, "is_provisional", False):
+        return [
+            f"{best.model} hyperparameters are PROVISIONAL: they are a placeholder, not a tuned configuration. "
+            "Treat the numbers as a lower bound."
+        ]
+    return []
+
+
+def _budget_warning(settings: BudgetSettings) -> list[str]:
+    """Say, in the report and in `run_result.json`, that this run is not the looked-up budget."""
+    if settings.is_looked_up:
+        return []
+    return [
+        "Training budget set by hand, not looked up: "
+        + "; ".join(settings.describe_changes())
+        + ". Every other hyperparameter is the looked-up configuration."
+    ]
+
+
+def _runtime_config(
+    *,
+    spec: LibrarySpec,
+    best: BestConfig,
+    output_dir: Path,
+    split_seeds: list[int],
+    model_seeds: list[int],
+    override: dict[str, Any] | None,
+    budget: BudgetOverrides | dict[str, Any] | None = None,
+    n_train: int | None = None,
+) -> tuple[dict[str, Any], BudgetSettings]:
+    """Build the runtime config and the budget it runs under; the budget wins over both blocks."""
+    fixed_best = dict(getattr(best, "fixed", {}) or {})
+    params_best = dict(getattr(best, "params", {}) or {})
+    if override is not None:
+        config = copy.deepcopy(override)
+        # A caller-supplied config may set what the entry leaves out, so the budget is
+        # resolved against the same merge the run will use.
+        settings = resolve_budget(params_best, {**dict(config.get("fixed", {})), **fixed_best}, budget, n_train=n_train)
+    else:
+        settings = resolve_budget(params_best, fixed_best, budget, n_train=n_train)
+        config = _config_from_protein_db(
+            spec=spec,
+            best=best,
+            output_dir=output_dir,
+            split_seeds=split_seeds,
+            model_seeds=model_seeds,
+            budget=settings,
+        )
+    config.setdefault("data", {})
+    config.setdefault("protein", {})
+    # The engine names unnamed target columns after upstream's own study's four SlugCas9 PAMs.
+    # The library's condition columns are right here, and `metrics.json` is a file the docs send
+    # people to, so they are passed down rather than left to that default.
+    config["data"]["target_names"] = [str(column) for column in spec.condition_columns]
+    # The looked-up training block is merged in last of the two, then the budget over both:
+    # what the user set has to survive, and what they left alone is the lookup's.
+    fixed = {**dict(config.get("fixed", {})), **fixed_best, **settings.as_fixed()}
+    if fixed.get("evaluate_test_during_optimization"):
+        raise ConfigError(
+            "training.evaluate_test_during_optimization must stay false. Remove it from the best-config YAML; "
+            "colabsd reads the test partition only through unlock_test()."
+        )
+    fixed["evaluate_test_during_optimization"] = False
+    config["fixed"] = fixed
+    evaluation = dict(getattr(best, "evaluation", {}) or {})
+    study = dict(config.get("study", {}))
+    study.update(
+        {
+            "direction": "maximize",
+            "objective": str(evaluation.get("selection_objective", study.get("objective", "mean_validation_spearman"))),
+            "top_k": 1,
+            "re_evaluation_split_seeds": list(split_seeds),
+            "re_evaluation_seeds": list(model_seeds),
+        }
+    )
+    config["study"] = study
+    return config, settings
+
+
+def _config_from_protein_db(
+    *,
+    spec: LibrarySpec,
+    best: BestConfig,
+    output_dir: Path,
+    split_seeds: list[int],
+    model_seeds: list[int],
+    budget: BudgetSettings,
+) -> dict[str, Any]:
+    """Write the one-protein record the engine resolves coordinates from, and configure a run against it.
+
+    The record's coordinates are `spec.positions_1based` and nothing else: the model averages the
+    embeddings at the sites the library varies. The blocks handed on carry the budget this run
+    will use, so upstream's loader validates the epochs and batch sizes that will actually train.
+    """
+    try:
+        from colabsd import protein_db
+    except ImportError as exc:  # pragma: no cover - only before protein_db lands
+        raise ConfigError(
+            "colabsd.protein_db is unavailable, so the mutated sites cannot be written where the engine "
+            f"reads them. Pass finetune(config=...) with a prepared runtime config instead ({exc})."
+        ) from exc
+    database_path = protein_db.write_protein_record(spec, out_dir=output_dir, protein_id=PROTEIN_ID)
+    return protein_db.runtime_config(
+        spec,
+        params={
+            "model": str(best.model),
+            "parameters": {**dict(best.params), "effective_batch_size": budget.effective_batch_size},
+            "training": {**dict(getattr(best, "fixed", {}) or {}), **budget.as_fixed()},
+            "evaluation": dict(getattr(best, "evaluation", {}) or {}),
+        },
+        protein_id=PROTEIN_ID,
+        database_path=Path(database_path).resolve(),
+        split_seeds=list(split_seeds),
+        model_seeds=list(model_seeds),
+    )
+
+
+def _selection_metric(config: dict[str, Any]) -> str:
+    from colabsd.engine.config_space import validation_metric_name
+
+    try:
+        return validation_metric_name(config)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{exc} Fix evaluation.selection_objective in the best-config YAML for this model."
+        ) from exc
+
+
+def _rename_targets(per_target: dict[str, Any], condition_columns: list[str]) -> dict[str, dict[str, float]]:
+    """Relabel the engine's positional target names with the user's condition columns."""
+    names = list(per_target)
+    if len(names) != len(condition_columns):
+        raise DataError(
+            f"The engine reported {len(names)} targets but the spec lists {len(condition_columns)} condition_columns. "
+            "The targets array and spec.condition_columns must agree."
+        )
+    return {column: dict(per_target[name]) for column, name in zip(condition_columns, names, strict=True)}
+
+
+def summarize_across_runs(values: Iterable[float]) -> dict[str, float]:
+    """Mean, sample sd and count over the finite values of one metric across repeated runs.
+
+    The sd of a single run is **undefined**, not zero: reporting 0.0 would claim a
+    reproducibility that one run cannot show. `colabsd.train` and `colabsd.report` both
+    aggregate through this one function so their tables agree.
+    """
+    finite = [float(value) for value in values if np.isfinite(value)]
+    if not finite:
+        return {"mean": float("nan"), "sd": float("nan"), "n": 0}
+    sd = float(np.std(finite, ddof=1)) if len(finite) > 1 else float("nan")
+    return {"mean": float(np.mean(finite)), "sd": sd, "n": len(finite)}
+
+
+def _aggregate(rows: list[dict[str, Any]], condition_columns: list[str], *, partition: str) -> pd.DataFrame:
+    import pandas as pd
+
+    records = []
+    for condition in condition_columns:
+        for metric in METRICS:
+            values = [float(row[partition]["per_condition"][condition][metric]) for row in rows]
+            stats = summarize_across_runs(values)
+            records.append(
+                {
+                    "partition": partition,
+                    "condition": condition,
+                    "metric": metric,
+                    "mean": stats["mean"],
+                    "sd": stats["sd"],
+                    "n_runs": int(stats["n"]),
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
+def _macro_without_unmeasured(macro: Any, per_target: Any) -> dict[str, float]:
+    """The engine's macro block, with a metric no target could produce restored to NaN.
+
+    `colabsd.engine.metrics.mean_metric` returns `0.0` when every per-target value of a metric is
+    non-finite -- `precision_k` is NaN on a prediction whose range collapses, so a head that
+    predicts one number makes P@10 and P@50 undefined for every condition. Carried through, that
+    `0.0` is published as a measurement: `report.csv`'s `mean` row, `report.json` and the report
+    figure all show a bar at zero over "1 run", while `summarize_across_runs` reports the same
+    emptiness honestly as mean NaN over 0 runs in `validation_summary.csv` for the same run.
+    docs/CONTRACTS.md forbids exactly this -- an undefined statistic must not be published as 0.0,
+    "because a zero would read as 'perfectly stable'".
+
+    Masked here, on colabsd's side of the engine seam (docs/CONTRACTS.md section 0), so the
+    vendored engine is untouched and every artifact of one run says the same thing.
+    """
+    values = per_target.values() if isinstance(per_target, dict) else ()
+    out: dict[str, float] = {}
+    for metric, value in dict(macro).items():
+        measured = False
+        for target in values:
+            try:
+                if np.isfinite(float(target[metric])):
+                    measured = True
+                    break
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+        out[metric] = float(value) if measured else float("nan")
+    return out
+
+
+def _macro_summary(rows: list[dict[str, Any]], partition: str) -> dict[str, dict[str, float]]:
+    summary: dict[str, dict[str, float]] = {}
+    for metric in METRICS:
+        stats = summarize_across_runs([float(row[partition]["mean"][metric]) for row in rows])
+        summary[metric] = {"mean": stats["mean"], "sd": stats["sd"], "n_runs": int(stats["n"])}
+    return summary
+
+
+def _flatten_runs(rows: list[dict[str, Any]], condition_columns: list[str]) -> list[dict[str, Any]]:
+    flat = []
+    for row in rows:
+        partition = "test" if "test" in row else "validation"
+        record = {
+            "split_seed": row["split_seed"],
+            "model_seed": row["model_seed"],
+            "best_epoch": row.get("best_epoch"),
+            "best_validation_score": row.get("best_validation_score"),
+            "minutes": row.get("minutes"),
+            # A row of numbers is not readable without the run that produced them: 2 epochs of
+            # a 20-epoch budget is a different measurement from 20 of 20.
+            "epochs_run": row.get("epochs_run"),
+            "epochs_budget": row.get("epochs_budget"),
+            "stopped_early": row.get("stopped_early"),
+        }
+        for metric, value in row[partition]["mean"].items():
+            record[f"{partition}_mean_{metric}"] = value
+        for condition in condition_columns:
+            for metric, value in row[partition]["per_condition"][condition].items():
+                record[f"{partition}_{condition}_{metric}"] = value
+        flat.append(record)
+    return flat
+
+
+def _fingerprint(**payload: Any) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _data_digest(sequences: list[str], targets: np.ndarray) -> str:
+    """Hash the training data so a resumed run cannot reuse a checkpoint fitted to other numbers."""
+    digest = hashlib.sha256()
+    for sequence in sequences:
+        digest.update(sequence.encode())
+        digest.update(b"\x00")
+    digest.update(np.ascontiguousarray(targets, dtype=np.float32).tobytes())
+    return digest.hexdigest()[:32]
+
+
+def _pooled_positions(adapter: Any, spec: LibrarySpec, config: dict[str, Any]) -> list[int]:
+    """The residues this run averages: the library's mutated sites, agreed on by all three parties.
+
+    The engine averages the embeddings the *adapter* selects but records the coordinates it resolves
+    from the *protein record*, and both must be the sites the *spec* says the library varies. A
+    disagreement is invisible otherwise: the metrics, the RunResult and the bundle would all describe
+    residues the model never averaged.
+    """
+    from colabsd.engine.config_space import pooling_positions_0based
+    from colabsd.engine.protein_db import clear_database_cache
+
+    expected = sorted(int(position) for position in spec.positions_0based())
+    positions = getattr(adapter, "pooling_positions_0based", None)
+    if not positions:
+        raise ConfigError(
+            "The adapter was given no residue positions, so there is nothing for it to average. Build it "
+            "with create_adapter(name, pooling_positions_0based=spec.positions_0based(), ...)."
+        )
+    resolved = sorted(int(position) for position in positions)
+    if resolved != expected:
+        raise ConfigError(
+            f"The adapter averages {len(resolved)} residues (0-based {resolved[:5]}) but the library varies "
+            f"{len(expected)} (0-based {expected[:5]}). Build the adapter with "
+            "pooling_positions_0based=spec.positions_0based(), from the same spec you are training on."
+        )
+    clear_database_cache()
+    try:
+        recorded = sorted(int(position) for position in pooling_positions_0based(config))
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        raise ConfigError(
+            f"The mutated sites could not be resolved from the protein record ({exc}). Write it with "
+            "colabsd.protein_db.write_protein_record(spec, out_dir) before calling finetune(config=...)."
+        ) from exc
+    if recorded != expected:
+        raise ConfigError(
+            f"The protein record lists {len(recorded)} mutated residues (0-based {recorded[:5]}) but this "
+            f"library varies {len(expected)} (0-based {expected[:5]}). Every artifact would record "
+            "coordinates the model never averaged: rewrite the record with "
+            "colabsd.protein_db.write_protein_record(spec, out_dir) for this spec."
+        )
+    return expected
+
+
+class _EventGuard:
+    """`on_event`, wrapped so that a picture which will not draw cannot end a run.
+
+    Drawing one is matplotlib, a comm channel and a widget, in a notebook on somebody else's
+    machine: it can fail for reasons this package will never see, and none of them are worth an
+    hour of GPU time. The first exception ends the event stream for the rest of the `finetune`
+    call -- a watcher that raised once raises again every few seconds for the next forty
+    minutes -- and leaves one line in `RunResult.warnings` saying the curve stopped and the
+    training did not.
+
+    `Exception`, never `BaseException`: Colab's stop button arrives as a `KeyboardInterrupt`,
+    and one pressed while a redraw is on screen must still stop the run.
+    """
+
+    def __init__(self, on_event: EventFn | None) -> None:
+        self._on_event = on_event
+        self.warnings: list[str] = []
+
+    def sink(self) -> EventFn | None:
+        """Itself while there is still somebody to send to; None once there is not.
+
+        Read once per run, so a run that starts after the watcher broke builds the text-line
+        reporters alone and constructs no events at all.
+        """
+        return self if self._on_event is not None else None
+
+    def __call__(self, event: TrainingEvent) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event)
+        except Exception as exc:
+            self._on_event = None
+            self.warnings.append(f"{EVENT_FAILURE_WARNING} ({type(exc).__name__}: {exc})")
+
+
+def _elapsed(seconds: float) -> str:
+    """`6m12s`, so a reader can tell a slow run from a stopped one."""
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+def _run_reporters(
+    progress: ProgressFn | None,
+    done: int,
+    total: int,
+    started: float,
+    *,
+    on_event: EventFn | None = None,
+    split_seed: int = 0,
+    model_seed: int = 0,
+    metric: str = "",
+) -> tuple[EpochProgress | None, BatchProgress | None]:
+    """Build the `(on_epoch, on_batch)` pair that turns one run's training into panel lines.
+
+    Batch lines read `run 1/2 · epoch 3/20 · batch 412/1643 · loss 0.183 · 2m14s`; an epoch
+    closes on `run 1/2 · epoch 3/20 · val 0.7412 · loss 0.171 · 2m31s`, carrying the score the
+    epoch is kept or discarded on in place of the batch count. `done` stays the number of
+    *completed runs*, so the run counter does not advance until the run really finishes:
+    which run is under way, and everything inside it, goes in the label.
+
+    Batch lines are throttled to one per `PROGRESS_MIN_INTERVAL_S`, except the last batch of an
+    epoch, which is always sent. A count that freezes at `batch 1600/1643` is what makes a
+    working run look hung, which is the whole reason these lines exist.
+
+    `on_event` gets the same two moments as `TrainingEvent` numbers, on that same gate and
+    immediately *after* the line: the event may be a redraw that blocks for a tenth of a
+    second, and the line that says the run is alive should not wait for it. `split_seed`,
+    `model_seed` and `metric` are what the line spells out in words and an event cannot
+    reconstruct -- which run these numbers belong to, and what `score` is measured in.
+    """
+    if progress is None and on_event is None:
+        return None, None
+
+    where = f"run {done + 1}/{total}"
+    sent_at = 0.0
+
+    def emit(detail: str) -> float:
+        nonlocal sent_at
+        sent_at = time.time()
+        _notify(progress, done, total, f"{where} · {detail} · {_elapsed(sent_at - started)}")
+        return sent_at
+
+    def announce(kind: str, epoch: int, max_epochs: int, loss: float, at: float, **fields: Any) -> None:
+        if on_event is None:
+            return
+        on_event(
+            TrainingEvent(
+                kind=kind,
+                run_index=done,
+                n_runs=total,
+                split_seed=int(split_seed),
+                model_seed=int(model_seed),
+                epoch=int(epoch),
+                max_epochs=int(max_epochs),
+                loss=float(loss),
+                metric=metric,
+                elapsed_s=at - started,
+                **fields,
+            )
+        )
+
+    def report_epoch(
+        epoch: int, max_epochs: int, score: float, loss: float, val_loss: float = float("nan")
+    ) -> None:
+        at = emit(f"epoch {epoch + 1}/{max_epochs} · val {score:.4f} · loss {loss:.3f}")
+        announce("epoch", epoch, max_epochs, loss, at, score=float(score), val_loss=float(val_loss))
+
+    def report_batch(epoch: int, max_epochs: int, step: int, n_batches: int, loss: float) -> None:
+        if step < n_batches and time.time() - sent_at < PROGRESS_MIN_INTERVAL_S:
+            return
+        at = emit(f"epoch {epoch + 1}/{max_epochs} · batch {step}/{n_batches} · loss {loss:.3f}")
+        announce("batch", epoch, max_epochs, loss, at, step=int(step), n_batches=int(n_batches))
+
+    return report_epoch, report_batch
+
+
+def _notify(progress: ProgressFn | None, done: int, total: int, label: str) -> None:
+    if progress is not None:
+        progress(done, total, label)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")  # noqa: UP017 -- datetime.UTC needs 3.11

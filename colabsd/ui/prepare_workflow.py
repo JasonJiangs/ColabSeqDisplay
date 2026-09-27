@@ -1,0 +1,384 @@
+"""The one preparation step of the main panel: the wild-type shape, as a 3Di string.
+
+There used to be a second notebook here that asked which backbone, wrote `wt_3di.txt` to the
+downloads folder, and handed it back to a main notebook asking the same question again. The
+backbone is asked once now, in `colabsd.ui.main_workflow`, and this module is the section that
+panel composes underneath it — on screen only when that backbone reads structure as well as
+sequence (`colabsd.ui.core.needs_structure`).
+
+Nothing ships a 3Di string, so every route starts from something the user provides — a
+structure file that Foldseek reads, a 3Di file, or a pasted string. Nothing here predicts a
+structure: bring one from the AlphaFold database or the PDB. The exception is a string this
+session already made: it stays in the session and is offered back rather than recomputed
+(`session_artifact`).
+
+Every decision is a pure function of a `colabsd.ui.core.WizardState`; `ThreeDiSection` is the
+thin ipywidgets layer above them and owns no rule.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from colabsd.ui import core, theme
+from colabsd.ui.core import Message
+
+#: The file this step writes, and the name it is written under.
+THREE_DI_FILENAME = "wt_3di.txt"
+
+
+# ----------------------------------------------------------------------------------------
+# What is already here. Recomputing a string this session has made is a conversion spent on
+# a file that already exists.
+# ----------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Artifact:
+    """The wild-type 3Di string this session made, and the protein it describes.
+
+    `describes` is what decides whether it may be reused at all: one protein's structure
+    states read against another protein's sequence are wrong at every position.
+    """
+
+    path: Path
+    describes: str
+    length: int = 0
+    detail: str = ""
+
+    @property
+    def label(self) -> str:
+        """The radio line offering it back."""
+        tail = f" — {self.detail}" if self.detail else ""
+        return f"Reuse the one made earlier in this session ({self.describes}{tail}) — nothing to compute"
+
+
+def session_artifact(state: core.WizardState, artifact: Artifact | None) -> Artifact | None:
+    """The session's 3Di string, when it still describes the wild type on screen.
+
+    Length is what decides it, for the reason `Artifact` gives.
+    """
+    if artifact is None:
+        return None
+    if artifact.length and state.wt_length and artifact.length != int(state.wt_length):
+        return None
+    return artifact
+
+
+def written_artifact(path: Path, three_di: str) -> Artifact:
+    """Register the 3Di string this step just wrote, so re-reading the library is free.
+
+    `on_check_library` drops the attached 3Di, because a re-read library may be a different
+    protein. When it is the same one, this makes the answer a click rather than another upload.
+    """
+    return Artifact(
+        path=Path(path),
+        describes=f"your {len(three_di):,d}-residue wild type",
+        length=len(three_di),
+        detail="made by this step",
+    )
+
+
+# ----------------------------------------------------------------------------------------
+# The choices the step offers, built from the state: a control that is irrelevant right now is
+# not on screen at all.
+# ----------------------------------------------------------------------------------------
+
+
+def three_di_choices(state: core.WizardState, artifact: Artifact | None = None) -> list[tuple[str, str]]:
+    """Where the wild-type 3Di string can come from, for this library.
+
+    The reuse line is offered only when there is something to reuse. Every other route starts
+    from a file the user has: nothing here folds a structure.
+    """
+    choices: list[tuple[str, str]] = [("Not chosen yet", "none")]
+    if artifact is not None:
+        choices.append((artifact.label, "session"))
+    choices += [
+        ("Upload a structure of my wild type (.pdb / .cif) and read the shape off it", "upload_structure"),
+        ("Upload a 3Di text file I already have", "upload_3di"),
+        ("Paste a 3Di string I already have", "paste"),
+    ]
+    return choices
+
+
+# ----------------------------------------------------------------------------------------
+# The contextual messages. `colabsd.ui.core` owns everything true of a 3Di string whatever
+# produced it; these are the ones this step itself earns.
+# ----------------------------------------------------------------------------------------
+
+
+def notices(
+    state: core.WizardState,
+    *,
+    artifact: Artifact | None = None,
+    has_gpu: bool | None = None,
+) -> list[Message]:
+    """Every message this step earns, in reading order.
+
+    `has_gpu=None` means nobody has looked at the machine yet, which is not the same as
+    "no GPU": the hardware refusal stays silent rather than firing backwards.
+    """
+    if not core.needs_structure(state):
+        return []
+    out: list[Message] = []
+    if state.three_di_source == "session" and artifact is None:
+        out.append(
+            Message(
+                "three_di_reuse_gone",
+                "stop",
+                "The 3Di string you were reusing describes another protein — the library changed under it. "
+                "Upload a structure of your own wild type instead, or a 3Di file you already have.",
+            )
+        )
+    computing = state.three_di_source == "upload_structure"
+    if artifact is not None and computing and not state.wt_3di_length:
+        out.append(
+            Message(
+                "three_di_reuse_available",
+                "info",
+                f"A 3Di string for {artifact.describes} is already here ({artifact.path.name}): pick the "
+                "reuse line above and this step is done. Compute one only if you want a different structure "
+                "of the same wild type.",
+            )
+        )
+    # would only bury the one that matters.
+    return out
+
+
+# ----------------------------------------------------------------------------------------
+# What the step writes, and what stops its button.
+# ----------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OutputFile:
+    """A file this step writes, what needs it, and where it goes."""
+
+    name: str
+    needed_by: str
+    where_it_goes: str
+
+
+def output_files(state: core.WizardState, *, work_dir: str | Path = core.DEFAULT_WORK_DIR) -> list[OutputFile]:
+    """What this step will write for this configuration, and what the file is for.
+
+    The panel that makes the file is the panel that trains, so the "where it goes" column says
+    where it is kept, not what to upload where. It is still written: a Drive mount survives a
+    disconnect.
+    """
+    if not core.needs_structure(state):
+        return []
+    return [
+        OutputFile(
+            name=THREE_DI_FILENAME,
+            needed_by=f"{state.backbone}, and nothing else on this page",
+            where_it_goes=(
+                f"kept in this session and written to `{Path(work_dir)}`, so a Drive mount survives a disconnect"
+            ),
+        )
+    ]
+
+
+def three_di_blockers(state: core.WizardState, artifact: Artifact | None = None) -> list[str]:
+    """What stops the get-the-3Di button, each said as the thing to go and fix."""
+    source = state.three_di_source
+    problems: list[str] = []
+    if source in {"none", ""}:
+        problems.append("Choose where the 3Di string should come from first.")
+    if source == "session" and artifact is None:
+        problems.append(
+            "There is no 3Di string here to reuse for this protein. Upload a structure of your own wild type, "
+            "or a 3Di file you already have."
+        )
+    if source == "paste" and not str(state.get("three_di_text") or "").strip():
+        problems.append("The 3Di box is empty. Paste the string, one lowercase letter per residue.")
+    if source == "upload_3di" and not str(state.get("three_di_file") or "").strip():
+        problems.append("No 3Di file yet. Upload one with the button above.")
+    if source == "upload_structure" and not str(state.get("structure_file") or "").strip():
+        problems.append("No structure yet. Upload a .pdb or .cif of your wild type.")
+    return problems
+
+
+# ----------------------------------------------------------------------------------------
+# Rendering. Pure string builders on top of `colabsd.ui.theme`, so the prose is testable.
+# ----------------------------------------------------------------------------------------
+
+
+def section_note(state: core.WizardState) -> str:
+    """What this step is for, said beside its own controls.
+
+    Nobody has to know what a 3Di string is to decide whether they need one: they chose a
+    backbone, and this says what that choice means for the step below it.
+    """
+    if not core.needs_structure(state):
+        return ""
+    instead = core.sequence_only_phrase()
+    escape = f" — choose {instead} backbone above and this step is not here at all" if instead else ""
+    return (
+        f"**{state.backbone}** reads your protein's *shape* as well as its sequence{escape}. The shape is "
+        "one letter per residue, a Foldseek 3Di string. The usual answer is a structure file you already "
+        "have or can download from the PDB or [AlphaFold](https://alphafold.ebi.ac.uk); folding it here is "
+        "the last resort. The string stays in this session: there is nothing to download and upload back."
+    )
+
+
+def outputs_html(files: Sequence[OutputFile]) -> str:
+    """What each written file is for and where it is kept."""
+    if not files:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f"<td style='padding:3px 10px 3px 0'><code>{item.name}</code></td>"
+        f"<td style='padding:3px 10px 3px 0'>{item.needed_by}</td>"
+        f"<td style='padding:3px 0'>{theme.render_markdown_inline(item.where_it_goes)}</td>"
+        "</tr>"
+        for item in files
+    )
+    return (
+        "<div style='margin:6px 0;line-height:1.5'><b>This step will write:</b>"
+        "<table style='border-collapse:collapse;margin-top:4px'>"
+        "<tr style='text-align:left;border-bottom:1px solid rgba(128,128,128,0.35)'>"
+        "<th style='padding-right:10px'>file</th><th style='padding-right:10px'>what needs it</th>"
+        "<th>where it is kept</th></tr>"
+        f"{rows}</table></div>"
+    )
+
+
+# ----------------------------------------------------------------------------------------
+# The widget layer: one section the main panel composes. It owns no decision and only builds
+# and reads widgets.
+# ----------------------------------------------------------------------------------------
+
+_LABEL = {"description_width": "initial"}
+
+
+@dataclass(frozen=True)
+class SectionTools:
+    """The main panel's own widget factories, so a composed section looks like the rest of it.
+
+    Passing them in rather than importing them keeps the upload row — and with it the "this is
+    about to block the kernel" notice — in exactly one place.
+    """
+
+    text: Callable[..., Any]
+    upload_row: Callable[..., Any]
+    button: Callable[..., Any]
+
+
+class ThreeDiSection:
+    """Source a wild-type 3Di string. On screen only because a SaProt backbone was chosen."""
+
+    def __init__(self, state: core.WizardState, tools: SectionTools) -> None:
+        import ipywidgets
+
+        self.fields: dict[str, Any] = {}
+        choices = three_di_choices(state, None)
+        values = [value for _label, value in choices]
+        self.fields["three_di_source"] = ipywidgets.RadioButtons(
+            options=choices,
+            value=state.three_di_source if state.three_di_source in values else "none",
+            layout={"width": "max-content"},
+            style=_LABEL,
+        )
+        self.fields["structure_file"] = tools.upload_row(
+            "structure_file", "Upload .pdb / .cif", "the wild-type structure", "structure"
+        )
+        self.fields["chain"] = tools.text("chain", "Chain to read:", "A — leave empty for the first chain")
+        self.fields["three_di_file"] = tools.upload_row(
+            "three_di_file", "Upload wt_3di.txt", "your 3Di file", "structure"
+        )
+        self.fields["three_di_text"] = ipywidgets.Textarea(
+            value=str(state.get("three_di_text") or ""),
+            placeholder="dpvqlvvcccd… one lowercase letter per residue",
+            description="3Di string:",
+            layout={"width": "560px", "height": "80px"},
+            style=_LABEL,
+        )
+        self.note = theme.note("")
+        self.button = tools.button("Get the 3Di string", "primary")
+
+    def children(self) -> list[Any]:
+        """The widgets, in reading order. The board, the button and the log are the panel's."""
+        return [
+            self.note,
+            self.fields["three_di_source"],
+            self.fields["structure_file"],
+            self.fields["chain"],
+            self.fields["three_di_file"],
+            self.fields["three_di_text"],
+        ]
+
+    def sync(self, state: core.WizardState, artifact: Artifact | None) -> str | None:
+        """Rebuild the source list for what is actually available; return a forced value.
+
+        Re-reading a different library has to take the reuse choice away rather than leave a
+        dead option selected.
+        """
+        choices = three_di_choices(state, artifact)
+        values = [value for _, value in choices]
+        widget = self.fields["three_di_source"]
+        if tuple(widget.options) == tuple(choices):
+            return None
+        wanted = state.three_di_source if state.three_di_source in values else "none"
+        widget.options = choices
+        widget.value = wanted
+        return wanted
+
+    def resolve(
+        self,
+        state: core.WizardState,
+        backend: Any,
+        *,
+        wt_sequence: str,
+        artifact: Artifact | None,
+        work_dir: Path,
+        has_gpu: bool,
+        on_note: Callable[[str], None] | None = None,
+    ) -> str:
+        """Produce the 3Di string this run will be trained with. Raises with what to fix.
+
+        `on_note` collects the remarks the two structure routes used to `print()` -- above all
+        the construct-mismatch line, which names the residues a PDB disagrees with the wild type
+        about and is what the TUTORIAL tells a reader to look at. A bare print inside a widget
+        callback reaches nobody: nothing in `colabsd.ui` captures stdout. Given a sink, the
+        caller renders those remarks in the section log beside its own sentence; left `None`,
+        `colabsd.structure` prints them as it always did for a plain-API caller.
+        """
+        problems = three_di_blockers(state, artifact)
+        if problems:
+            raise ValueError(" ".join(problems))
+        length = len(wt_sequence)
+        source = state.three_di_source
+        # The three routes below hand over a string somebody typed, uploaded or reused, and the
+        # 3Di alphabet is the twenty amino-acid letters lower-cased, so no check of the letters
+        # can tell a structure string from the sequence itself. `wt_sequence` is what makes the
+        # difference: the validator compares the two and refuses a string that is the sequence
+        # again. `upload_structure` below passes it as `expected_sequence` for the same reason.
+        if source == "session":
+            assert artifact is not None  # three_di_blockers refused this above
+            return backend.load_three_di(
+                artifact.path, expected_length=length, wt_sequence=wt_sequence
+            )
+        if source == "paste":
+            return backend.validate_three_di(
+                str(state.get("three_di_text") or ""), length, wt_sequence=wt_sequence
+            )
+        if source == "upload_3di":
+            return backend.load_three_di(
+                Path(str(state.get("three_di_file")).strip()),
+                expected_length=length,
+                wt_sequence=wt_sequence,
+            )
+        if source == "upload_structure":
+            return backend.three_di_from_structure(
+                Path(str(state.get("structure_file")).strip()),
+                chain=str(state.get("chain") or "").strip() or None,
+                expected_length=length,
+                expected_sequence=wt_sequence,
+                on_note=on_note,
+            )
+        raise ValueError(f"'{source}' is not a 3Di source this step offers.")
